@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
+import os
 import discord
 from discord.ext import commands, tasks
-import os
 
 TOKEN = os.environ.get('DISCORD_BOT_TOKEN')
-ROLE_NAME = 'bad bots'
+BAD_BOT_ROLE_NAME = 'bad bots'
 MODERATOR_ROLE_NAME = 'moderators'
-DELAY_MINUTES = 8
+BOT_SCAN_DELAY_MINUTES = 1
 
 if not TOKEN:
     print('DISCORD_BOT_TOKEN environment variable not set. Exiting...')
@@ -27,19 +27,19 @@ async def on_ready():
 @tasks.loop(minutes=1)
 async def update_bad_bots():
     for guild in bot.guilds:
-        bad_bots_role = discord.utils.get(guild.roles, name=ROLE_NAME)
+        bad_bots_role = discord.utils.get(guild.roles, name=BAD_BOT_ROLE_NAME)
         if bad_bots_role:
             for member in guild.members:
                 if not member.bot and bad_bots_role in member.roles:
                     if len(member.roles) > 2:  # User has more than just @everyone and bad bots role
                         await member.remove_roles(bad_bots_role, reason='User has been assigned additional roles')
-                        print(f'Removed {ROLE_NAME} role from {member.name} in {guild.name}')
+                        print(f'Removed {BAD_BOT_ROLE_NAME} role from {member.name} in {guild.name}')
                     elif len(member.roles) == 1:  # Newly joined user with no assigned roles
                         joined_at = member.joined_at
-                        delay = DELAY_MINUTES * 60
+                        delay = BOT_SCAN_DELAY_MINUTES  * 60
                         if (discord.utils.utcnow() - joined_at).total_seconds() > delay:
-                            await member.add_roles(bad_bots_role, reason=f'No role assigned after {DELAY_MINUTES} minutes')
-                            print(f'Assigned {ROLE_NAME} role to {member.name} in {guild.name}')
+                            await member.add_roles(bad_bots_role, reason=f'No role assigned after {BOT_SCAN_DELAY_MINUTES} minutes')
+                            print(f'Assigned {BAD_BOT_ROLE_NAME} role to {member.name} in {guild.name}')
 
 @update_bad_bots.before_loop
 async def before_update_bad_bots():
@@ -51,7 +51,7 @@ async def on_message(message):
     if message.author.bot:
         return
 
-    bad_bots_role = discord.utils.get(message.author.guild.roles, name=ROLE_NAME)
+    bad_bots_role = discord.utils.get(message.author.guild.roles, name=BAD_BOT_ROLE_NAME)
     if bad_bots_role in message.author.roles:
         await message.delete()
         print(f'Deleted message from {message.author.name} in {message.guild.name}')
