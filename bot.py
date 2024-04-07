@@ -23,6 +23,7 @@ async def on_ready():
     print(f'Logged in as {bot.user.name} (ID: {bot.user.id})')
     update_bad_bots.start()
 
+#Mark users without roles as bad bots. If a user adds a role, remove the bad bot role:
 @tasks.loop(minutes=1)
 async def update_bad_bots():
     for guild in bot.guilds:
@@ -44,6 +45,19 @@ async def update_bad_bots():
 async def before_update_bad_bots():
     await bot.wait_until_ready()
 
+#Delete messages posted by bad bots:
+@bot.event
+async def on_message(message):
+    if message.author.bot:
+        return
+
+    bad_bots_role = discord.utils.get(message.author.guild.roles, name=ROLE_NAME)
+    if bad_bots_role in message.author.roles:
+        await message.delete()
+        print(f'Deleted message from {message.author.name} in {message.guild.name}')
+
+
+#Alow modertors to make the bot send messages to a channel:
 @bot.tree.command(name='post', description='Post a message in a channel')
 @commands.has_role(MODERATOR_ROLE_NAME)
 async def post_message(interaction: discord.Interaction, channel: discord.TextChannel, message: str):
