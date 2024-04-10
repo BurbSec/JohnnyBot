@@ -54,7 +54,7 @@ JohnnyBot is a Discord moderation bot designed to automate role management and e
 2. Run the bot:
 
    ```shell
-   python johnnybot.py
+   python bot.py
    ```
 
 3. The bot should now be online and ready to moderate your Discord server.
