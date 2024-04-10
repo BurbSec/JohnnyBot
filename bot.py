@@ -10,7 +10,7 @@ TOKEN = os.environ.get('DISCORD_BOT_TOKEN')
 BAD_BOT_ROLE_NAME = 'bad bots'
 MODERATOR_ROLE_NAME = 'moderators'
 DELAY_MINUTES = 1
-LOG_FILE = 'johnnybot.log'
+LOG_FILE = './johnnybot.log'
 LOG_MAX_SIZE = 5 * 1024 * 1024  # 5MB
 MODERATORS_CHANNEL_NAME = 'moderators_only'  # Name of the moderators channel
 
