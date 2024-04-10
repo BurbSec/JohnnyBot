@@ -10,7 +10,7 @@ TOKEN = os.environ.get('DISCORD_BOT_TOKEN')
 BAD_BOT_ROLE_NAME = 'bad bots'
 MODERATOR_ROLE_NAME = 'moderators'
 DELAY_MINUTES = 1
-LOG_FILE = './johnnybot.log'
+LOG_FILE = 'johnnybot.log'  # Changed to use the filename directly
 LOG_MAX_SIZE = 5 * 1024 * 1024  # 5MB
 MODERATORS_CHANNEL_NAME = 'moderators_only'  # Name of the moderators channel
 
@@ -26,7 +26,12 @@ intents.message_content = True
 # Set up logging
 logger = logging.getLogger('discord')
 logger.setLevel(logging.INFO)
-handler = RotatingFileHandler(LOG_FILE, maxBytes=LOG_MAX_SIZE, backupCount=5)
+
+# Get the directory path of the script
+script_dir = os.path.dirname(os.path.abspath(__file__))
+log_file_path = os.path.join(script_dir, LOG_FILE)
+
+handler = RotatingFileHandler(log_file_path, maxBytes=LOG_MAX_SIZE, backupCount=5)
 formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 handler.setFormatter(formatter)
 logger.addHandler(handler)
