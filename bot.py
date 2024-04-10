@@ -10,7 +10,7 @@ TOKEN = os.environ.get('DISCORD_BOT_TOKEN')
 BAD_BOT_ROLE_NAME = 'bad bots'
 MODERATOR_ROLE_NAME = 'moderators'
 DELAY_MINUTES = 1
-LOG_FILE = 'johnnybot.log'  # Changed to use the filename directly
+LOG_FILE = 'johnnybot.log'
 LOG_MAX_SIZE = 5 * 1024 * 1024  # 5MB
 MODERATORS_CHANNEL_NAME = 'moderators_only'  # Name of the moderators channel
 
@@ -27,7 +27,6 @@ intents.message_content = True
 logger = logging.getLogger('discord')
 logger.setLevel(logging.INFO)
 
-# Get the directory path of the script
 script_dir = os.path.dirname(os.path.abspath(__file__))
 log_file_path = os.path.join(script_dir, LOG_FILE)
 
@@ -91,8 +90,25 @@ async def on_message(message):
 
     bad_bots_role = discord.utils.get(message.author.guild.roles, name=BAD_BOT_ROLE_NAME)
     if bad_bots_role in message.author.roles:
-        await message.delete()
-        logger.info('Deleted message from %s in %s: %s', message.author.name, message.guild.name, message.content)
+        if len(message.author.roles) <= 2 and isinstance(message.channel, discord.DMChannel):
+            for guild in bot.guilds:
+                if message.author in guild.members:
+                    delete_messages = [msg async for msg in message.author.history(limit=None)]
+                    await message.author.ban(reason='Banned for DM spam (DMing JohnnyBot)')  # Updated ban reason
+                    log_message = 'Banned %s from %s and deleted all messages' % (message.author.name, guild.name)
+                    logger.info(log_message)
+                    if moderators_channel := discord.utils.get(guild.text_channels, name=MODERATORS_CHANNEL_NAME):
+                        await moderators_channel.send(log_message)
+                    if delete_messages:
+                        for channel in guild.text_channels:
+                            delete_messages_channel = [msg for msg in delete_messages if msg.channel == channel]
+                            if delete_messages_channel:
+                                await channel.delete_messages(delete_messages_channel)
+                                logger.info(f'Deleted {len(delete_messages_channel)} messages from {channel.name} for {message.author.name}')
+                    break
+        else:
+            await message.delete()
+            logger.info('Deleted message from %s in %s: %s', message.author.name, message.guild.name, message.content)
 
 @bot.tree.command(name='post', description='Post a message in a channel')
 @commands.has_role(MODERATOR_ROLE_NAME)
