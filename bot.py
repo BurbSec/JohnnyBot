@@ -8,11 +8,11 @@ from discord.ext import commands, tasks
 
 TOKEN = os.environ.get('DISCORD_BOT_TOKEN')
 BAD_BOT_ROLE_NAME = 'bad bots'
-MODERATOR_ROLE_NAME = 'moderators'
+MODERATOR_ROLE_NAME = 'Moderators'
 DELAY_MINUTES = 1
 LOG_FILE = 'johnnybot.log'
 LOG_MAX_SIZE = 5 * 1024 * 1024  # 5MB
-MODERATORS_CHANNEL_NAME = 'moderators_only'  # Name of the moderators channel
+MODERATORS_CHANNEL_NAME = 'moderators_only'
 
 if not TOKEN:
     print('DISCORD_BOT_TOKEN environment variable not set. Exiting...')
@@ -48,10 +48,13 @@ async def update_bad_bots():
     try:
         for guild in bot.guilds:
             bad_bots_role = discord.utils.get(guild.roles, name=BAD_BOT_ROLE_NAME)
+            moderator_role = discord.utils.get(guild.roles, name=MODERATOR_ROLE_NAME)
             moderators_channel = discord.utils.get(guild.text_channels, name=MODERATORS_CHANNEL_NAME)
-            if bad_bots_role and moderators_channel:
+            if bad_bots_role and moderator_role and moderators_channel:
                 for member in guild.members:
                     if not member.bot and bad_bots_role in member.roles:
+                        if moderator_role in member.roles:  # Skip members with the moderator role
+                            continue
                         if len(member.roles) > 2:
                             await member.remove_roles(bad_bots_role, reason='User has been assigned additional roles')
                             log_message = 'Removed %s role from %s in %s' % (BAD_BOT_ROLE_NAME, member.name, guild.name)
@@ -89,22 +92,24 @@ async def on_message(message):
         return
 
     bad_bots_role = discord.utils.get(message.author.guild.roles, name=BAD_BOT_ROLE_NAME)
-    if bad_bots_role in message.author.roles:
+    moderator_role = discord.utils.get(message.author.guild.roles, name=MODERATOR_ROLE_NAME)
+    if bad_bots_role in message.author.roles and not moderator_role in message.author.roles:
         if len(message.author.roles) <= 2 and isinstance(message.channel, discord.DMChannel):
             for guild in bot.guilds:
                 if message.author in guild.members:
                     delete_messages = [msg async for msg in message.author.history(limit=None)]
-                    await message.author.ban(reason='Banned for DM spam (DMing JohnnyBot)')  # Updated ban reason
-                    log_message = 'Banned %s from %s and deleted all messages' % (message.author.name, guild.name)
-                    logger.info(log_message)
-                    if moderators_channel := discord.utils.get(guild.text_channels, name=MODERATORS_CHANNEL_NAME):
-                        await moderators_channel.send(log_message)
-                    if delete_messages:
-                        for channel in guild.text_channels:
-                            delete_messages_channel = [msg for msg in delete_messages if msg.channel == channel]
-                            if delete_messages_channel:
-                                await channel.delete_messages(delete_messages_channel)
-                                logger.info(f'Deleted {len(delete_messages_channel)} messages from {channel.name} for {message.author.name}')
+                    if moderator_role not in [role for role in message.author.roles]:  # Check if the user doesn't have the moderator role
+                        await message.author.ban(reason='Banned for DM spam (DMing JohnnyBot)')
+                        log_message = 'Banned %s from %s and deleted all messages' % (message.author.name, guild.name)
+                        logger.info(log_message)
+                        if moderators_channel := discord.utils.get(guild.text_channels, name=MODERATORS_CHANNEL_NAME):
+                            await moderators_channel.send(log_message)
+                        if delete_messages:
+                            for channel in guild.text_channels:
+                                delete_messages_channel = [msg for msg in delete_messages if msg.channel == channel]
+                                if delete_messages_channel:
+                                    await channel.delete_messages(delete_messages_channel)
+                                    logger.info(f'Deleted {len(delete_messages_channel)} messages from {channel.name} for {message.author.name}')
                     break
         else:
             await message.delete()
