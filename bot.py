@@ -60,19 +60,21 @@ async def process_member(member, bad_bots_role, moderator_role):
             await log_and_send_message(member.guild, 'Removed %s role from %s in %s',
                                        BAD_BOT_ROLE_NAME, member.name, member.guild.name)
             return True
-        elif len(member.roles) == 1:
-            joined_at = member.joined_at
-            delay = DELAY_MINUTES * 60
-            if (discord.utils.utcnow() - joined_at).total_seconds() > delay:
-                await member.add_roles(bad_bots_role,
-                                       reason=f'No role assigned after {DELAY_MINUTES} minutes')
-                await log_and_send_message(member.guild, 'Assigned %s role to %s in %s',
-                                           BAD_BOT_ROLE_NAME, member.name, member.guild.name)
-                return True
+    elif len(member.roles) == 1:  # Member has only the default @everyone role
+        joined_at = member.joined_at
+        delay = DELAY_MINUTES * 60
+        if (discord.utils.utcnow() - joined_at).total_seconds() > delay:
+            await member.add_roles(bad_bots_role,
+                                   reason=f'No role assigned after {DELAY_MINUTES} minutes')
+            await log_and_send_message(member.guild, 'Assigned %s role to %s in %s',
+                                       BAD_BOT_ROLE_NAME, member.name, member.guild.name)
+            return True
     return False
 
 async def ban_and_delete_messages(message):
-    for guild in bot.guilds:
+    guild = message.guild
+    if guild:
+        bad_bots_role = discord.utils.get(guild.roles, name=BAD_BOT_ROLE_NAME)
         if message.author in guild.members:
             delete_messages = [msg async for msg in message.author.history(limit=None)]
             try:
@@ -99,12 +101,6 @@ async def ban_and_delete_messages(message):
                             error_response = e.response
                             logger.error('Error deleting messages in %s: %s (Status code: %d)',
                                          channel.name, error_response.text, error_response.status)
-            break
-
-@bot.event
-async def on_ready():
-    logger.info('Logged in as %s (ID: %s)', bot.user.name, bot.user.id)
-    update_bad_bots.start()
 
 @tasks.loop(minutes=1)
 async def update_bad_bots():
@@ -129,18 +125,23 @@ async def before_update_bad_bots():
     await bot.wait_until_ready()
 
 @bot.event
+async def on_ready():
+    logger.info('Logged in as %s (ID: %s)', bot.user.name, bot.user.id)
+    update_bad_bots.start()
+
+@bot.event
 async def on_message(message):
     if message.author.bot:
         return
 
-    bad_bots_role = discord.utils.get(message.author.guild.roles, name=BAD_BOT_ROLE_NAME)
-    if ((bad_bots_role in message.author.roles or len(message.author.roles) == 1)
-            and isinstance(message.channel, discord.DMChannel)):
+    if isinstance(message.channel, discord.DMChannel):
         await ban_and_delete_messages(message)
-    elif bad_bots_role in message.author.roles:
-        await message.delete()
-        logger.info('Deleted message from %s in %s: %s', message.author.name,
-                    message.guild.name, message.content)
+    else:
+        bad_bots_role = discord.utils.get(message.guild.roles, name=BAD_BOT_ROLE_NAME)
+        if bad_bots_role in message.author.roles:
+            await message.delete()
+            logger.info('Deleted message from %s in %s: %s', message.author.name,
+                        message.guild.name, message.content)
 
 @bot.tree.command(name='post', description='Post a message in a channel')
 @commands.has_role(MODERATOR_ROLE_NAME)
