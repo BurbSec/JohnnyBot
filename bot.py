@@ -1,15 +1,14 @@
 #!/usr/bin/env python
-
 import os
 import logging
 from logging.handlers import RotatingFileHandler
 import discord
-from discord.ext import commands, tasks
+from discord.ext import commands
 
 TOKEN = os.environ.get('DISCORD_BOT_TOKEN')
 BAD_BOT_ROLE_NAME = 'bad bots'
 MODERATOR_ROLE_NAME = 'Moderators'
-DELAY_MINUTES = 1
+DELAY_MINUTES = 4
 LOG_FILE = 'johnnybot.log'
 LOG_MAX_SIZE = 5 * 1024 * 1024  # 5MB
 MODERATORS_CHANNEL_NAME = 'moderators_only'  # Name of the moderators channel
@@ -53,109 +52,84 @@ async def log_and_send_message(guild, message, *args, level='info'):
     if moderators_channel := discord.utils.get(guild.text_channels, name=MODERATORS_CHANNEL_NAME):
         await moderators_channel.send(message % args)
 
-async def process_member(member, bad_bots_role, moderator_role):
-    if bad_bots_role in member.roles and moderator_role not in member.roles:
-        if len(member.roles) > 2:
-            await member.remove_roles(bad_bots_role, reason='User has been assigned additional roles')
-            await log_and_send_message(member.guild, 'Removed %s role from %s in %s',
-                                       BAD_BOT_ROLE_NAME, member.name, member.guild.name)
-            return True
-    elif len(member.roles) == 1:  # Member has only the default @everyone role
-        joined_at = member.joined_at
-        delay = DELAY_MINUTES * 60
-        if (discord.utils.utcnow() - joined_at).total_seconds() > delay:
-            await member.add_roles(bad_bots_role,
-                                   reason=f'No role assigned after {DELAY_MINUTES} minutes')
-            await log_and_send_message(member.guild, 'Assigned %s role to %s in %s',
-                                       BAD_BOT_ROLE_NAME, member.name, member.guild.name)
-            return True
-    return False
-
-async def ban_and_delete_messages(message):
-    guild = message.guild
-    if guild:
-        bad_bots_role = discord.utils.get(guild.roles, name=BAD_BOT_ROLE_NAME)
-        if message.author in guild.members:
-            delete_messages = [msg async for msg in message.author.history(limit=None)]
-            try:
-                await message.author.ban(reason='Banned for DM spam (DMing JohnnyBot)')
-                await log_and_send_message(guild, 'Banned %s from %s and deleted all messages',
-                                           message.author.name, guild.name)
-            except discord.errors.HTTPException as e:
-                error_response = e.response
-                await log_and_send_message(guild,
-                                           'Error banning %s from %s: %s (Status code: %d)',
-                                           message.author.name, guild.name, error_response.text,
-                                           error_response.status, level='error')
-            if delete_messages:
-                for channel in guild.text_channels:
-                    delete_messages_channel = [msg for msg in delete_messages
-                                               if msg.channel == channel]
-                    if delete_messages_channel:
-                        try:
-                            await channel.delete_messages(delete_messages_channel)
-                            logger.info('Deleted %d messages from %s for %s',
-                                        len(delete_messages_channel), channel.name,
-                                        message.author.name)
-                        except discord.errors.HTTPException as e:
-                            error_response = e.response
-                            logger.error('Error deleting messages in %s: %s (Status code: %d)',
-                                         channel.name, error_response.text, error_response.status)
-
-@tasks.loop(minutes=1)
-async def update_bad_bots():
-    roles_modified = False
+async def kick_and_delete_messages(member):
+    guild = member.guild
+    delete_messages = [msg async for msg in member.history(limit=None)]
     try:
-        for guild in bot.guilds:
-            bad_bots_role, moderator_role, moderators_channel = await get_roles_and_channel(guild)
-            if bad_bots_role and moderator_role and moderators_channel:
-                for member in guild.members:
-                    if not member.bot:
-                        roles_modified |= await process_member(member, bad_bots_role, moderator_role)
+        await member.kick(reason=f'No role assigned after {DELAY_MINUTES} minutes')
+        await log_and_send_message(guild, 'Kicked %s from %s', member.name, guild.name)
     except discord.errors.HTTPException as e:
         error_response = e.response
-        logger.error('Unable to complete task "update_bad_bots": %s (Status code: %d)',
-                     error_response.text, error_response.status)
-    else:
-        if not roles_modified:
-            logger.debug('Task "update_bad_bots" completed without modifying roles')
+        await log_and_send_message(guild, 'Error kicking %s from %s: %s (Status code: %d)',
+                                   member.name, guild.name, error_response.text,
+                                   error_response.status, level='error')
+    if delete_messages:
+        for channel in guild.text_channels:
+            delete_messages_channel = [msg for msg in delete_messages if msg.channel == channel]
+            if delete_messages_channel:
+                try:
+                    await channel.delete_messages(delete_messages_channel)
+                    logger.info('Deleted %d messages from %s for %s',
+                                len(delete_messages_channel), channel.name, member.name)
+                except discord.errors.HTTPException as e:
+                    error_response = e.response
+                    logger.error('Error deleting messages in %s: %s (Status code: %d)',
+                                 channel.name, error_response.text, error_response.status)
 
-@update_bad_bots.before_loop
-async def before_update_bad_bots():
-    await bot.wait_until_ready()
+@bot.event
+async def on_member_join(member):
+    guild = member.guild
+    bad_bots_role, _, _ = await get_roles_and_channel(guild)
+    if bad_bots_role:
+        await member.add_roles(bad_bots_role, reason='New member joined')
+        await asyncio.sleep(DELAY_MINUTES * 60)
+        if member.roles == [guild.default_role, bad_bots_role]:
+            await kick_and_delete_messages(member)
+
+@bot.event
+async def on_member_update(before, after):
+    guild = after.guild
+    bad_bots_role, _, _ = await get_roles_and_channel(guild)
+    if bad_bots_role in after.roles and len(after.roles) > 2:
+        await after.remove_roles(bad_bots_role, reason='User has additional roles')
 
 @bot.event
 async def on_ready():
     logger.info('Logged in as %s (ID: %s)', bot.user.name, bot.user.id)
-    update_bad_bots.start()
 
-@bot.event
-async def on_message(message):
-    if message.author.bot:
-        return
+    # Register the slash command
+    try:
+        await bot.tree.sync()
+        logger.info('Slash command registered successfully')
+    except discord.errors.HTTPException as e:
+        error_response = e.response
+        logger.error('Failed to register slash command: %s (Status code: %d)',
+                     error_response.text, error_response.status)
 
-    if isinstance(message.channel, discord.DMChannel):
-        await ban_and_delete_messages(message)
-    else:
-        bad_bots_role = discord.utils.get(message.guild.roles, name=BAD_BOT_ROLE_NAME)
-        if bad_bots_role in message.author.roles:
-            await message.delete()
-            logger.info('Deleted message from %s in %s: %s', message.author.name,
-                        message.guild.name, message.content)
-
-@bot.tree.command(name='post', description='Post a message in a channel')
+@bot.tree.command(name='botsay', description='Make the bot say something in a channel')
 @commands.has_role(MODERATOR_ROLE_NAME)
-async def post_message(interaction: discord.Interaction, channel: discord.TextChannel, message: str):
-    await channel.send(message)
-    await interaction.response.send_message(f'Message sent to {channel.mention}', ephemeral=True)
+async def botsay(interaction: discord.Interaction, channel: discord.TextChannel, message: str):
+    try:
+        await channel.send(message)
+        await interaction.response.send_message(f'Message sent to {channel.mention}', ephemeral=True)
+    except discord.errors.HTTPException as e:
+        error_response = e.response
+        await interaction.response.send_message(
+            f'Error sending message: {error_response.text} (Status code: {error_response.status})',
+            ephemeral=True
+        )
+        logger.error('Error sending message: %s (Status code: %d)',
+                     error_response.text, error_response.status)
 
-@post_message.error
-async def post_message_error(interaction: discord.Interaction, error):
+@botsay.error
+async def botsay_error(interaction: discord.Interaction, error):
     if isinstance(error, commands.MissingRole):
         await interaction.response.send_message(
             f'You need the {MODERATOR_ROLE_NAME} role to use this command.', ephemeral=True)
     else:
         logger.error('Error occurred: %s', str(error))
+        await interaction.response.send_message(
+            'An error occurred while processing the command.', ephemeral=True)
 
 if __name__ == '__main__':
     bot.run(TOKEN)
