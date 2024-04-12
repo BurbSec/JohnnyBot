@@ -12,6 +12,8 @@ DELAY_MINUTES = 4
 LOG_FILE = 'johnnybot.log'
 LOG_MAX_SIZE = 5 * 1024 * 1024  # 5MB
 MODERATORS_CHANNEL_NAME = 'moderators_only'  # Name of the moderators channel
+PROTECTED_CHANNELS = ['🫠・code_of_conduct', '🧚・hey_listen', '👯・local_events',
+                      '🧩・ctf_announcements', '🖥・virtual_events'] #Users can't post here
 
 if not TOKEN:
     print('DISCORD_BOT_TOKEN environment variable not set. Exiting...')
@@ -92,6 +94,18 @@ async def on_member_update(before, after):
     bad_bots_role, _, _ = await get_roles_and_channel(guild)
     if bad_bots_role in after.roles and len(after.roles) > 2:
         await after.remove_roles(bad_bots_role, reason='User has additional roles')
+
+@bot.event
+async def on_message(message):
+    if message.author == bot.user:
+        return
+
+    if message.channel.name in PROTECTED_CHANNELS:
+        _, moderator_role, _ = await get_roles_and_channel(message.guild)
+        if moderator_role not in message.author.roles:
+            await message.delete()
+            logger.info('Deleted message from %s in protected channel %s: %s',
+                        message.author.name, message.channel.name, message.content)
 
 @bot.event
 async def on_ready():
