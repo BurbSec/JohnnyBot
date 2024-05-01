@@ -3,6 +3,7 @@ import os
 import logging
 from logging.handlers import RotatingFileHandler
 import discord
+from discord import app_commands
 from discord.ext import commands
 
 TOKEN = os.environ.get('DISCORD_BOT_TOKEN')
@@ -13,7 +14,8 @@ LOG_FILE = 'johnnybot.log'
 LOG_MAX_SIZE = 5 * 1024 * 1024  # 5MB
 MODERATORS_CHANNEL_NAME = 'moderators_only'  # Name of the moderators channel
 PROTECTED_CHANNELS = ['🫠・code_of_conduct', '🧚・hey_listen', '👯・local_events',
-                      '🧩・ctf_announcements', '🖥・virtual_events'] #Users can't post here
+                      '🧩・ctf_announcements', '🖥・virtual_events']  # Users can't post here
+LOGGING_CHANNEL_NAME = '🍻・general_lobbycon'  # Name of the channel to log kicks
 
 if not TOKEN:
     print('DISCORD_BOT_TOKEN environment variable not set. Exiting...')
@@ -60,6 +62,14 @@ async def kick_and_delete_messages(member):
     try:
         await member.kick(reason=f'No role assigned after {DELAY_MINUTES} minutes')
         await log_and_send_message(guild, 'Kicked %s from %s', member.name, guild.name)
+
+        # Send a message to the logging channel
+        logging_channel = discord.utils.get(guild.text_channels, name=LOGGING_CHANNEL_NAME)
+        if logging_channel:
+            await logging_channel.send(f'(¯`*•.¸,¤°´.｡.:* {member.name} is a bot and has been derezzed *:.｡.`°¤,¸.•*´¯)')
+        else:
+            logger.warning('Channel "%s" not found in guild %s', LOGGING_CHANNEL_NAME, guild.name)
+
     except discord.errors.HTTPException as e:
         error_response = e.response
         await log_and_send_message(guild, 'Error kicking %s from %s: %s (Status code: %d)',
@@ -144,6 +154,81 @@ async def botsay_error(interaction: discord.Interaction, error):
         logger.error('Error occurred: %s', str(error))
         await interaction.response.send_message(
             'An error occurred while processing the command.', ephemeral=True)
+
+@bot.tree.command(name='kick', description='Kick a member from the server')
+@commands.has_role(MODERATOR_ROLE_NAME)
+async def kick_command(interaction: discord.Interaction, member: discord.Member, reason: str = None):
+    try:
+        await member.kick(reason=reason)
+        await interaction.response.send_message(f'Kicked {member.mention} from the server.', ephemeral=True)
+        
+        logging_channel = discord.utils.get(interaction.guild.text_channels, name=LOGGING_CHANNEL_NAME)
+        if logging_channel:
+            await logging_channel.send(f'(¯`*•.¸,¤°´.｡.:* {member.name} has been kicked from the server. Reason: {reason} *:.｡.`°¤,¸.•*´¯)')
+        else:
+            logger.warning('Channel "%s" not found in guild %s', LOGGING_CHANNEL_NAME, interaction.guild.name)
+    except discord.errors.HTTPException as e:
+        error_response = e.response
+        await interaction.response.send_message(
+            f'Error kicking {member.mention}: {error_response.text} (Status code: {error_response.status})',
+            ephemeral=True
+        )
+        logger.error('Error kicking %s: %s (Status code: %d)', member.name, error_response.text, error_response.status)
+
+@bot.tree.command(name='ban', description='Ban a member from the server')
+@commands.has_role(MODERATOR_ROLE_NAME)
+async def ban_command(interaction: discord.Interaction, member: discord.Member, reason: str = None):
+    try:
+        await member.ban(reason=reason)
+        await interaction.response.send_message(f'Banned {member.mention} from the server.', ephemeral=True)
+        
+        logging_channel = discord.utils.get(interaction.guild.text_channels, name=LOGGING_CHANNEL_NAME)
+        if logging_channel:
+            await logging_channel.send(f'(¯`*•.¸,¤°´.｡.:* {member.name} has been banned from the server. Reason: {reason} *:.｡.`°¤,¸.•*´¯)')
+        else:
+            logger.warning('Channel "%s" not found in guild %s', LOGGING_CHANNEL_NAME, interaction.guild.name)
+    except discord.errors.HTTPException as e:
+        error_response = e.response
+        await interaction.response.send_message(
+            f'Error banning {member.mention}: {error_response.text} (Status code: {error_response.status})',
+            ephemeral=True
+        )
+        logger.error('Error banning %s: %s (Status code: %d)', member.name, error_response.text, error_response.status)
+
+@bot.tree.command(name='timeout', description='Timeout a member in the server')
+@commands.has_role(MODERATOR_ROLE_NAME)
+async def timeout_command(interaction: discord.Interaction, member: discord.Member, duration: str, reason: str = None):
+    try:
+        timeout_duration = parse_duration(duration)
+        await member.timeout(timeout_duration, reason=reason)
+        await interaction.response.send_message(f'Timed out {member.mention} for {duration}.', ephemeral=True)
+        
+        logging_channel = discord.utils.get(interaction.guild.text_channels, name=LOGGING_CHANNEL_NAME)
+        if logging_channel:
+            await logging_channel.send(f'(¯`*•.¸,¤°´.｡.:* {member.name} has been timed out for {duration}. Reason: {reason} *:.｡.`°¤,¸.•*´¯)')
+        else:
+            logger.warning('Channel "%s" not found in guild %s', LOGGING_CHANNEL_NAME, interaction.guild.name)
+    except discord.errors.HTTPException as e:
+        error_response = e.response
+        await interaction.response.send_message(
+            f'Error timing out {member.mention}: {error_response.text} (Status code: {error_response.status})',
+            ephemeral=True
+        )
+        logger.error('Error timing out %s: %s (Status code: %d)', member.name, error_response.text, error_response.status)
+
+def parse_duration(duration: str) -> int:
+    units = {
+        's': 1,
+        'm': 60,
+        'h': 3600,
+        'd': 86400
+    }
+    try:
+        amount = int(duration[:-1])
+        unit = duration[-1].lower()
+        return amount * units[unit]
+    except (ValueError, KeyError):
+        raise ValueError('Invalid duration format. Use a number followed by a unit (s, m, h, d).')
 
 if __name__ == '__main__':
     bot.run(TOKEN)
