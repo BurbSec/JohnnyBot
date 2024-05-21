@@ -1,10 +1,9 @@
-#!/usr/bin/env python
+import discord
+from discord.ext import commands
 import os
 import logging
 from logging.handlers import RotatingFileHandler
-import discord
-from discord import app_commands
-from discord.ext import commands
+import asyncio
 
 TOKEN = os.environ.get('DISCORD_BOT_TOKEN')
 BAD_BOT_ROLE_NAME = 'bad bots'
@@ -53,13 +52,14 @@ async def log_and_send_message(guild, message, *args, level='info'):
         logger.error(message, *args)
     elif level == 'debug':
         logger.debug(message, *args)
-    if moderators_channel := discord.utils.get(guild.text_channels, name=MODERATORS_CHANNEL_NAME):
+    moderators_channel = discord.utils.get(guild.text_channels, name=MODERATORS_CHANNEL_NAME)
+    if moderators_channel:
         await moderators_channel.send(message % args)
 
 async def kick_and_delete_messages(member):
     guild = member.guild
-    delete_messages = [msg async for msg in member.history(limit=None)]
     try:
+        delete_messages = [msg async for msg in member.history(limit=None)]
         await member.kick(reason=f'No role assigned after {DELAY_MINUTES} minutes')
         await log_and_send_message(guild, 'Kicked %s from %s', member.name, guild.name)
 
@@ -70,23 +70,26 @@ async def kick_and_delete_messages(member):
         else:
             logger.warning('Channel "%s" not found in guild %s', LOGGING_CHANNEL_NAME, guild.name)
 
+        if delete_messages:
+            for channel in guild.text_channels:
+                delete_messages_channel = [msg for msg in delete_messages if msg.channel == channel]
+                if delete_messages_channel:
+                    try:
+                        await channel.delete_messages(delete_messages_channel)
+                        logger.info('Deleted %d messages from %s for %s',
+                                    len(delete_messages_channel), channel.name, member.name)
+                    except discord.errors.HTTPException as e:
+                        error_response = e.response
+                        logger.error('Error deleting messages in %s: %s (Status code: %d)',
+                                     channel.name, error_response.text, error_response.status)
+                        await log_and_send_message(guild, 'Error deleting messages for %s in %s: %s (Status code: %d)',
+                                                   member.name, channel.name, error_response.text,
+                                                   error_response.status, level='error')
     except discord.errors.HTTPException as e:
         error_response = e.response
         await log_and_send_message(guild, 'Error kicking %s from %s: %s (Status code: %d)',
                                    member.name, guild.name, error_response.text,
                                    error_response.status, level='error')
-    if delete_messages:
-        for channel in guild.text_channels:
-            delete_messages_channel = [msg for msg in delete_messages if msg.channel == channel]
-            if delete_messages_channel:
-                try:
-                    await channel.delete_messages(delete_messages_channel)
-                    logger.info('Deleted %d messages from %s for %s',
-                                len(delete_messages_channel), channel.name, member.name)
-                except discord.errors.HTTPException as e:
-                    error_response = e.response
-                    logger.error('Error deleting messages in %s: %s (Status code: %d)',
-                                 channel.name, error_response.text, error_response.status)
 
 @bot.event
 async def on_member_join(member):
@@ -94,12 +97,14 @@ async def on_member_join(member):
     bad_bots_role, _, _ = await get_roles_and_channel(guild)
     if bad_bots_role:
         await member.add_roles(bad_bots_role, reason='New member joined')
+        await log_and_send_message(guild, 'Assigned %s role to %s in %s',
+                                   BAD_BOT_ROLE_NAME, member.name, guild.name)
         await asyncio.sleep(DELAY_MINUTES * 60)
         if member.roles == [guild.default_role, bad_bots_role]:
             await kick_and_delete_messages(member)
 
 @bot.event
-async def on_member_update(before, after):
+async def on_member_update(after):
     guild = after.guild
     bad_bots_role, _, _ = await get_roles_and_channel(guild)
     if bad_bots_role in after.roles and len(after.roles) > 2:
@@ -110,13 +115,31 @@ async def on_message(message):
     if message.author == bot.user:
         return
 
-    if message.channel.name in PROTECTED_CHANNELS:
-        _, moderator_role, _ = await get_roles_and_channel(message.guild)
-        if moderator_role not in message.author.roles:
+    guild = message.guild
+    if isinstance(message.channel, discord.DMChannel):
+        bad_bots_role, _, _ = await get_roles_and_channel(guild)
+        if (bad_bots_role in message.author.roles or len(message.author.roles) == 1) and message.author in guild.members:
+            await kick_and_delete_messages(message.author)
+    else:
+        bad_bots_role, moderator_role, _ = await get_roles_and_channel(guild)
+        if bad_bots_role in message.author.roles:
             await message.delete()
-            logger.info('Deleted message from %s in protected channel %s: %s',
-                        message.author.name, message.channel.name, message.content)
-
+            logger.info('Deleted message from %s in %s: %s', message.author.name,
+                        message.guild.name, message.content)
+        elif message.channel.name in PROTECTED_CHANNELS:
+            if moderator_role not in message.author.roles:
+                try:
+                    await message.delete()
+                    logger.info('Deleted message from %s in protected channel %s: %s',
+                                message.author.name, message.channel.name, message.content)
+                except discord.errors.HTTPException as e:
+                    error_response = e.response
+                    logger.error('Error deleting message from %s in protected channel %s: %s (Status code: %d)',
+                                 message.author.name, message.channel.name, error_response.text, error_response.status)
+                    await log_and_send_message(guild, 'Error deleting message from %s in protected channel %s: %s (Status code: %d)',
+                                               message.author.name, message.channel.name, error_response.text,
+                                               error_response.status, level='error')
+            
 @bot.event
 async def on_ready():
     logger.info('Logged in as %s (ID: %s)', bot.user.name, bot.user.id)
@@ -145,16 +168,6 @@ async def botsay(interaction: discord.Interaction, channel: discord.TextChannel,
         logger.error('Error sending message: %s (Status code: %d)',
                      error_response.text, error_response.status)
 
-@botsay.error
-async def botsay_error(interaction: discord.Interaction, error):
-    if isinstance(error, commands.MissingRole):
-        await interaction.response.send_message(
-            f'You need the {MODERATOR_ROLE_NAME} role to use this command.', ephemeral=True)
-    else:
-        logger.error('Error occurred: %s', str(error))
-        await interaction.response.send_message(
-            'An error occurred while processing the command.', ephemeral=True)
-
 @bot.tree.command(name='kick', description='Kick a member from the server')
 @commands.has_role(MODERATOR_ROLE_NAME)
 async def kick_command(interaction: discord.Interaction, member: discord.Member, reason: str = None):
@@ -174,6 +187,8 @@ async def kick_command(interaction: discord.Interaction, member: discord.Member,
             ephemeral=True
         )
         logger.error('Error kicking %s: %s (Status code: %d)', member.name, error_response.text, error_response.status)
+        await log_and_send_message(interaction.guild, 'Error kicking %s: %s (Status code: %d)', member.name,
+                                   error_response.text, error_response.status, level='error')
 
 @bot.tree.command(name='ban', description='Ban a member from the server')
 @commands.has_role(MODERATOR_ROLE_NAME)
@@ -194,6 +209,8 @@ async def ban_command(interaction: discord.Interaction, member: discord.Member, 
             ephemeral=True
         )
         logger.error('Error banning %s: %s (Status code: %d)', member.name, error_response.text, error_response.status)
+        await log_and_send_message(interaction.guild, 'Error banning %s: %s (Status code: %d)', member.name,
+                                   error_response.text, error_response.status, level='error')
 
 @bot.tree.command(name='timeout', description='Timeout a member in the server')
 @commands.has_role(MODERATOR_ROLE_NAME)
@@ -215,6 +232,8 @@ async def timeout_command(interaction: discord.Interaction, member: discord.Memb
             ephemeral=True
         )
         logger.error('Error timing out %s: %s (Status code: %d)', member.name, error_response.text, error_response.status)
+        await log_and_send_message(interaction.guild, 'Error timing out %s: %s (Status code: %d)', member.name,
+                                   error_response.text, error_response.status, level='error')
 
 def parse_duration(duration: str) -> int:
     units = {
@@ -227,8 +246,8 @@ def parse_duration(duration: str) -> int:
         amount = int(duration[:-1])
         unit = duration[-1].lower()
         return amount * units[unit]
-    except (ValueError, KeyError):
-        raise ValueError('Invalid duration format. Use a number followed by a unit (s, m, h, d).')
+    except (ValueError, KeyError) as exc:
+        raise ValueError('Invalid duration format. Use a number followed by a unit (s, m, h, d).') from exc
 
 if __name__ == '__main__':
     bot.run(TOKEN)
