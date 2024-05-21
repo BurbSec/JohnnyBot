@@ -1,9 +1,9 @@
-import discord
-from discord.ext import commands
 import os
 import logging
 from logging.handlers import RotatingFileHandler
 import asyncio
+import discord
+from discord.ext import commands
 
 TOKEN = os.environ.get('DISCORD_BOT_TOKEN')
 BAD_BOT_ROLE_NAME = 'bad bots'
