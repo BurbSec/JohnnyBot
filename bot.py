@@ -32,7 +32,10 @@ logger.setLevel(logging.INFO)
 script_dir = os.path.dirname(os.path.abspath(__file__))
 log_file_path = os.path.join(script_dir, LOG_FILE)
 
-handler = RotatingFileHandler(log_file_path, maxBytes=LOG_MAX_SIZE, backupCount=5)
+if not os.path.exists(log_file_path):
+    open(log_file_path, 'a', encoding='utf-8').close()
+
+handler = RotatingFileHandler(log_file_path, maxBytes=LOG_MAX_SIZE, backupCount=5, encoding='utf-8')
 formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 handler.setFormatter(formatter)
 logger.addHandler(handler)
