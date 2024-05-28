@@ -1,9 +1,10 @@
+import asyncio
+import logging
+import os
+from logging.handlers import RotatingFileHandler
+
 import discord
 from discord.ext import commands
-import os
-import logging
-from logging.handlers import RotatingFileHandler
-import asyncio
 
 TOKEN = os.environ.get('DISCORD_BOT_TOKEN')
 BAD_BOT_ROLE_NAME = 'bad bots'
@@ -15,6 +16,7 @@ MODERATORS_CHANNEL_NAME = 'moderators_only'  # Name of the moderators channel
 PROTECTED_CHANNELS = ['🫠・code_of_conduct', '🧚・hey_listen', '👯・local_events',
                       '🧩・ctf_announcements', '🖥・virtual_events']  # Users can't post here
 LOGGING_CHANNEL_NAME = '🍻・general_lobbycon'  # Name of the channel to log kicks
+BOT_TRAP_CHANNEL_NAME = 'bot-trap'  # Name of the channel where bad bots are allowed to post
 
 if not TOKEN:
     print('DISCORD_BOT_TOKEN environment variable not set. Exiting...')
@@ -142,7 +144,7 @@ async def on_message(message):
             await kick_and_delete_messages(message.author)
     else:
         bad_bots_role, moderator_role, _ = await get_roles_and_channel(guild)
-        if bad_bots_role in message.author.roles:
+        if bad_bots_role in message.author.roles and message.channel.name != BOT_TRAP_CHANNEL_NAME:
             await message.delete()
             logger.info('Deleted message from %s in %s: %s', message.author.name,
                         message.guild.name, message.content)
