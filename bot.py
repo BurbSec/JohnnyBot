@@ -1,9 +1,9 @@
+import discord
+from discord.ext import commands
 import os
 import logging
 from logging.handlers import RotatingFileHandler
 import asyncio
-import discord
-from discord.ext import commands
 
 TOKEN = os.environ.get('DISCORD_BOT_TOKEN')
 BAD_BOT_ROLE_NAME = 'bad bots'
@@ -32,6 +32,7 @@ logger.setLevel(logging.INFO)
 script_dir = os.path.dirname(os.path.abspath(__file__))
 log_file_path = os.path.join(script_dir, LOG_FILE)
 
+# Create the log file if it doesn't exist, with UTF-8 encoding
 if not os.path.exists(log_file_path):
     open(log_file_path, 'a', encoding='utf-8').close()
 
@@ -41,6 +42,20 @@ handler.setFormatter(formatter)
 logger.addHandler(handler)
 
 bot = commands.Bot(command_prefix='!', intents=intents)
+
+def parse_duration(duration: str) -> int:
+    units = {
+        's': 1,
+        'm': 60,
+        'h': 3600,
+        'd': 86400
+    }
+    try:
+        amount = int(duration[:-1])
+        unit = duration[-1].lower()
+        return amount * units[unit]
+    except (ValueError, KeyError) as exc:
+        raise ValueError('Invalid duration format. Use a number followed by a unit (s, m, h, d).') from exc
 
 async def get_roles_and_channel(guild):
     bad_bots_role = discord.utils.get(guild.roles, name=BAD_BOT_ROLE_NAME)
@@ -112,6 +127,8 @@ async def on_member_update(after):
     bad_bots_role, _, _ = await get_roles_and_channel(guild)
     if bad_bots_role in after.roles and len(after.roles) > 2:
         await after.remove_roles(bad_bots_role, reason='User has additional roles')
+        await log_and_send_message(guild, 'Removed %s role from %s in %s',
+                                   BAD_BOT_ROLE_NAME, after.name, guild.name)
 
 @bot.event
 async def on_message(message):
@@ -237,20 +254,6 @@ async def timeout_command(interaction: discord.Interaction, member: discord.Memb
         logger.error('Error timing out %s: %s (Status code: %d)', member.name, error_response.text, error_response.status)
         await log_and_send_message(interaction.guild, 'Error timing out %s: %s (Status code: %d)', member.name,
                                    error_response.text, error_response.status, level='error')
-
-def parse_duration(duration: str) -> int:
-    units = {
-        's': 1,
-        'm': 60,
-        'h': 3600,
-        'd': 86400
-    }
-    try:
-        amount = int(duration[:-1])
-        unit = duration[-1].lower()
-        return amount * units[unit]
-    except (ValueError, KeyError) as exc:
-        raise ValueError('Invalid duration format. Use a number followed by a unit (s, m, h, d).') from exc
 
 if __name__ == '__main__':
     bot.run(TOKEN)
