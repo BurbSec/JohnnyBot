@@ -45,7 +45,16 @@ logger.addHandler(handler)
 
 bot = commands.Bot(command_prefix='!', intents=intents)
 
+# ... (previous code remains the same)
+
 def parse_duration(duration: str) -> int:
+    """
+    Parse a duration string and return the corresponding number of seconds.
+
+    :param duration: A string representing the duration, e.g., '5m', '2h', '1d'
+    :return: The duration in seconds
+    :raises ValueError: If the duration format is invalid
+    """
     units = {
         's': 1,
         'm': 60,
@@ -60,12 +69,26 @@ def parse_duration(duration: str) -> int:
         raise ValueError('Invalid duration format. Use a number followed by a unit (s, m, h, d).') from exc
 
 async def get_roles_and_channel(guild):
+    """
+    Retrieve the "bad bots" role, moderator role, and moderators channel for a given guild.
+
+    :param guild: The Discord guild
+    :return: A tuple containing the "bad bots" role, moderator role, and moderators channel
+    """
     bad_bots_role = discord.utils.get(guild.roles, name=BAD_BOT_ROLE_NAME)
     moderator_role = discord.utils.get(guild.roles, name=MODERATOR_ROLE_NAME)
     moderators_channel = discord.utils.get(guild.text_channels, name=MODERATORS_CHANNEL_NAME)
     return bad_bots_role, moderator_role, moderators_channel
 
 async def log_and_send_message(guild, message, *args, level='info'):
+    """
+    Log a message and send it to the moderators channel.
+
+    :param guild: The Discord guild
+    :param message: The message to log and send
+    :param args: Arguments to format the message
+    :param level: The logging level ('info', 'error', or 'debug')
+    """
     if level == 'info':
         logger.info(message, *args)
     elif level == 'error':
@@ -77,6 +100,11 @@ async def log_and_send_message(guild, message, *args, level='info'):
         await moderators_channel.send(message % args)
 
 async def kick_and_delete_messages(member):
+    """
+    Kick a member and delete their messages.
+
+    :param member: The Discord member to kick
+    """
     guild = member.guild
     try:
         delete_messages = [msg async for msg in member.history(limit=None)]
@@ -113,6 +141,11 @@ async def kick_and_delete_messages(member):
 
 @bot.event
 async def on_member_join(member):
+    """
+    Event handler for when a new member joins the server.
+
+    :param member: The Discord member who joined
+    """
     guild = member.guild
     bad_bots_role, _, _ = await get_roles_and_channel(guild)
     if bad_bots_role:
@@ -125,15 +158,26 @@ async def on_member_join(member):
 
 @bot.event
 async def on_member_update(after):
+    """
+    Event handler for when a member's roles are updated.
+
+    :param before: The member's state before the update
+    :param after: The member's state after the update
+    """
     guild = after.guild
     bad_bots_role, _, _ = await get_roles_and_channel(guild)
-    if bad_bots_role in after.roles and len(after.roles) > 2:
+    if bad_bots_role in after.roles and any(role != guild.default_role for role in after.roles):
         await after.remove_roles(bad_bots_role, reason='User has additional roles')
         await log_and_send_message(guild, 'Removed %s role from %s in %s',
                                    BAD_BOT_ROLE_NAME, after.name, guild.name)
 
 @bot.event
 async def on_message(message):
+    """
+    Event handler for when a message is sent.
+
+    :param message: The Discord message
+    """
     if message.author == bot.user:
         return
 
@@ -161,9 +205,12 @@ async def on_message(message):
                     await log_and_send_message(guild, 'Error deleting message from %s in protected channel %s: %s (Status code: %d)',
                                                message.author.name, message.channel.name, error_response.text,
                                                error_response.status, level='error')
-            
+
 @bot.event
 async def on_ready():
+    """
+    Event handler for when the bot is ready.
+    """
     logger.info('Logged in as %s (ID: %s)', bot.user.name, bot.user.id)
 
     # Register the slash command
@@ -178,6 +225,13 @@ async def on_ready():
 @bot.tree.command(name='botsay', description='Make the bot say something in a channel')
 @commands.has_role(MODERATOR_ROLE_NAME)
 async def botsay(interaction: discord.Interaction, channel: discord.TextChannel, message: str):
+    """
+    Slash command to make the bot say something in a channel.
+
+    :param interaction: The Discord interaction
+    :param channel: The target channel
+    :param message: The message to send
+    """
     try:
         await channel.send(message)
         await interaction.response.send_message(f'Message sent to {channel.mention}', ephemeral=True)
@@ -193,6 +247,13 @@ async def botsay(interaction: discord.Interaction, channel: discord.TextChannel,
 @bot.tree.command(name='kick', description='Kick a member from the server')
 @commands.has_role(MODERATOR_ROLE_NAME)
 async def kick_command(interaction: discord.Interaction, member: discord.Member, reason: str = None):
+    """
+    Slash command to kick a member from the server.
+
+    :param interaction: The Discord interaction
+    :param member: The member to kick
+    :param reason: The reason for kicking the member
+    """
     try:
         await member.kick(reason=reason)
         await interaction.response.send_message(f'Kicked {member.mention} from the server.', ephemeral=True)
@@ -215,6 +276,13 @@ async def kick_command(interaction: discord.Interaction, member: discord.Member,
 @bot.tree.command(name='ban', description='Ban a member from the server')
 @commands.has_role(MODERATOR_ROLE_NAME)
 async def ban_command(interaction: discord.Interaction, member: discord.Member, reason: str = None):
+    """
+    Slash command to ban a member from the server.
+
+    :param interaction: The Discord interaction
+    :param member: The member to ban
+    :param reason: The reason for banning the member
+    """
     try:
         await member.ban(reason=reason)
         await interaction.response.send_message(f'Banned {member.mention} from the server.', ephemeral=True)
@@ -237,11 +305,19 @@ async def ban_command(interaction: discord.Interaction, member: discord.Member, 
 @bot.tree.command(name='timeout', description='Timeout a member in the server')
 @commands.has_role(MODERATOR_ROLE_NAME)
 async def timeout_command(interaction: discord.Interaction, member: discord.Member, duration: str, reason: str = None):
+    """
+    Slash command to timeout a member in the server.
+
+    :param interaction: The Discord interaction
+    :param member: The member to timeout
+    :param duration: The duration of the timeout
+    :param reason: The reason for the timeout
+    """
     try:
         timeout_duration = parse_duration(duration)
         await member.timeout(timeout_duration, reason=reason)
         await interaction.response.send_message(f'Timed out {member.mention} for {duration}.', ephemeral=True)
-        
+
         logging_channel = discord.utils.get(interaction.guild.text_channels, name=LOGGING_CHANNEL_NAME)
         if logging_channel:
             await logging_channel.send(f'(¯`*•.¸,¤°´.｡.:* {member.name} has been timed out for {duration}. Reason: {reason} *:.｡.`°¤,¸.•*´¯)')
