@@ -157,7 +157,7 @@ async def on_member_join(member):
             await kick_and_delete_messages(member)
 
 @bot.event
-async def on_member_update(after):
+async def on_member_update(before, after):
     """
     Event handler for when a member's roles are updated.
 
@@ -166,7 +166,7 @@ async def on_member_update(after):
     """
     guild = after.guild
     bad_bots_role, _, _ = await get_roles_and_channel(guild)
-    if bad_bots_role in after.roles and any(role != guild.default_role for role in after.roles):
+    if bad_bots_role in after.roles and any(role not in before.roles for role in after.roles):
         await after.remove_roles(bad_bots_role, reason='User has additional roles')
         await log_and_send_message(guild, 'Removed %s role from %s in %s',
                                    BAD_BOT_ROLE_NAME, after.name, guild.name)
