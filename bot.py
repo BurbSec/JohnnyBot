@@ -9,14 +9,15 @@ from discord.ext import commands
 TOKEN = os.environ.get('DISCORD_BOT_TOKEN')
 BAD_BOT_ROLE_NAME = 'bad bots'
 MODERATOR_ROLE_NAME = 'Moderators'
+AUTOMATA_ROLE_NAME = 'automata'
 DELAY_MINUTES = 4
 LOG_FILE = 'johnnybot.log'
 LOG_MAX_SIZE = 5 * 1024 * 1024  # 5MB
-MODERATORS_CHANNEL_NAME = 'moderators_only'  # Name of the moderators channel
+MODERATORS_CHANNEL_NAME = 'moderators_only'
 PROTECTED_CHANNELS = ['🫠・code_of_conduct', '🧚・hey_listen', '👯・local_events',
-                      '🧩・ctf_announcements', '🖥・virtual_events']  # Users can't post here
-LOGGING_CHANNEL_NAME = '🍻・general_lobbycon'  # Name of the channel to log kicks
-BOT_TRAP_CHANNEL_NAME = 'bot-trap'  # Name of the channel where bad bots are allowed to post
+                      '🧩・ctf_announcements', '🖥・virtual_events']
+LOGGING_CHANNEL_NAME = '🍻・general_lobbycon'
+BOT_TRAP_CHANNEL_NAME = 'bot-trap'
 
 if not TOKEN:
     print('DISCORD_BOT_TOKEN environment variable not set. Exiting...')
@@ -44,8 +45,6 @@ handler.setFormatter(formatter)
 logger.addHandler(handler)
 
 bot = commands.Bot(command_prefix='!', intents=intents)
-
-# ... (previous code remains the same)
 
 def parse_duration(duration: str) -> int:
     """
@@ -80,24 +79,28 @@ async def get_roles_and_channel(guild):
     moderators_channel = discord.utils.get(guild.text_channels, name=MODERATORS_CHANNEL_NAME)
     return bad_bots_role, moderator_role, moderators_channel
 
-async def log_and_send_message(guild, message, *args, level='info'):
+async def log_and_send_message(guild, message, *args, level='info', **kwargs):
     """
-    Log a message and send it to the moderators channel.
+    Log a message and send it to the moderators channel with enhanced logging.
 
     :param guild: The Discord guild
     :param message: The message to log and send
     :param args: Arguments to format the message
     :param level: The logging level ('info', 'error', or 'debug')
+    :param kwargs: Additional keyword arguments for context
     """
+    formatted_message = message % args
+    
     if level == 'info':
-        logger.info(message, *args)
+        logger.info(formatted_message, *args, extra=kwargs)
     elif level == 'error':
-        logger.error(message, *args)
+        logger.error(formatted_message, *args, extra=kwargs)
     elif level == 'debug':
-        logger.debug(message, *args)
+        logger.debug(formatted_message, *args, extra=kwargs)
+    
     moderators_channel = discord.utils.get(guild.text_channels, name=MODERATORS_CHANNEL_NAME)
     if moderators_channel:
-        await moderators_channel.send(message % args)
+        await moderators_channel.send(formatted_message)
 
 async def kick_and_delete_messages(member):
     """
@@ -185,28 +188,51 @@ async def on_message(message):
     if isinstance(message.channel, discord.DMChannel):
         bad_bots_role, _, _ = await get_roles_and_channel(guild)
         if (bad_bots_role in message.author.roles or len(message.author.roles) == 1) and message.author in guild.members:
+            logger.info(f'Kicking {message.author.name} from {guild.name} due to no roles in DM')
             await kick_and_delete_messages(message.author)
     else:
         bad_bots_role, moderator_role, _ = await get_roles_and_channel(guild)
-        automata_role = discord.utils.get(guild.roles, name='Automata')
+        automata_role = discord.utils.get(guild.roles, name=AUTOMATA_ROLE_NAME)
         
+        # Logging additional context for message deletion
         if bad_bots_role in message.author.roles and message.channel.name != BOT_TRAP_CHANNEL_NAME:
             await message.delete()
-            logger.info('Deleted message from %s in %s: %s', message.author.name,
-                        message.guild.name, message.content)
+            logger.info('Deleted message from %s in %s (bad bots role, outside bot trap): %s', 
+                        message.author.name, message.guild.name, message.content)
+        
         elif message.channel.name in PROTECTED_CHANNELS:
-            if moderator_role not in message.author.roles and (automata_role is None or automata_role not in message.author.roles):
+            # Detailed logging for protected channel message deletion
+            reason = ""
+            if moderator_role not in message.author.roles:
+                reason += "Not a moderator. "
+            if automata_role is None or automata_role not in message.author.roles:
+                reason += "Not an Automata role member. "
+            
+            if reason:
                 try:
                     await message.delete()
-                    logger.info('Deleted message from %s in protected channel %s: %s',
-                                message.author.name, message.channel.name, message.content)
+                    logger.info(
+                        'Deleted message from %s in protected channel %s. Reasons: %s Message content: %s', 
+                        message.author.name, message.channel.name, reason.strip(), message.content
+                    )
+                    await log_and_send_message(
+                        guild, 
+                        f'Deleted message in {message.channel.name} from {message.author.name}. Reasons: {reason.strip()}',
+                        level='info'
+                    )
                 except discord.errors.HTTPException as e:
                     error_response = e.response
-                    logger.error('Error deleting message from %s in protected channel %s: %s (Status code: %d)',
-                                 message.author.name, message.channel.name, error_response.text, error_response.status)
-                    await log_and_send_message(guild, 'Error deleting message from %s in protected channel %s: %s (Status code: %d)',
-                                               message.author.name, message.channel.name, error_response.text,
-                                               error_response.status, level='error')
+                    logger.error(
+                        'Error deleting message from %s in protected channel %s: %s (Status code: %d)',
+                        message.author.name, message.channel.name, error_response.text, error_response.status
+                    )
+                    await log_and_send_message(
+                        guild, 
+                        'Error deleting message from %s in protected channel %s: %s (Status code: %d)',
+                        message.author.name, message.channel.name, error_response.text,
+                        error_response.status, 
+                        level='error'
+                    )
 
 @bot.event
 async def on_ready():
