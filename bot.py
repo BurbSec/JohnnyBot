@@ -201,23 +201,17 @@ async def on_message(message):
                         message.author.name, message.guild.name, message.content)
         
         elif message.channel.name in PROTECTED_CHANNELS:
-            # Detailed logging for protected channel message deletion
-            reason = ""
-            if moderator_role not in message.author.roles:
-                reason += "Not a moderator. "
-            if automata_role is None or automata_role not in message.author.roles:
-                reason += "Not an Automata role member. "
-            
-            if reason:
+            # Allow moderators and automata roles to post in protected channels
+            if moderator_role not in message.author.roles and (automata_role is None or automata_role not in message.author.roles):
                 try:
                     await message.delete()
                     logger.info(
-                        'Deleted message from %s in protected channel %s. Reasons: %s Message content: %s', 
-                        message.author.name, message.channel.name, reason.strip(), message.content
+                        'Deleted message from %s in protected channel %s. Not a moderator or Automata role. Message content: %s', 
+                        message.author.name, message.channel.name, message.content
                     )
                     await log_and_send_message(
                         guild, 
-                        f'Deleted message in {message.channel.name} from {message.author.name}. Reasons: {reason.strip()}',
+                        f'Deleted message in {message.channel.name} from {message.author.name}. Not a moderator or Automata role.',
                         level='info'
                     )
                 except discord.errors.HTTPException as e:
