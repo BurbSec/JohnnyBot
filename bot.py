@@ -188,12 +188,14 @@ async def on_message(message):
             await kick_and_delete_messages(message.author)
     else:
         bad_bots_role, moderator_role, _ = await get_roles_and_channel(guild)
+        automata_role = discord.utils.get(guild.roles, name='Automata')
+        
         if bad_bots_role in message.author.roles and message.channel.name != BOT_TRAP_CHANNEL_NAME:
             await message.delete()
             logger.info('Deleted message from %s in %s: %s', message.author.name,
                         message.guild.name, message.content)
         elif message.channel.name in PROTECTED_CHANNELS:
-            if moderator_role not in message.author.roles:
+            if moderator_role not in message.author.roles and (automata_role is None or automata_role not in message.author.roles):
                 try:
                     await message.delete()
                     logger.info('Deleted message from %s in protected channel %s: %s',
