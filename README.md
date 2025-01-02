@@ -69,32 +69,26 @@ JohnnyBot is a Discord moderation bot designed to automate role management and e
   - `channel`: The channel to purge messages from.
   - `limit`: Number of messages to delete.
 
-### 3. `/mute`
-**Description:** Mutes a member by adding a specific role.
-- **Parameters:**
-  - `member`: Member to mute.
-  - `reason`: Reason for the mute (optional).
-
-### 4. `/kick`
+### 3. `/kick`
 **Description:** Kicks a member from the server.
 - **Parameters:**
   - `member`: Member to kick.
   - `reason`: Reason for the kick (optional).
 
-### 5. `/botsay`
+### 4. `/botsay`
 **Description:** Makes the bot send a message to a specified channel.
 - **Parameters:**
   - `channel`: Target channel.
   - `message`: Message to send.
 
-### 6. `/timeout`
+### 5. `/timeout`
 **Description:** Timeouts a member for a specified duration.
 - **Parameters:**
   - `member`: Member to timeout.
   - `duration`: Timeout duration in seconds.
   - `reason`: Reason for the timeout (optional).
 
-### 7. `/log_tail`
+### 6. `/log_tail`
 **Description:** Sends the last specified number of lines from the bot's log file to the user via DM.
 - **Parameters:**
   - `lines`: Number of lines to retrieve.

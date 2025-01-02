@@ -1,4 +1,5 @@
 import logging
+import time
 import os
 import json
 from datetime import timedelta
@@ -62,13 +63,20 @@ async def on_ready():
     print(f'Logged in as {bot.user} (ID: {bot.user.id})')
     print('------')
 
+# Allow for very long reminder sleeps 
 @tasks.loop(seconds=60)
 async def reminder_loop():
+    current_time = time.time()
     for reminder in reminders.values():
-        channel = bot.get_channel(reminder['channel_id'])
-        if channel:
-            await channel.send(f'**{reminder['title']}**\n{reminder['message']}')
+        if current_time >= reminder.get('next_run', 0):
+            channel = bot.get_channel(reminder['channel_id'])
+            if channel:
+                await channel.send(f'**{reminder["title"]}**\n{reminder["message"]}')
+            reminder['next_run'] = current_time + reminder['interval']
+    with open(REMINDERS_FILE, 'w', encoding='utf-8') as reminder_file:
+        json.dump(reminders, reminder_file)
 
+# Reminder spam 
 @tree.command(name='set_reminder', description='Sets a reminder message to be sent to a channel at regular intervals')
 @app_commands.describe(channel='Channel to send the reminder to', title='Title of the reminder', message='Reminder message', interval='Interval in seconds')
 @app_commands.checks.has_role(MODERATOR_ROLE_NAME)
@@ -77,12 +85,41 @@ async def set_reminder(interaction: discord.Interaction, channel: discord.TextCh
         'channel_id': channel.id,
         'title': title,
         'message': message,
-        'interval': interval
+        'interval': interval,
+        'next_run': time.time() + interval
     }
     with open(REMINDERS_FILE, 'w', encoding='utf-8') as reminder_file:
         json.dump(reminders, reminder_file)
     await interaction.response.send_message(f'Reminder set in {channel.mention} every {interval} seconds.', ephemeral=True)
 
+@set_reminder.error
+async def set_reminder_error(interaction: discord.Interaction, error):
+    if isinstance(error, app_commands.MissingRole):
+        await interaction.response.send_message('You do not have permission to set reminders.', ephemeral=True)
+@tree.command(name='list_reminders', description='Lists all current reminder titles along with their text')
+async def list_reminders(interaction: discord.Interaction):
+    if not reminders:
+        await interaction.response.send_message('There are no reminders set.', ephemeral=True)
+        return
+
+    reminder_list = '\n'.join([f"**{reminder['title']}**: {reminder['message']}" for reminder in reminders.values()])
+    await interaction.response.send_message(f'Current reminders:\n{reminder_list}', ephemeral=True)
+
+@tree.command(name='delete_reminder', description='Deletes a reminder by title')
+@app_commands.describe(title='Title of the reminder to delete')
+@app_commands.checks.has_role(MODERATOR_ROLE_NAME)
+async def delete_reminder(interaction: discord.Interaction, title: str):
+    for channel_id, reminder in reminders.items():
+        if reminder['title'] == title:
+            del reminders[channel_id]
+            with open(REMINDERS_FILE, 'w', encoding='utf-8') as reminder_file:
+                json.dump(reminders, reminder_file)
+            await interaction.response.send_message(f'Reminder titled "{title}" has been deleted.', ephemeral=True)
+            return
+
+    await interaction.response.send_message(f'No reminder found with the title "{title}".', ephemeral=True)
+
+# Purge channel messages
 @tree.command(name='purge', description='Purges a specified number of messages from a channel')
 @app_commands.describe(channel='Channel to purge messages from', limit='Number of messages to delete')
 @app_commands.describe(limit='Number of messages to delete')
@@ -90,17 +127,7 @@ async def purge(interaction: discord.Interaction, channel: discord.TextChannel, 
     deleted = await channel.purge(limit=limit)
     await interaction.response.send_message(f'Deleted {len(deleted)} message(s)', ephemeral=True)
 
-@tree.command(name='mute', description='Mutes a member by adding a specific role')
-@app_commands.describe(member='Member to mute', reason='Reason for mute')
-@app_commands.checks.has_role(MODERATOR_ROLE_NAME)
-async def mute(interaction: discord.Interaction, member: discord.Member, reason: str = None):
-    automata_role = discord.utils.get(interaction.guild.roles, name=AUTOMATA_ROLE_NAME)
-    if automata_role:
-        await member.add_roles(automata_role, reason=reason)
-        await interaction.response.send_message(f'{member.mention} has been muted.', ephemeral=True)
-    else:
-        await interaction.response.send_message('Mute role not found.', ephemeral=True)
-
+# Kick a member
 @tree.command(name='kick', description='Kicks a member from the server')
 @app_commands.describe(member='Member to kick', reason='Reason for kick')
 @app_commands.checks.has_role(MODERATOR_ROLE_NAME)
@@ -108,6 +135,7 @@ async def kick(interaction: discord.Interaction, member: discord.Member, reason:
     await member.kick(reason=reason)
     await interaction.response.send_message(f'{member.mention} has been kicked. Reason: {reason}', ephemeral=True)
 
+# Make the bot say something in chat
 @tree.command(name='botsay', description='Makes the bot send a message to a specified channel')
 @app_commands.describe(channel='Channel to send the message to', message='Message to send')
 @app_commands.checks.has_role(MODERATOR_ROLE_NAME)
@@ -115,6 +143,7 @@ async def botsay(interaction: discord.Interaction, channel: discord.TextChannel,
     await channel.send(message)
     await interaction.response.send_message(f'Message sent to {channel.mention}', ephemeral=True)
 
+# Put a member in time out
 @tree.command(name='timeout', description='Timeouts a member for a specified duration')
 @app_commands.describe(member='Member to timeout', duration='Timeout duration in seconds', reason='Reason for timeout')
 @app_commands.checks.has_role(MODERATOR_ROLE_NAME)
@@ -122,12 +151,6 @@ async def timeout(interaction: discord.Interaction, member: discord.Member, dura
     until = discord.utils.utcnow() + timedelta(seconds=duration)
     await member.timeout(until, reason=reason)
     await interaction.response.send_message(f'{member.mention} has been timed out for {duration} seconds.', ephemeral=True)
-
-@set_reminder.error
-async def set_reminder_error(interaction: discord.Interaction, error):
-    if isinstance(error, app_commands.MissingRole):
-        await interaction.response.send_message('You do not have permission to set reminders.', ephemeral=True)
-
 
 
 @tree.command(name='log_tail', description='DM the last specified number of lines of the bot log to the user')
