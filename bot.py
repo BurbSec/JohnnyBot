@@ -130,4 +130,19 @@ async def set_reminder_error(interaction: discord.Interaction, error):
 
 
 
+@tree.command(name='log_tail', description='DM the last specified number of lines of the bot log to the user')
+@app_commands.describe(lines='Number of lines to retrieve from the log')
+async def log_tail(interaction: discord.Interaction, lines: int):
+    try:
+        with open(LOG_FILE, 'r', encoding='utf-8') as log_file:
+            last_lines = ''.join(log_file.readlines()[-lines:])
+        if last_lines:
+            await interaction.user.send(f'```{last_lines}```')
+            await interaction.response.send_message('Log lines sent to your DMs.', ephemeral=True)
+        else:
+            await interaction.response.send_message('Log file is empty.', ephemeral=True)
+    except (OSError, IOError) as e:
+        logger.error('Failed to read log file: %s', e)
+        await interaction.response.send_message('Failed to retrieve log file.', ephemeral=True)
+
 bot.run(TOKEN)
