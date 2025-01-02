@@ -34,15 +34,7 @@ JohnnyBot is a Discord moderation bot designed to automate role management and e
    pip install -r requirements.txt
    ```
 
-3. Set up the token:
-   - Get a bot token by following [this guide](https://www.writebots.com/discord-bot-token/)
-   - Create a new file named `.env` in the project directory.
-   - Add the following line to the `.env` file, replacing `YOUR_BOT_TOKEN` with your actual Discord bot token:
-     ```shell
-     DISCORD_BOT_TOKEN=YOUR_BOT_TOKEN
-     ```
-
-4. Configure the bot settings:
+3. Configure the bot settings:
    - Open the `bot.py` file in a text editor.
    - Modify the following constants according to your server's setup:
      - `BAD_BOT_ROLE_NAME`: Role assigned to bad bots (default: 'bad bots').
@@ -54,11 +46,12 @@ JohnnyBot is a Discord moderation bot designed to automate role management and e
 ## Running the Bot
 
 1. Ensure all installation steps are complete.
-2. Run the bot:
+2. Add your Discord bot token to an environment variable called `DISCORD_BOT_TOKEN`
+3. Run the bot:
    ```shell
    python bot.py
    ```
-3. The bot should now be online and moderating your Discord server.
+4. The bot should now be online and moderating your Discord server.
 
 ## Available Commands
 
