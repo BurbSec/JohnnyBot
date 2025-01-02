@@ -20,7 +20,7 @@ JohnnyBot is a Discord moderation bot designed to automate role management and e
 ## Requirements
 
 - Python 3.7 or higher
-- discord.py library (version 2.0 or higher)
+- Official Discord.py library version 2.4 or higher
 
 ## Installation
 
