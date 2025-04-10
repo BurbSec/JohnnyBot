@@ -143,17 +143,24 @@ async def list_reminders(interaction: discord.Interaction):
 @app_commands.checks.has_role(MODERATOR_ROLE_NAME)
 async def delete_reminder(interaction: discord.Interaction, title: str):
     try:
-        for channel_id, reminder in reminders.items():
+        for channel_id, reminder in list(reminders.items()):  # Use list() to avoid runtime dictionary modification
             if reminder['title'] == title:
+                # Remove the reminder from the dictionary
                 del reminders[channel_id]
+                
+                # Stop the associated thread
                 if channel_id in reminder_threads:
-                    reminder_threads[channel_id].set()  # Stop the reminder thread
-                    del reminder_threads[channel_id]
+                    reminder_threads[channel_id].set()  # Signal the thread to stop
+                    del reminder_threads[channel_id]  # Remove the stop_event from the dictionary
+                
+                # Save the updated reminders to the file
                 with open(REMINDERS_FILE, 'w', encoding='utf-8') as reminder_file:
                     json.dump(reminders, reminder_file)
+                
                 await interaction.response.send_message(f'Reminder titled "{title}" has been deleted.', ephemeral=True)
                 return
 
+        # If no reminder with the given title is found
         await interaction.response.send_message(f'No reminder found with the title "{title}".', ephemeral=True)
     except (OSError, IOError) as e:
         logger.error('Failed to write reminders file: %s', e)
