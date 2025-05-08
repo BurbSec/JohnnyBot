@@ -22,6 +22,27 @@ JohnnyBot is a Discord moderation bot designed to automate role management and e
 - Python 3.7 or higher
 - Official Discord.py library version 2.4 or higher
 
+## Concurrency Model
+
+Note the bot uses both asyncio and threading for different purposes. DON'T CHNAGE THIS:
+
+- **asyncio** is used for:
+  - All Discord API interactions (primary event loop)
+  - Background tasks (like reminder checking)
+  - Command handling
+  - Network operations
+
+- **threading** is used for:
+  - Synchronous operations that can't be made async (like file I/O)
+  - Thread-safe caching of Discord objects
+  - Synchronization primitives (locks) for shared resources
+
+This hybrid approach allows the bot to:
+1. Handle Discord's async API efficiently
+2. Perform blocking operations without stalling the event loop
+3. Maintain thread safety for shared resources
+4. Scale well under load
+
 ## Installation
 
 1. Clone the repository:
