@@ -8,8 +8,14 @@ from logging.handlers import RotatingFileHandler
 import discord
 from discord import app_commands
 from discord.ext import commands
+from functools import wraps
+from typing import Any, Callable, Coroutine, Optional, TypeVar, Union
+
+T = TypeVar('T')
 
 TOKEN = os.environ.get('DISCORD_BOT_TOKEN')
+if not TOKEN:
+    raise ValueError("DISCORD_BOT_TOKEN environment variable is not set")
 BAD_BOT_ROLE_NAME = 'bad bots'
 MODERATOR_ROLE_NAME = 'Moderators'
 AUTOMATA_ROLE_NAME = 'automata'
@@ -38,6 +44,7 @@ tree = bot.tree
 
 reminders = {}
 reminder_threads = {}
+reminders_lock = threading.Lock()
 
 # Load reminders from file
 if os.path.exists(REMINDERS_FILE):
@@ -46,6 +53,44 @@ if os.path.exists(REMINDERS_FILE):
             reminders = json.load(f)
     except (OSError, IOError) as e:
         logger.error('Failed to read reminders file: %s', e)
+
+def handle_errors(func: Callable[..., Coroutine[Any, Any, T]]) -> Callable[..., Coroutine[Any, Any, Optional[T]]]:
+    """Decorator to handle common errors in slash commands."""
+    @wraps(func)
+    async def wrapper(interaction: discord.Interaction, *args: Any, **kwargs: Any) -> Optional[T]:
+        try:
+            return await func(interaction, *args, **kwargs)
+        except app_commands.errors.MissingRole:
+            await interaction.response.send_message(
+                'You do not have the required role to use this command.',
+                ephemeral=True
+            )
+        except discord.HTTPException as e:
+            logger.error('Discord API error: %s', e)
+            await interaction.response.send_message(
+                'Discord API error occurred.',
+                ephemeral=True
+            )
+        except (OSError, IOError) as e:
+            logger.error('File access error: %s', e)
+            await interaction.response.send_message(
+                'File access error occurred.',
+                ephemeral=True
+            )
+        except Exception as e:
+            logger.error('Unexpected error: %s', e)
+            await interaction.response.send_message(
+                'An unexpected error occurred.',
+                ephemeral=True
+            )
+        return None
+    return wrapper
+
+async def cleanup_reminder_threads() -> None:
+    """Clean up all reminder threads by setting their stop events."""
+    for stop_event in reminder_threads.values():
+        stop_event.set()
+    reminder_threads.clear()
 
 @bot.event
 async def on_ready():
@@ -65,6 +110,11 @@ async def on_ready():
     logger.info('Logged in as %s (ID: %s)', bot.user, bot.user.id)
     print(f'Logged in as {bot.user} (ID: {bot.user.id})')
     print('------')
+
+@bot.event
+async def on_disconnect():
+    """Clean up resources when bot disconnects."""
+    await cleanup_reminder_threads()
 
     # Restart reminder loops for existing reminders
     for reminder in reminders.values():
@@ -86,20 +136,33 @@ def send_reminder(channel_id, title, message, interval, stop_event):
         if channel:
             bot.loop.create_task(channel.send(f'**{title}**\n{message}'))
 
+class InvalidReminderInterval(Exception):
+    """Exception raised when an invalid reminder interval is provided."""
+    pass
+
+def validate_reminder_interval(interval: int) -> None:
+    """Validate that reminder interval is reasonable."""
+    if interval < 60:
+        raise InvalidReminderInterval("Interval must be at least 60 seconds")
+    if interval > 86400:
+        raise InvalidReminderInterval("Interval must be less than 24 hours (86400 seconds)")
+
 @tree.command(name='set_reminder', description='Sets a reminder message to be sent to a channel at regular intervals')
 @app_commands.describe(channel='Channel to send the reminder to', title='Title of the reminder', message='Reminder message', interval='Interval in seconds')
 @app_commands.checks.has_role(MODERATOR_ROLE_NAME)
 async def set_reminder(interaction: discord.Interaction, channel: discord.TextChannel, title: str, message: str, interval: int):
     """Sets a reminder message to be sent to a channel at regular intervals."""
     try:
-        reminders[channel.id] = {
-            'channel_id': channel.id,
-            'title': title,
-            'message': message,
-            'interval': interval
-        }
-        with open(REMINDERS_FILE, 'w', encoding='utf-8') as reminder_file:
-            json.dump(reminders, reminder_file)
+        validate_reminder_interval(interval)
+        with reminders_lock:
+            reminders[channel.id] = {
+                'channel_id': channel.id,
+                'title': title,
+                'message': message,
+                'interval': interval
+            }
+            with open(REMINDERS_FILE, 'w', encoding='utf-8') as reminder_file:
+                json.dump(reminders, reminder_file)
         
         # Start the reminder loop using threading.Timer
         stop_event = threading.Event()
@@ -109,6 +172,11 @@ async def set_reminder(interaction: discord.Interaction, channel: discord.TextCh
         reminder_threads[channel.id] = stop_event
         
         await interaction.response.send_message(f'Reminder set in {channel.mention} every {interval} seconds.', ephemeral=True)
+    except InvalidReminderInterval as e:
+        await interaction.response.send_message(f'Invalid interval: {e}', ephemeral=True)
+    except discord.HTTPException as e:
+        logger.error('Discord API error: %s', e)
+        await interaction.response.send_message('Discord API error occurred.', ephemeral=True)
     except (OSError, IOError) as e:
         logger.error('Failed to write reminders file: %s', e)
         await interaction.response.send_message('Failed to set reminder due to file access error.', ephemeral=True)
@@ -138,10 +206,27 @@ async def list_reminders(interaction: discord.Interaction):
         logger.error('An error occurred: %s', e)
         await interaction.response.send_message('An unexpected error occurred.', ephemeral=True)
 
+@tree.command(name='delete_all_reminders', description='Deletes all active reminders')
+@app_commands.checks.has_role(MODERATOR_ROLE_NAME)
+@handle_errors
+async def delete_all_reminders(interaction: discord.Interaction) -> None:
+    """Delete all active reminders."""
+    with reminders_lock:
+        reminders.clear()
+        for stop_event in reminder_threads.values():
+            stop_event.set()
+        reminder_threads.clear()
+        
+        with open(REMINDERS_FILE, 'w', encoding='utf-8') as reminder_file:
+            json.dump(reminders, reminder_file)
+    
+    await interaction.response.send_message('All reminders have been deleted.', ephemeral=True)
+
 @tree.command(name='delete_reminder', description='Deletes a reminder by title')
 @app_commands.describe(title='Title of the reminder to delete')
 @app_commands.checks.has_role(MODERATOR_ROLE_NAME)
-async def delete_reminder(interaction: discord.Interaction, title: str):
+@handle_errors
+async def delete_reminder(interaction: discord.Interaction, title: str) -> None:
     try:
         for channel_id, reminder in list(reminders.items()):  # Use list() to avoid runtime dictionary modification
             if reminder['title'] == title:
@@ -169,18 +254,33 @@ async def delete_reminder(interaction: discord.Interaction, title: str):
         logger.error('An error occurred: %s', e)
         await interaction.response.send_message('An unexpected error occurred.', ephemeral=True)
 
-@delete_reminder.error
-async def delete_reminder_error(interaction: discord.Interaction, error):
-    """Handles errors for the delete_reminder command."""
-    if isinstance(error, app_commands.errors.MissingRole):
-        await interaction.response.send_message('You do not have the required role to use this command.', ephemeral=True)
-    else:
-        await interaction.response.send_message(f'Error: {error}', ephemeral=True)
+@tree.command(name='list_reminder_threads', description='Lists all active reminder threads')
+@app_commands.checks.has_role(MODERATOR_ROLE_NAME)
+@handle_errors
+async def list_reminder_threads(interaction: discord.Interaction) -> None:
+    """List all active reminder threads."""
+    if not reminder_threads:
+        await interaction.response.send_message('No active reminder threads.', ephemeral=True)
+        return
+    
+    thread_list = []
+    with reminders_lock:
+        for channel_id, stop_event in reminder_threads.items():
+            reminder = reminders.get(channel_id, {})
+            thread_list.append(
+                f"Channel {channel_id}: {reminder.get('title', 'Unknown')} "
+                f"(every {reminder.get('interval', 0)} seconds)"
+            )
+    
+    await interaction.response.send_message(
+        f'Active reminder threads:\n' + '\n'.join(thread_list),
+        ephemeral=True
+    )
 
 # Purge channel messages
 @tree.command(name='purge_last_messages', description='Purges a specified number of messages from a channel')
 @app_commands.describe(channel='Channel to purge messages from', limit='Number of messages to delete')
-@app_commands.describe(limit='Number of messages to delete')
+@app_commands.checks.has_role(MODERATOR_ROLE_NAME)
 async def purge_last_messages(interaction: discord.Interaction, channel: discord.TextChannel, limit: int):
     """Purges a specified number of messages from a channel."""
     try:
@@ -331,4 +431,22 @@ async def log_tail_error(interaction: discord.Interaction, error):
     else:
         await interaction.response.send_message(f'Error: {error}', ephemeral=True)
 
-bot.run(TOKEN)
+def validate_input(func: Callable[..., Coroutine[Any, Any, T]]) -> Callable[..., Coroutine[Any, Any, T]]:
+    """Decorator to validate command input."""
+    @wraps(func)
+    async def wrapper(interaction: discord.Interaction, *args: Any, **kwargs: Any) -> T:
+        # Basic input sanitization
+        for arg in args:
+            if isinstance(arg, str) and len(arg) > 2000:
+                raise ValueError("Input too long (max 2000 characters)")
+        return await func(interaction, *args, **kwargs)
+    return wrapper
+
+try:
+    bot.run(TOKEN)
+except KeyboardInterrupt:
+    logger.info("Shutting down gracefully...")
+    asyncio.run(cleanup_reminder_threads())
+except Exception as e:
+    logger.error("Fatal error: %s", e)
+    raise
