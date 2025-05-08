@@ -1,4 +1,9 @@
 import asyncio
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.interval import IntervalTrigger
+from icalendar import Calendar
+import requests
+from datetime import datetime, timedelta
 import logging
 import threading
 import os
@@ -483,6 +488,70 @@ async def log_tail(interaction: discord.Interaction, lines: int):
 
 @log_tail.error
 async def log_tail_error(interaction: discord.Interaction, error):
+    await interaction.response.send_message(f"Error: {str(error)}", ephemeral=True)
+
+@tree.command(name='add_event_feed_url', description='Adds a calendar feed URL to check for events')
+async def add_event_feed_url(interaction: discord.Interaction, calendar_url: str):
+    """Adds a calendar feed to check for new events"""
+    try:
+        # Validate URL
+        if not calendar_url.startswith(('http://', 'https://')):
+            await interaction.response.send_message("Invalid URL format", ephemeral=True)
+            return
+            
+        # Add feed to tracking
+        if interaction.guild.id not in event_feed.feeds:
+            event_feed.feeds[interaction.guild.id] = {}
+            
+        event_feed.feeds[interaction.guild.id][calendar_url] = None
+        
+        # Do initial check
+        await event_feed.check_feeds()
+        
+        await interaction.response.send_message(
+            f"Added calendar feed! I'll check for new events hourly and post in #bot-trap",
+            ephemeral=True
+        )
+    except Exception as e:
+        await interaction.response.send_message(
+            f"Error adding feed: {str(e)}",
+            ephemeral=True
+        )
+
+@add_event_feed_url.error
+async def add_event_feed_url_error(interaction: discord.Interaction, error):
+    await interaction.response.send_message(f"Error: {str(error)}", ephemeral=True)
+
+@tree.command(name='add_event_feed', description='Adds a calendar feed to check for events')
+async def add_event_feed(interaction: discord.Interaction, calendar_url: str):
+    """Adds a calendar feed to check for new events"""
+    try:
+        # Validate URL
+        if not calendar_url.startswith(('http://', 'https://')):
+            await interaction.response.send_message("Invalid URL format", ephemeral=True)
+            return
+            
+        # Add feed to tracking
+        if interaction.guild.id not in event_feed.feeds:
+            event_feed.feeds[interaction.guild.id] = {}
+            
+        event_feed.feeds[interaction.guild.id][calendar_url] = None
+        
+        # Do initial check
+        await event_feed.check_feeds()
+        
+        await interaction.response.send_message(
+            f"Added calendar feed! I'll check for new events hourly and post in #bot-trap",
+            ephemeral=True
+        )
+    except Exception as e:
+        await interaction.response.send_message(
+            f"Error adding feed: {str(e)}",
+            ephemeral=True
+        )
+
+@add_event_feed.error
+async def add_event_feed_error(interaction: discord.Interaction, error):
     """Handles errors for the log_tail command."""
     if isinstance(error, app_commands.errors.MissingRole):
         await interaction.response.send_message('You do not have the required role to use this command.', ephemeral=True)
@@ -499,6 +568,117 @@ def validate_input(func: Callable[..., Coroutine[Any, Any, T]]) -> Callable[...,
                 raise ValueError("Input too long (max 2000 characters)")
         return await func(interaction, *args, **kwargs)
     return wrapper
+
+class EventFeed:
+    def __init__(self, bot):
+        self.bot = bot
+        self.feeds = {}  # {guild_id: {feed_url: last_checked}}
+        self.scheduler = AsyncIOScheduler()
+        self.scheduler.start()
+        
+    async def check_feeds(self):
+        """Check all registered calendar feeds for new events"""
+        for guild_id, feeds in self.feeds.items():
+            guild = self.bot.get_guild(guild_id)
+            if not guild:
+                continue
+                
+            for feed_url, last_checked in feeds.items():
+                try:
+                    # Fetch and parse calendar
+                    response = requests.get(feed_url)
+                    calendar = Calendar.from_ical(response.text)
+                    
+                    # Process events in next 30 days
+                    now = datetime.utcnow()
+                    end_date = now + timedelta(days=30)
+                    
+                    for component in calendar.walk():
+                        if component.name == "VEVENT":
+                            start = component.get('dtstart').dt
+                            if isinstance(start, datetime) and now <= start <= end_date:
+                                # Check if event is new or updated
+                                if last_checked is None or start > last_checked:
+                                    await self.create_discord_event(guild, component)
+                                    
+                    # Update last checked time
+                    self.feeds[guild_id][feed_url] = now
+                    
+                except Exception as e:
+                    print(f"Error processing feed {feed_url}: {e}")
+    
+    async def create_discord_event(self, guild, ical_event):
+        """Create Discord event from iCal event"""
+        try:
+            # Get bot-trap channel
+            channel = discord.utils.get(guild.text_channels, name="bot-trap")
+            if not channel:
+                return
+                
+            # Create Discord event
+            event = await guild.create_scheduled_event(
+                name=ical_event.get('summary'),
+                description=ical_event.get('description'),
+                start_time=ical_event.get('dtstart').dt,
+                end_time=ical_event.get('dtend').dt,
+                location=ical_event.get('location')
+            )
+            
+            # Post initial notification
+            await channel.send(
+                f"Upcoming event! {event.url}\n"
+                f"**{event.name}**\n"
+                f"{event.description or ''}"
+            )
+            
+            # Schedule reminders
+            await self.schedule_reminders(event)
+            
+        except Exception as e:
+            print(f"Error creating event: {e}")
+    
+    async def schedule_reminders(self, event):
+        """Schedule 24h and 10h reminders for an event"""
+        # 24h reminder
+        remind_time = event.start_time - timedelta(hours=24)
+        if remind_time > datetime.utcnow():
+            self.scheduler.add_job(
+                self.send_reminder,
+                trigger='date',
+                run_date=remind_time,
+                args=[event, "Starts in 24 hours!"]
+            )
+        
+        # 10h reminder
+        remind_time = event.start_time - timedelta(hours=10)
+        if remind_time > datetime.utcnow():
+            self.scheduler.add_job(
+                self.send_reminder,
+                trigger='date',
+                run_date=remind_time,
+                args=[event, "Starts in 10 hours!"]
+            )
+    
+    async def send_reminder(self, event, message):
+        """Send reminder message to bot-trap channel"""
+        try:
+            channel = discord.utils.get(event.guild.text_channels, name="bot-trap")
+            if channel:
+                await channel.send(f"{message} {event.url}")
+        except Exception as e:
+            print(f"Error sending reminder: {e}")
+
+# Initialize event feed system
+event_feed = EventFeed(bot)
+
+# Schedule hourly feed checks
+@bot.event
+async def on_ready():
+    event_feed.scheduler.add_job(
+        event_feed.check_feeds,
+        trigger=IntervalTrigger(hours=1),
+        next_run_time=datetime.now()
+    )
 
 try:
     bot.run(TOKEN)

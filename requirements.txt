@@ -1,1 +1,4 @@
-discord.py==2.3.2
+discord.py>=2.4
+apscheduler==3.10.1
+icalendar==5.0.11
+requests==2.31.0
