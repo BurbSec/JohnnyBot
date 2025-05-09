@@ -491,7 +491,11 @@ async def log_tail_error(interaction: discord.Interaction, error):
     await interaction.response.send_message(f"Error: {str(error)}", ephemeral=True)
 
 @tree.command(name='add_event_feed_url', description='Adds a calendar feed URL to check for events')
-async def add_event_feed_url(interaction: discord.Interaction, calendar_url: str):
+@app_commands.describe(
+    calendar_url='URL of the calendar feed',
+    channel_name='Channel to post notifications (default: bot-trap)'
+)
+async def add_event_feed_url(interaction: discord.Interaction, calendar_url: str, channel_name: str = "bot-trap"):
     """Adds a calendar feed to check for new events"""
     try:
         # Validate URL
@@ -503,13 +507,16 @@ async def add_event_feed_url(interaction: discord.Interaction, calendar_url: str
         if interaction.guild.id not in event_feed.feeds:
             event_feed.feeds[interaction.guild.id] = {}
             
-        event_feed.feeds[interaction.guild.id][calendar_url] = None
+        event_feed.feeds[interaction.guild.id][calendar_url] = {
+            'last_checked': None,
+            'channel': channel_name
+        }
         
         # Do initial check
         await event_feed.check_feeds()
         
         await interaction.response.send_message(
-            f"Added calendar feed! I'll check for new events hourly and post in #bot-trap",
+            f"Added calendar feed! I'll check for new events hourly and post in #{channel_name}",
             ephemeral=True
         )
     except Exception as e:
@@ -558,6 +565,29 @@ async def add_event_feed_error(interaction: discord.Interaction, error):
     else:
         await interaction.response.send_message(f'Error: {error}', ephemeral=True)
 
+@tree.command(name='list_event_feeds', description='Lists all registered calendar feeds')
+@handle_errors
+async def list_event_feeds(interaction: discord.Interaction):
+    """Lists all registered calendar feeds"""
+    if interaction.guild.id not in event_feed.feeds or not event_feed.feeds[interaction.guild.id]:
+        await interaction.response.send_message('No calendar feeds registered', ephemeral=True)
+        return
+    
+    feed_list = '\n'.join(event_feed.feeds[interaction.guild.id].keys())
+    await interaction.response.send_message(f'Registered calendar feeds:\n{feed_list}', ephemeral=True)
+
+@tree.command(name='remove_event_feed', description='Removes a calendar feed')
+@app_commands.describe(feed_url='URL of the calendar feed to remove')
+@handle_errors
+async def remove_event_feed(interaction: discord.Interaction, feed_url: str):
+    """Removes a calendar feed"""
+    if interaction.guild.id not in event_feed.feeds or feed_url not in event_feed.feeds[interaction.guild.id]:
+        await interaction.response.send_message('Calendar feed not found', ephemeral=True)
+        return
+    
+    del event_feed.feeds[interaction.guild.id][feed_url]
+    await interaction.response.send_message(f'Removed calendar feed: {feed_url}', ephemeral=True)
+
 def validate_input(func: Callable[..., Coroutine[Any, Any, T]]) -> Callable[..., Coroutine[Any, Any, T]]:
     """Decorator to validate command input."""
     @wraps(func)
@@ -572,7 +602,7 @@ def validate_input(func: Callable[..., Coroutine[Any, Any, T]]) -> Callable[...,
 class EventFeed:
     def __init__(self, bot):
         self.bot = bot
-        self.feeds = {}  # {guild_id: {feed_url: last_checked}}
+        self.feeds = {}  # {guild_id: {feed_url: {'last_checked': datetime, 'channel': str}}}
         self.scheduler = AsyncIOScheduler()
         self.scheduler.start()
         
@@ -583,11 +613,29 @@ class EventFeed:
             if not guild:
                 continue
                 
-            for feed_url, last_checked in feeds.items():
+            for feed_url, feed_data in feeds.items():
+                last_checked = feed_data.get('last_checked')
+                channel_name = feed_data.get('channel', 'bot-trap')
                 try:
                     # Fetch and parse calendar
-                    response = requests.get(feed_url)
-                    calendar = Calendar.from_ical(response.text)
+                    # Add timeout and size limits
+                    response = requests.get(
+                        feed_url,
+                        timeout=10,
+                        headers={'Accept': 'text/calendar'},
+                        stream=True
+                    )
+                    response.raise_for_status()
+                    
+                    # Limit calendar size to 1MB
+                    max_size = 1024 * 1024
+                    content = bytearray()
+                    for chunk in response.iter_content(chunk_size=8192):
+                        content.extend(chunk)
+                        if len(content) > max_size:
+                            raise ValueError("Calendar feed exceeds 1MB size limit")
+                            
+                    calendar = Calendar.from_ical(content.decode('utf-8'))
                     
                     # Process events in next 30 days
                     now = datetime.utcnow()
@@ -599,19 +647,19 @@ class EventFeed:
                             if isinstance(start, datetime) and now <= start <= end_date:
                                 # Check if event is new or updated
                                 if last_checked is None or start > last_checked:
-                                    await self.create_discord_event(guild, component)
-                                    
+                                    await self.create_discord_event(guild, component, channel_name)
+                                     
                     # Update last checked time
-                    self.feeds[guild_id][feed_url] = now
+                    self.feeds[guild_id][feed_url]['last_checked'] = now
                     
                 except Exception as e:
-                    print(f"Error processing feed {feed_url}: {e}")
+                    logger.error(f"Error processing feed {feed_url}: {str(e)}")
     
-    async def create_discord_event(self, guild, ical_event):
+    async def create_discord_event(self, guild, ical_event, channel_name='bot-trap'):
         """Create Discord event from iCal event"""
         try:
             # Get bot-trap channel
-            channel = discord.utils.get(guild.text_channels, name="bot-trap")
+            channel = discord.utils.get(guild.text_channels, name=channel_name)
             if not channel:
                 return
                 
@@ -635,7 +683,7 @@ class EventFeed:
             await self.schedule_reminders(event)
             
         except Exception as e:
-            print(f"Error creating event: {e}")
+            logger.error(f"Error creating event: {str(e)}")
     
     async def schedule_reminders(self, event):
         """Schedule 24h and 10h reminders for an event"""
@@ -666,7 +714,7 @@ class EventFeed:
             if channel:
                 await channel.send(f"{message} {event.url}")
         except Exception as e:
-            print(f"Error sending reminder: {e}")
+            logger.error(f"Error sending reminder: {str(e)}")
 
 # Initialize event feed system
 event_feed = EventFeed(bot)
