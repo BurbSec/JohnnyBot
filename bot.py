@@ -1,4 +1,5 @@
 import asyncio
+import time
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from icalendar import Calendar
@@ -213,6 +214,15 @@ async def on_ready():
     
     # Start reminder checker
     await start_reminder_checker()
+
+@bot.event
+async def on_thread_create(thread):
+    """Handle new forum thread creation"""
+    if thread.parent.name == "🧑💻・job_postings":
+        try:
+            await thread.send("I have to post this reply or the thread won't show up in the sidebar. Get used to this until Discord fixes this bug.")
+        except Exception as e:
+            logger.error(f"Failed to post in new thread {thread.id}: {str(e)}")
 
 @bot.event
 async def on_disconnect():
