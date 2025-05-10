@@ -1,4 +1,4 @@
 discord.py>=2.4
-apscheduler==3.10.1
-icalendar==5.0.11
-requests==2.31.0
+apscheduler>=3.10.1
+icalendar>=5.0.11
+requests>=2.32.0
