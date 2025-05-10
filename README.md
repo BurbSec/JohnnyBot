@@ -11,6 +11,8 @@ JohnnyBot is a Discord moderation bot designed to automate role management and e
   - Deletes messages sent by members with the "bad bots" role in non-DM channels.
   - Kicks members with the "bad bots" role who violate server guidelines.
   - Bans members with the "bad bots" role or no role who DM the bot, deleting their messages across the server.
+- **Forum Management:**
+  - Automatically replies to new threads in the "🧑💻・job_postings" forum with a required message
 - **Command-based Moderation:**
   - Provides moderators with slash commands to manage members, messages, and post announcements.
 - **Logging and Notifications:**
