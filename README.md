@@ -7,17 +7,25 @@ JohnnyBot is a Discord moderation bot designed to automate role management and e
 - **Automatic Role Management:**
   - Assigns the "bad bots" role to new members automatically.
   - Removes the "bad bots" role from members who complete onboarding.
+
 - **Moderation Automation:**
   - Deletes messages sent by members with the "bad bots" role in non-DM channels.
   - Kicks members with the "bad bots" role who violate server guidelines.
   - Bans members with the "bad bots" role or no role who DM the bot, deleting their messages across the server.
+
 - **Forum Management:**
   - Automatically replies to new threads in the "🧑💻・job_postings" forum with a required message
+
 - **Command-based Moderation:**
   - Provides moderators with slash commands to manage members, messages, and post announcements.
+
 - **Logging and Notifications:**
   - Logs actions and errors to a rotating log file.
   - Sends notifications to a designated moderators-only channel.
+
+- **Pet Interactions:**
+  - Includes JohnnyBot functionality with time-based messages
+  - `/pet` command to interact with JohnnyBot
 
 ## Requirements
 
@@ -80,41 +88,107 @@ This hybrid approach allows the bot to:
 
 ### 1. `/set_reminder`
 **Description:** Sets a reminder message to be sent to a specified channel at regular intervals.
+
 - **Parameters:**
   - `channel`: The target channel.
   - `title`: Title of the reminder.
   - `message`: The reminder content.
   - `interval`: Interval (in seconds) between reminders.
 
-### 2. `/purge`
+### 2. `/list_reminders`
+**Description:** Lists all current reminders.
+
+### 3. `/delete_all_reminders`
+**Description:** Deletes all active reminders.
+
+### 4. `/delete_reminder`
+**Description:** Deletes a reminder by title.
+
+- **Parameters:**
+  - `title`: Title of the reminder to delete.
+
+### 5. `/purge_last_messages`
 **Description:** Deletes a specified number of messages from a channel.
+
 - **Parameters:**
   - `channel`: The channel to purge messages from.
   - `limit`: Number of messages to delete.
 
-### 3. `/kick`
+### 6. `/purge_string`
+**Description:** Deletes all messages containing a specific string from a channel.
+
+- **Parameters:**
+  - `channel`: The channel to purge messages from.
+  - `search_string`: String to search for in messages.
+
+### 7. `/purge_webhooks`
+**Description:** Deletes all messages sent by webhooks or apps from a channel.
+
+- **Parameters:**
+  - `channel`: The channel to purge messages from.
+
+### 8. `/kick`
 **Description:** Kicks a member from the server.
+
 - **Parameters:**
   - `member`: Member to kick.
   - `reason`: Reason for the kick (optional).
 
-### 4. `/botsay`
+### 9. `/botsay`
 **Description:** Makes the bot send a message to a specified channel.
+
 - **Parameters:**
   - `channel`: Target channel.
   - `message`: Message to send.
 
-### 5. `/timeout`
+### 10. `/timeout`
 **Description:** Timeouts a member for a specified duration.
+
 - **Parameters:**
   - `member`: Member to timeout.
   - `duration`: Timeout duration in seconds.
   - `reason`: Reason for the timeout (optional).
 
-### 6. `/log_tail`
+### 11. `/log_tail`
 **Description:** Sends the last specified number of lines from the bot's log file to the user via DM.
+
 - **Parameters:**
   - `lines`: Number of lines to retrieve.
+
+### 12. `/add_event_feed_url`
+**Description:** Adds a calendar feed URL to check for events.
+
+- **Parameters:**
+  - `calendar_url`: URL of the calendar feed.
+  - `channel_name`: Channel to post notifications (default: bot-trap).
+
+### 13. `/add_event_feed`
+**Description:** Adds a calendar feed to check for events.
+
+- **Parameters:**
+  - `calendar_url`: URL of the calendar feed.
+
+### 14. `/list_event_feeds`
+**Description:** Lists all registered calendar feeds.
+
+### 15. `/remove_event_feed`
+**Description:** Removes a calendar feed.
+
+- **Parameters:**
+  - `feed_url`: URL of the calendar feed to remove.
+
+### 16. `/cat`
+**Description:** Check on JohnnyBot.
+
+### 17. `/pet_cat`
+**Description:** Pet JohnnyBot.
+
+### 18. `/cat_pick_fav`
+**Description:** See who JohnnyBot prefers today.
+
+- **Parameters:**
+  - `user1`: First potential favorite.
+  - `user2`: Second potential favorite.
 
 ## Usage
 
@@ -125,6 +199,10 @@ This hybrid approach allows the bot to:
 ## Contributing
 
 Contributions are welcome! If you encounter any bugs or have suggestions, feel free to open an issue or submit a pull request.
+
+## Attribution
+
+Cat functionality adapted from [PetBot](https://github.com/0xMetr0/PetBot) under MIT License.
 
 ## License
 
