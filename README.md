@@ -41,7 +41,7 @@ JohnnyBot is a Discord moderation bot designed to automate role management and e
 
 ## Concurrency Model
 
-Note the bot uses both asyncio and threading for different purposes. DON'T CHNAGE THIS:
+Note the bot uses both asyncio and threading for different purposes. DON'T CHANGE THIS:
 
 - **asyncio** is used for:
   - All Discord API interactions (primary event loop)
