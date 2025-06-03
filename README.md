@@ -23,6 +23,11 @@ JohnnyBot is a Discord moderation bot designed to automate role management and e
   - Logs actions and errors to a rotating log file.
   - Sends notifications to a designated moderators-only channel.
 
+- **Message Archive:**
+  - Allows moderators to dump and archive user messages from specific channels
+  - Provides temporary download links for message archives
+  - Automatically cleans up old archive files
+
 - **Pet Interactions:**
   - Includes JohnnyBot functionality with time-based messages
   - `/pet` command to interact with JohnnyBot
@@ -31,6 +36,8 @@ JohnnyBot is a Discord moderation bot designed to automate role management and e
 
 - Python 3.7 or higher
 - Official Discord.py library version 2.4 or higher
+- Flask 2.0.0 or higher (for message dump web server)
+- Waitress 2.1.2 or higher (for production-ready web server)
 
 ## Concurrency Model
 
@@ -189,6 +196,22 @@ This hybrid approach allows the bot to:
 - **Parameters:**
   - `user1`: First potential favorite.
   - `user2`: Second potential favorite.
+
+### 19. `/message_dump`
+**Description:** Dumps a user's messages from a specified channel into a downloadable file. Compresses the file and hosts it via a temporary web server for 30 minutes.
+
+- **Parameters:**
+  - `user`: User whose messages to dump.
+  - `channel`: Channel to dump messages from.
+  - `start_date`: Start date in YYYY-MM-DD format (e.g., 2025-01-01).
+  - `limit`: Maximum number of messages to fetch (default: 1000).
+
+- **Features:**
+  - Retrieves messages with proper pagination
+  - Handles Discord API rate limits
+  - Automatically cleans up orphaned dump files
+  - Provides a download link via DM
+  - Link expires after 30 minutes
 
 ## Usage
 

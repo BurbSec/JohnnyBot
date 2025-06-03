@@ -20,6 +20,10 @@ AUTOMATA_ROLE_NAME = 'automata'
 LOG_FILE = os.path.join(os.path.dirname(__file__), 'johnnybot.log')
 LOG_MAX_SIZE = 5 * 1024 * 1024  # 5MB
 REMINDERS_FILE = os.path.join(os.path.dirname(__file__), 'reminders.json')
+TEMP_DIR = os.path.join(os.path.dirname(__file__), 'temp')
+
+# Create temp directory if it doesn't exist
+os.makedirs(TEMP_DIR, exist_ok=True)
 
 # Channel names
 MODERATORS_CHANNEL_NAME = 'moderators_only'
