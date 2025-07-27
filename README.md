@@ -1,6 +1,6 @@
 # JohnnyBot - Discord Moderation Bot
 
-JohnnyBot is a Discord moderation bot designed to automate role management and enforce server rules. It provides features such as automatic role assignment, message deletion, and user management to ensure a smooth server experience. Most commands are limited to users with the MODERATOR_ROLE_NAME, however the PetBot commands can be leveraged by all users.  
+JohnnyBot is a Discord bot designed to automate server management and enforce server rules. It provides features such as automatic role assignment, message deletion, and user management to ensure a smooth server experience. Most commands are limited to users with the MODERATOR_ROLE_NAME, however the PetBot commands can be leveraged by all users.  
 
 ## Features
 
@@ -23,6 +23,10 @@ JohnnyBot is a Discord moderation bot designed to automate role management and e
   - Allows moderators to dump and archive user messages from specific channels
   - Provides temporary download links for message archives
   - Automatically cleans up old archive files
+
+- **Channel Write Protection:**
+  - Deletes any non-moderator messages posted in the `PROTECTED_CHANNELS` you define in `config.py`
+  - This is a hack to get around Discord's requirement of a minimum number of messagebale channels.
 
 - **PetBot Interactions:**
   - Includes [PetBot](https://github.com/0xMetr0/PetBot) functionality with time-themed messages
@@ -69,9 +73,9 @@ This hybrid approach allows the bot to:
 3. Configure the bot settings:
    - Open the config.py file in a text editor.
    - Modify the following constants according to your server's setup:
-     - `MODERATOR_ROLE_NAME`: Moderator role name (default: "Moderators").
-     - `LOG_FILE`: Name of the log file (default: "johnnybot.log").
-     - `MODERATORS_CHANNEL_NAME`: Name of the moderators channel for notifications (default: "moderators_only").
+     - `MODERATOR_ROLE_NAME`: Name of the modifier role. Necessary for mods to use the bot commands.
+     - `PROTECTED_CHANNELS`: Channels you wish to force to read-only when Discord requires them not to be.
+     - `MODERATORS_CHANNEL_NAME`: Name of the moderators chat channel for bot notifications to be sent to.
 
 ## Running the Bot
 

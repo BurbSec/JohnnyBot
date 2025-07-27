@@ -17,6 +17,8 @@ from discord.ext import commands
 from config import (
     TOKEN,
     REMINDERS_FILE,
+    PROTECTED_CHANNELS,
+    MODERATOR_ROLE_NAME,
     logger
 )
 
@@ -351,6 +353,44 @@ async def on_ready():  # pylint: disable=too-many-statements
             logger.info('Event feed scheduler already running')
     except (AttributeError, ImportError, ValueError) as e:
         logger.error('Failed to start event feed scheduler: %s', e)
+
+@bot.event
+async def on_message(message):
+    """Monitor messages in protected channels and delete non-moderator messages."""
+    # Don't process bot messages
+    if message.author.bot:
+        return
+    
+    # Check if message is in a protected channel
+    if message.channel.name in PROTECTED_CHANNELS:
+        # Check if user has moderator role
+        has_moderator_role = False
+        if hasattr(message.author, 'roles'):
+            for role in message.author.roles:
+                if role.name == MODERATOR_ROLE_NAME:
+                    has_moderator_role = True
+                    break
+        
+        # Delete message if user is not a moderator
+        if not has_moderator_role:
+            try:
+                await message.delete()
+                logger.info(
+                    'Deleted message from %s in protected channel %s: %s',
+                    message.author.name,
+                    message.channel.name,
+                    message.content[:100] + '...' if len(message.content) > 100 else message.content
+                )
+            except discord.HTTPException as e:
+                logger.error(
+                    'Failed to delete message from %s in %s: %s',
+                    message.author.name,
+                    message.channel.name,
+                    e
+                )
+    
+    # Process commands
+    await bot.process_commands(message)
 
 @bot.event
 async def on_disconnect():
