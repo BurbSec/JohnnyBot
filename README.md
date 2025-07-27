@@ -81,10 +81,45 @@ This hybrid approach allows the bot to:
      - `PROTECTED_CHANNELS`: Channels you wish to force to read-only when Discord requires them not to be.
      - `MODERATORS_CHANNEL_NAME`: Name of the moderators chat channel for bot notifications to be sent to.
 
+## Registering for a Discord Bot Token
+
+Follow [THIS GUDE](https://www.upwork.com/resources/how-to-make-discord-bot) to register your bot with Discord and receive the `DISCORD_BOT_TOKEN` you will use when running the bot. 
+
+**FOR STEP 8 IN THE ABOVE GUIDE**: JohnnyBot requires specific Discord permissions to function properly. When creating your bot application and generating an invite link, ensure these permissions are selected:
+
+### General Permissions
+- **Manage Server** - Required for server management features
+- **Manage Roles** - Required for role permission cloning and voice channel safety features
+- **Manage Channels** - Required for channel permission cloning and management
+- **Kick Members** - Required for the `/kick` command
+- **Manage Nicknames** - Required for voice channel safety (muting members)
+- **Manage Events** - Required for creating Discord events from calendar feeds
+- **View Channels** - Required to access and monitor channels
+- **Moderate Members** - Required for the `/timeout` command
+
+### Text Permissions
+- **Send Messages** - Required to send bot responses and notifications
+- **Manage Messages** - Required for purge commands and protected channel enforcement
+- **Read Message History** - Required for message dump functionality and purge commands
+- **Use Slash Commands** - Required for all slash command functionality
+- **Embed Links** - Required for rich embed messages (event notifications)
+- **Attach Files** - Required for log file attachments
+
+### Voice Permissions
+- **Connect** - Required to monitor voice channels for safety features
+- **Mute Members** - Required for voice channel chaperone functionality
+- **Move Members** - Required for voice channel management
+
+### Additional Notes
+- The bot does **NOT** require Administrator permissions
+- Ensure the bot's role is positioned high enough in the role hierarchy to manage the roles and channels it needs to work with
+- For permission cloning commands, the bot cannot clone permissions to/from roles higher than its own highest role
+
+
 ## Running the Bot
 
 1. Ensure all installation steps are complete.
-2. Add your Discord bot token to an environment variable called `DISCORD_BOT_TOKEN` via any secure means you desire.
+2. Add your Discord bot token to an OS environment variable called `DISCORD_BOT_TOKEN` via any secure means you desire.
 3. Run the bot:
    ```shell
    python bot.py
@@ -209,6 +244,14 @@ This hybrid approach allows the bot to:
   - Automatically cleans up orphaned dump files
   - Provides a download link via DM
   - Link expires after 30 minutes
+
+### 20. Permission Cloning Commands
+**Description:** Clone permissions between categories, channels, or roles. All commands remove existing permissions from the destination before copying new ones.
+
+- **`/clone_category_permissions`, `/clone_channel_permissions`, `/clone_role_permissions`** - Clone permissions from a source to a destination
+  - `source_*`: Source category, channel or role to copy permissions from
+  - `destination_*`: Destination category, channel or role to copy permissions to
+  - *Note: Includes safety checks to prevent privilege escalation*
 
 ## Contributing
 

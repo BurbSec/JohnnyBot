@@ -543,6 +543,54 @@ def register_commands():  # pylint: disable=too-many-locals
     # Add error handler for message_dump
     _message_dump.on_error = message_dump_error
 
+    # Register clone_category_permissions command
+    @tree.command(name='clone_category_permissions',
+                  description='Clone permissions from source category to destination category')
+    @app_commands.describe(
+        source_category='Source category to copy permissions from',
+        destination_category='Destination category to copy permissions to'
+    )
+    @app_commands.checks.has_role(MODERATOR_ROLE_NAME)
+    async def _clone_category_permissions(interaction: discord.Interaction,
+                                        source_category: discord.CategoryChannel,
+                                        destination_category: discord.CategoryChannel):
+        await clone_category_permissions(interaction, source_category, destination_category)
+
+    # Add error handler for clone_category_permissions
+    _clone_category_permissions.on_error = clone_category_permissions_error
+
+    # Register clone_channel_permissions command
+    @tree.command(name='clone_channel_permissions',
+                  description='Clone permissions from source channel to destination channel')
+    @app_commands.describe(
+        source_channel='Source channel to copy permissions from',
+        destination_channel='Destination channel to copy permissions to'
+    )
+    @app_commands.checks.has_role(MODERATOR_ROLE_NAME)
+    async def _clone_channel_permissions(interaction: discord.Interaction,
+                                       source_channel: discord.abc.GuildChannel,
+                                       destination_channel: discord.abc.GuildChannel):
+        await clone_channel_permissions(interaction, source_channel, destination_channel)
+
+    # Add error handler for clone_channel_permissions
+    _clone_channel_permissions.on_error = clone_channel_permissions_error
+
+    # Register clone_role_permissions command
+    @tree.command(name='clone_role_permissions',
+                  description='Clone permissions from source role to destination role')
+    @app_commands.describe(
+        source_role='Source role to copy permissions from',
+        destination_role='Destination role to copy permissions to'
+    )
+    @app_commands.checks.has_role(MODERATOR_ROLE_NAME)
+    async def _clone_role_permissions(interaction: discord.Interaction,
+                                    source_role: discord.Role,
+                                    destination_role: discord.Role):
+        await clone_role_permissions(interaction, source_role, destination_role)
+
+    # Add error handler for clone_role_permissions
+    _clone_role_permissions.on_error = clone_role_permissions_error
+
 def setup_commands(bot_param):
     """Initialize command module with bot instance and register commands."""
     # Using globals is necessary here to initialize module-level variables
@@ -1320,3 +1368,307 @@ async def message_dump_error(interaction: discord.Interaction, error):
     else:
         logger.error('Error in message_dump command: %s', error)
         await interaction.response.send_message(f'Error: {error}', ephemeral=True)
+
+async def clone_category_permissions(interaction: discord.Interaction,
+                                   source_category: discord.CategoryChannel,
+                                   destination_category: discord.CategoryChannel):
+    """Clone permissions from source category to destination category."""
+    try:
+        await interaction.response.defer(ephemeral=True)
+        
+        # Verify both categories are in the same guild
+        if source_category.guild.id != destination_category.guild.id:
+            await interaction.followup.send(
+                'Source and destination categories must be in the same server.',
+                ephemeral=True
+            )
+            return
+        
+        # Clear existing permissions on destination category
+        await interaction.followup.send(
+            f'Clearing existing permissions on {destination_category.name}...',
+            ephemeral=True
+        )
+        
+        # Get all current overwrites and clear them
+        for target in list(destination_category.overwrites.keys()):
+            try:
+                # Only process Member and Role objects, skip others
+                if isinstance(target, (discord.Member, discord.Role)):
+                    await destination_category.set_permissions(target, overwrite=None)
+                    logger.info('Cleared permissions for %s on category %s', target, destination_category.name)
+            except discord.HTTPException as e:
+                logger.error('Failed to clear permissions for %s: %s', target, e)
+        
+        # Copy permissions from source to destination
+        await interaction.followup.send(
+            f'Copying permissions from {source_category.name} to {destination_category.name}...',
+            ephemeral=True
+        )
+        
+        copied_count = 0
+        for target, overwrite in source_category.overwrites.items():
+            try:
+                # Only process Member and Role objects, skip others
+                if isinstance(target, (discord.Member, discord.Role)):
+                    await destination_category.set_permissions(target, overwrite=overwrite)
+                    copied_count += 1
+                    logger.info('Copied permissions for %s from %s to %s',
+                               target, source_category.name, destination_category.name)
+            except discord.HTTPException as e:
+                logger.error('Failed to copy permissions for %s: %s', target, e)
+                await interaction.followup.send(
+                    f'Warning: Failed to copy permissions for {target}: {e}',
+                    ephemeral=True
+                )
+        
+        await interaction.followup.send(
+            f'Successfully cloned permissions from **{source_category.name}** to **{destination_category.name}**.\n'
+            f'Copied {copied_count} permission overrides.',
+            ephemeral=True
+        )
+        
+    except discord.Forbidden:
+        await interaction.followup.send(
+            'I don\'t have permission to manage permissions on one or both categories.',
+            ephemeral=True
+        )
+    except discord.HTTPException as e:
+        logger.error('Discord API error in clone_category_permissions: %s', e)
+        await interaction.followup.send(
+            'A Discord API error occurred while cloning permissions.',
+            ephemeral=True
+        )
+    except Exception as e:
+        logger.error('Unexpected error in clone_category_permissions: %s', e)
+        await interaction.followup.send(
+            'An unexpected error occurred while cloning permissions.',
+            ephemeral=True
+        )
+
+async def clone_category_permissions_error(interaction: discord.Interaction, error):
+    """Handles errors for the clone_category_permissions command."""
+    if isinstance(error, app_commands.errors.MissingRole):
+        await interaction.response.send_message(
+            'You do not have the required role to use this command.',
+            ephemeral=True
+        )
+    elif isinstance(error, discord.HTTPException):
+        logger.error('Discord API error: %s', error)
+        await interaction.response.send_message(
+            'Discord API error occurred.',
+            ephemeral=True
+        )
+    else:
+        logger.error('Error in clone_category_permissions command: %s', error)
+        await interaction.response.send_message(
+            f'Error: {error}',
+            ephemeral=True
+        )
+
+async def clone_channel_permissions(interaction: discord.Interaction,
+                                  source_channel: discord.abc.GuildChannel,
+                                  destination_channel: discord.abc.GuildChannel):
+    """Clone permissions from source channel to destination channel."""
+    try:
+        await interaction.response.defer(ephemeral=True)
+        
+        # Verify both channels are in the same guild
+        if source_channel.guild.id != destination_channel.guild.id:
+            await interaction.followup.send(
+                'Source and destination channels must be in the same server.',
+                ephemeral=True
+            )
+            return
+        
+        # Clear existing permissions on destination channel
+        await interaction.followup.send(
+            f'Clearing existing permissions on {destination_channel.name}...',
+            ephemeral=True
+        )
+        
+        # Get all current overwrites and clear them
+        for target in list(destination_channel.overwrites.keys()):
+            try:
+                # Only process Member and Role objects, skip others
+                if isinstance(target, (discord.Member, discord.Role)):
+                    await destination_channel.set_permissions(target, overwrite=None)
+                    logger.info('Cleared permissions for %s on channel %s', target, destination_channel.name)
+            except discord.HTTPException as e:
+                logger.error('Failed to clear permissions for %s: %s', target, e)
+        
+        # Copy permissions from source to destination
+        await interaction.followup.send(
+            f'Copying permissions from {source_channel.name} to {destination_channel.name}...',
+            ephemeral=True
+        )
+        
+        copied_count = 0
+        for target, overwrite in source_channel.overwrites.items():
+            try:
+                # Only process Member and Role objects, skip others
+                if isinstance(target, (discord.Member, discord.Role)):
+                    await destination_channel.set_permissions(target, overwrite=overwrite)
+                    copied_count += 1
+                    logger.info('Copied permissions for %s from %s to %s',
+                               target, source_channel.name, destination_channel.name)
+            except discord.HTTPException as e:
+                logger.error('Failed to copy permissions for %s: %s', target, e)
+                await interaction.followup.send(
+                    f'Warning: Failed to copy permissions for {target}: {e}',
+                    ephemeral=True
+                )
+        
+        await interaction.followup.send(
+            f'Successfully cloned permissions from **{source_channel.name}** to **{destination_channel.name}**.\n'
+            f'Copied {copied_count} permission overrides.',
+            ephemeral=True
+        )
+        
+    except discord.Forbidden:
+        await interaction.followup.send(
+            'I don\'t have permission to manage permissions on one or both channels.',
+            ephemeral=True
+        )
+    except discord.HTTPException as e:
+        logger.error('Discord API error in clone_channel_permissions: %s', e)
+        await interaction.followup.send(
+            'A Discord API error occurred while cloning permissions.',
+            ephemeral=True
+        )
+    except Exception as e:
+        logger.error('Unexpected error in clone_channel_permissions: %s', e)
+        await interaction.followup.send(
+            'An unexpected error occurred while cloning permissions.',
+            ephemeral=True
+        )
+
+async def clone_channel_permissions_error(interaction: discord.Interaction, error):
+    """Handles errors for the clone_channel_permissions command."""
+    if isinstance(error, app_commands.errors.MissingRole):
+        await interaction.response.send_message(
+            'You do not have the required role to use this command.',
+            ephemeral=True
+        )
+    elif isinstance(error, discord.HTTPException):
+        logger.error('Discord API error: %s', error)
+        await interaction.response.send_message(
+            'Discord API error occurred.',
+            ephemeral=True
+        )
+    else:
+        logger.error('Error in clone_channel_permissions command: %s', error)
+        await interaction.response.send_message(
+            f'Error: {error}',
+            ephemeral=True
+        )
+
+async def clone_role_permissions(interaction: discord.Interaction,
+                               source_role: discord.Role,
+                               destination_role: discord.Role):
+    """Clone permissions from source role to destination role."""
+    try:
+        await interaction.response.defer(ephemeral=True)
+        
+        # Verify both roles are in the same guild
+        if source_role.guild.id != destination_role.guild.id:
+            await interaction.followup.send(
+                'Source and destination roles must be in the same server.',
+                ephemeral=True
+            )
+            return
+        
+        # Check if we're trying to clone to/from @everyone role
+        if source_role.is_default() or destination_role.is_default():
+            await interaction.followup.send(
+                'Cannot clone permissions to or from the @everyone role.',
+                ephemeral=True
+            )
+            return
+        
+        # Check if we're trying to clone to/from a role higher than the bot's highest role
+        if interaction.guild:
+            bot_member = interaction.guild.me
+            if bot_member and (source_role >= bot_member.top_role or destination_role >= bot_member.top_role):
+                await interaction.followup.send(
+                    'Cannot clone permissions to or from a role higher than or equal to my highest role.',
+                    ephemeral=True
+                )
+                return
+        
+        # Check if we're trying to clone to/from a role higher than the user's highest role
+        # interaction.user might be a User, we need to get the Member object
+        if interaction.guild and hasattr(interaction, 'user'):
+            member = interaction.guild.get_member(interaction.user.id)
+            if member and (source_role >= member.top_role or destination_role >= member.top_role):
+                await interaction.followup.send(
+                    'Cannot clone permissions to or from a role higher than or equal to your highest role.',
+                    ephemeral=True
+                )
+                return
+        
+        await interaction.followup.send(
+            f'Cloning permissions from **{source_role.name}** to **{destination_role.name}**...',
+            ephemeral=True
+        )
+        
+        # Copy the permissions from source role to destination role
+        try:
+            await destination_role.edit(
+                permissions=source_role.permissions,
+                reason=f'Permissions cloned from {source_role.name} by {interaction.user}'
+            )
+            
+            await interaction.followup.send(
+                f'Successfully cloned permissions from **{source_role.name}** to **{destination_role.name}**.\n'
+                f'The destination role now has the same server-wide permissions as the source role.',
+                ephemeral=True
+            )
+            
+            logger.info('Cloned permissions from role %s to role %s by user %s',
+                       source_role.name, destination_role.name, interaction.user)
+            
+        except discord.HTTPException as e:
+            logger.error('Failed to clone role permissions: %s', e)
+            await interaction.followup.send(
+                f'Failed to clone permissions: {e}',
+                ephemeral=True
+            )
+        
+    except discord.Forbidden:
+        await interaction.followup.send(
+            'I don\'t have permission to manage one or both of these roles.',
+            ephemeral=True
+        )
+    except discord.HTTPException as e:
+        logger.error('Discord API error in clone_role_permissions: %s', e)
+        await interaction.followup.send(
+            'A Discord API error occurred while cloning permissions.',
+            ephemeral=True
+        )
+    except Exception as e:
+        logger.error('Unexpected error in clone_role_permissions: %s', e)
+        await interaction.followup.send(
+            'An unexpected error occurred while cloning permissions.',
+            ephemeral=True
+        )
+
+async def clone_role_permissions_error(interaction: discord.Interaction, error):
+    """Handles errors for the clone_role_permissions command."""
+    if isinstance(error, app_commands.errors.MissingRole):
+        await interaction.response.send_message(
+            'You do not have the required role to use this command.',
+            ephemeral=True
+        )
+    elif isinstance(error, discord.HTTPException):
+        logger.error('Discord API error: %s', error)
+        await interaction.response.send_message(
+            'Discord API error occurred.',
+            ephemeral=True
+        )
+    else:
+        logger.error('Error in clone_role_permissions command: %s', error)
+        await interaction.response.send_message(
+            f'Error: {error}',
+            ephemeral=True
+        )
