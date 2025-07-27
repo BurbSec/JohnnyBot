@@ -7,6 +7,10 @@ JohnnyBot is a Discord bot designed to automate server management and enforce se
 - **Command-based Moderation:**
   - Provides moderators with slash commands to manage members, messages, and post announcements.
 
+- **Voice Channel Chaperone:**
+  - Monitors voice channels and mutes all members if only one adult and one child are present
+  - Sends an alert to the moderators channel
+
 - **Reminder System:**
   - Set recurring reminders to be sent to specific channels at regular intervals
   - Persistent reminder storage with automatic scheduling

@@ -19,6 +19,9 @@ from config import (
     REMINDERS_FILE,
     PROTECTED_CHANNELS,
     MODERATOR_ROLE_NAME,
+    MODERATORS_CHANNEL_NAME,
+    ADULT_ROLE_NAMES,
+    CHILD_ROLE_NAMES,
     logger
 )
 
@@ -171,6 +174,7 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.guilds = True
 intents.members = True
+intents.voice_states = True
 
 bot = commands.Bot(command_prefix='!', intents=intents)
 
@@ -391,6 +395,125 @@ async def on_message(message):
     
     # Process commands
     await bot.process_commands(message)
+
+def get_user_role_type(member):
+    """Determine if a user is an adult, child, or neither based on their roles.
+    
+    Args:
+        member: Discord member object
+        
+    Returns:
+        str: 'adult', 'child', or 'neither'
+    """
+    if not hasattr(member, 'roles'):
+        return 'neither'
+    
+    user_role_names = [role.name for role in member.roles]
+    
+    # Check if user has any adult roles
+    for adult_role in ADULT_ROLE_NAMES:
+        if adult_role in user_role_names:
+            return 'adult'
+    
+    # Check if user has any child roles
+    for child_role in CHILD_ROLE_NAMES:
+        if child_role in user_role_names:
+            return 'child'
+    
+    return 'neither'
+
+async def check_voice_channel_safety(channel):
+    """Check if a voice channel has only one adult and one child, and take action if so.
+    
+    Args:
+        channel: Discord voice channel object
+    """
+    if not channel or not hasattr(channel, 'members'):
+        return
+    
+    adults = []
+    children = []
+    
+    # Categorize all members in the channel
+    for member in channel.members:
+        if member.bot:  # Skip bots
+            continue
+            
+        role_type = get_user_role_type(member)
+        if role_type == 'adult':
+            adults.append(member)
+        elif role_type == 'child':
+            children.append(member)
+    
+    # Check if we have exactly one adult and one child
+    if len(adults) == 1 and len(children) == 1:
+        logger.warning(
+            'ALERT: One adult (%s) and one child (%s) detected in voice channel %s',
+            adults[0].display_name,
+            children[0].display_name,
+            channel.name
+        )
+        
+        # Mute all members in the channel
+        for member in channel.members:
+            if not member.bot:
+                try:
+                    await member.edit(mute=True)
+                    logger.info('Muted %s in channel %s', member.display_name, channel.name)
+                except discord.HTTPException as e:
+                    logger.error('Failed to mute %s: %s', member.display_name, e)
+        
+        # Send alert to moderators channel
+        try:
+            # Find the moderators channel
+            moderators_channel = None
+            for guild_channel in channel.guild.channels:
+                if guild_channel.name == MODERATORS_CHANNEL_NAME:
+                    moderators_channel = guild_channel
+                    break
+            
+            if moderators_channel:
+                alert_message = (
+                    f"🚨 **ALERT**: There is only one adult ({adults[0].mention}) and one child "
+                    f"({children[0].mention}) currently in {channel.mention}\n\n"
+                    f"All members in the channel have been muted for safety."
+                )
+                await moderators_channel.send(alert_message)
+                logger.info('Alert sent to moderators channel for voice channel %s', channel.name)
+            else:
+                logger.error('Moderators channel "%s" not found', MODERATORS_CHANNEL_NAME)
+                
+        except discord.HTTPException as e:
+            logger.error('Failed to send alert to moderators channel: %s', e)
+
+@bot.event
+async def on_guild_channel_create(channel):
+    """Handle when a new channel is created - join voice channels automatically."""
+    if isinstance(channel, discord.VoiceChannel):
+        logger.info('New voice channel created: %s', channel.name)
+        # The bot will automatically monitor this channel through voice state events
+        # No need to physically join the channel, just log the creation
+
+@bot.event
+async def on_voice_state_update(member, before, after):
+    """Handle voice state changes - monitor for adult/child combinations."""
+    # Skip bot users
+    if member.bot:
+        return
+    
+    channels_to_check = set()
+    
+    # Add the channel they left (if any)
+    if before.channel:
+        channels_to_check.add(before.channel)
+    
+    # Add the channel they joined (if any)
+    if after.channel:
+        channels_to_check.add(after.channel)
+    
+    # Check safety for all affected channels
+    for channel in channels_to_check:
+        await check_voice_channel_safety(channel)
 
 @bot.event
 async def on_disconnect():

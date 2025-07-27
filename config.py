@@ -11,6 +11,9 @@ from logging.handlers import RotatingFileHandler
 MODERATORS_CHANNEL_NAME = 'moderators_only'
 PROTECTED_CHANNELS = ['🫠・code_of_conduct', '🧚・hey_listen', '👯・local_events']
 MODERATOR_ROLE_NAME = 'Moderators'
+# These are for the "Voice Chaperone" function
+ADULT_ROLE_NAMES = ['Dads', 'GrownUps']
+CHILD_ROLE_NAMES = ['Kids', 'Bambinos', 'Girls']
 
 TOKEN = os.environ.get('DISCORD_BOT_TOKEN')
 if not TOKEN:
