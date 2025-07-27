@@ -1,4 +1,5 @@
 """Discord bot command module for server management and automation."""
+# pylint: disable=too-many-lines,line-too-long,trailing-whitespace,import-outside-toplevel,logging-fstring-interpolation,broad-exception-caught,no-else-break
 import os
 import random
 import time as time_module
@@ -9,8 +10,7 @@ import zipfile
 import socket
 import shutil
 from datetime import datetime, timedelta
-from typing import TypeVar
-from pathlib import Path
+from typing import Optional, Dict, Any
 import discord
 from discord import app_commands
 import requests
@@ -25,74 +25,266 @@ from config import (
     logger
 )
 
-class DiscordCache:
-    """Simple in-memory cache for Discord data."""
-    def __init__(self):
-        self._cache = {}
 
-    def get(self, key):
-        return self._cache.get(key)
-
-    def set(self, key, value):
-        self._cache[key] = value
-
-    def clear(self):
-        self._cache.clear()
-
-class EventFeed:
+class EventFeed:  # pylint: disable=too-few-public-methods
     """Handles event feed subscriptions and notifications."""
     def __init__(self, bot):
         self.bot = bot
-        self.feeds = {}  # {guild_id: {url: last_checked}}
+        self.feeds: Dict[int, Dict[str, Any]] = {}  # {guild_id: {url: feed_data}}
         self.running = True
+        self.scheduler: Optional[Any] = None  # Will be set in setup_commands
+
+    async def check_feeds_job(self):
+        """Scheduled job to check all subscribed feeds for new events."""
+        for guild_id, feeds in self.feeds.items():
+            guild = self.bot.get_guild(guild_id)
+            if not guild:
+                continue
+                
+            for url, feed_data in feeds.items():
+                try:
+                    await self._check_single_feed(guild, url, feed_data)
+                except Exception as e:
+                    logger.error("Error checking feed %s: %s", url, e)
+
+    async def _check_single_feed(self, guild, url: str, feed_data: Dict[str, Any]):
+        """Check a single calendar feed for new events."""
+        try:
+            calendar = await self._fetch_calendar(url)
+            channel = self._get_notification_channel(guild, feed_data.get('channel', 'bot-trap'))
+            if not channel:
+                return
+            
+            new_events = self._parse_calendar_events(calendar, feed_data)
+            await self._process_new_events(guild, channel, new_events, feed_data)
+            
+        except (requests.RequestException, ValueError, AttributeError) as e:
+            logger.error("Error checking feed %s: %s", url, e)
+
+    async def _fetch_calendar(self, url: str):
+        """Fetch and parse calendar from URL."""
+        response = requests.get(url, timeout=30)
+        response.raise_for_status()
+        return Calendar.from_ical(response.text)
+
+    def _get_notification_channel(self, guild, channel_name: str):
+        """Get the Discord channel for notifications."""
+        channel = discord.utils.get(guild.text_channels, name=channel_name)
+        if not channel:
+            logger.error("Channel #%s not found in guild %s", channel_name, guild.name)
+        return channel
+
+    def _parse_calendar_events(self, calendar, feed_data: Dict[str, Any]) -> list:
+        """Parse calendar events and return new ones."""
+        posted_events = feed_data.get('posted_events', set())
+        last_checked = feed_data.get('last_checked', datetime.now() - timedelta(days=1))
+        current_time = datetime.now()
+        new_events = []
+
+        for component in calendar.walk():
+            if component.name == "VEVENT":
+                event = self._process_calendar_event(component, posted_events, last_checked, current_time)
+                if event:
+                    new_events.append(event)
+        
+        return new_events
+
+    def _process_calendar_event(self, component, posted_events: set, last_checked: datetime, current_time: datetime):
+        """Process a single calendar event component."""
+        event_uid = str(component.get('uid', ''))
+        if event_uid in posted_events:
+            return None
+
+        # Extract basic event details
+        event_details = self._extract_event_details(component)
+        if not event_details:
+            return None
+
+        start_date, end_date = event_details['start_date'], event_details['end_date']
+        
+        # Only process future events or events that started recently
+        if start_date < current_time - timedelta(hours=1):
+            return None
+        
+        # Check if this is a new event since last check
+        if start_date > last_checked or event_uid not in posted_events:
+            return {
+                'uid': event_uid,
+                'summary': event_details['summary'],
+                'description': event_details['description'],
+                'location': event_details['location'],
+                'start_date': start_date,
+                'end_date': end_date
+            }
+        return None
+
+    def _extract_event_details(self, component):
+        """Extract event details from calendar component."""
+        # Extract basic info
+        summary = str(component.get('summary', 'No Title'))
+        description = str(component.get('description', ''))
+        location = str(component.get('location', ''))
+        
+        # Handle start datetime
+        dtstart = component.get('dtstart')
+        if not dtstart:
+            return None  # Skip events without start date
+        
+        start_date = dtstart.dt
+        if not hasattr(start_date, 'date'):
+            start_date = datetime.combine(start_date, datetime.min.time())
+        
+        # Handle end datetime
+        end_date = self._calculate_end_date(component.get('dtend'), start_date)
+        
+        return {
+            'summary': summary,
+            'description': description,
+            'location': location,
+            'start_date': start_date,
+            'end_date': end_date
+        }
+
+    def _calculate_end_date(self, dtend, start_date):
+        """Calculate event end date."""
+        if dtend:
+            end_date = dtend.dt
+            if not hasattr(end_date, 'date'):
+                end_date = datetime.combine(end_date, datetime.min.time())
+            return end_date
+        
+        # If no end date, assume 1 hour duration for timed events
+        if isinstance(start_date, datetime):
+            return start_date + timedelta(hours=1)
+        # For all-day events, end is the same day
+        return start_date
+
+    async def _process_new_events(self, guild, channel, new_events: list, feed_data: Dict[str, Any]):
+        """Process and post new events."""
+        posted_events = feed_data.get('posted_events', set())
+        
+        for event in new_events:
+            await self._post_event_to_discord(channel, event)
+            await self._create_discord_event(guild, event)
+            posted_events.add(event['uid'])
+        
+        # Update feed data
+        feed_data['last_checked'] = datetime.now()
+        feed_data['posted_events'] = posted_events
+
+    async def _post_event_to_discord(self, channel, event: Dict[str, Any]):
+        """Post an event to a Discord channel."""
+        try:
+            # Format the event date
+            start_date = event['start_date']
+            end_date = event.get('end_date')
+            
+            if isinstance(start_date, datetime):
+                date_str = start_date.strftime("%Y-%m-%d")
+                time_str = start_date.strftime("%H:%M")
+                if end_date and isinstance(end_date, datetime) and end_date.date() == start_date.date():
+                    time_str += f" - {end_date.strftime('%H:%M')}"
+            else:
+                date_str = str(start_date)
+                time_str = "All Day"
+            
+            # Build the message
+            embed = discord.Embed(
+                title=f"📅 {event['summary']}",
+                color=0x00ff00,
+                description="🎉 **Also added to Discord Events!**"
+            )
+            
+            embed.add_field(name="📅 Date", value=date_str, inline=True)
+            embed.add_field(name="🕐 Time", value=time_str, inline=True)
+            
+            if event['location']:
+                embed.add_field(name="📍 Location", value=event['location'], inline=False)
+            
+            if event['description']:
+                # Truncate description if too long
+                desc = event['description'][:1000] + "..." if len(event['description']) > 1000 else event['description']
+                embed.add_field(name="📝 Description", value=desc, inline=False)
+            
+            await channel.send(embed=embed)
+            logger.info("Posted event '%s' to #%s", event['summary'], channel.name)
+            
+        except discord.HTTPException as e:
+            logger.error("Error posting event to Discord: %s", e)
+
+    async def _create_discord_event(self, guild, event: Dict[str, Any]):
+        """Create a Discord Event in the guild's Events section."""
+        try:
+            # Prepare event data
+            name = event['summary'][:100]  # Discord has a 100 character limit for event names
+            description = event.get('description', '')[:1000]  # 1000 character limit for description
+            start_time = event['start_date']
+            end_time = event.get('end_date')
+            location = event.get('location', '')
+            
+            # Convert to timezone-aware datetime if needed
+            if isinstance(start_time, datetime) and start_time.tzinfo is None:
+                start_time = start_time.replace(tzinfo=discord.utils.utcnow().tzinfo)
+            
+            if end_time and isinstance(end_time, datetime) and end_time.tzinfo is None:
+                end_time = end_time.replace(tzinfo=discord.utils.utcnow().tzinfo)
+            
+            # Handle all-day events (date objects)
+            if not isinstance(start_time, datetime):
+                # Convert date to datetime at start of day
+                start_time = datetime.combine(start_time, datetime.min.time())
+                start_time = start_time.replace(tzinfo=discord.utils.utcnow().tzinfo)
+                
+            if end_time and not isinstance(end_time, datetime):
+                # Convert date to datetime at end of day
+                end_time = datetime.combine(end_time, datetime.max.time().replace(microsecond=0))
+                end_time = end_time.replace(tzinfo=discord.utils.utcnow().tzinfo)
+            
+            # If no end time, set it to 1 hour after start for timed events
+            if not end_time:
+                end_time = start_time + timedelta(hours=1)
+            
+            # Create the Discord event as an external event
+            # External events require a location
+            event_location = location[:100] if location else "See event details"
+            
+            # Create the Discord event
+            discord_event = await guild.create_scheduled_event(
+                name=name,
+                description=description,
+                start_time=start_time,
+                end_time=end_time,
+                entity_type=discord.EntityType.external,
+                location=event_location,
+                privacy_level=discord.PrivacyLevel.guild_only
+            )
+            
+            logger.info("Created Discord Event '%s' (ID: %s) in guild %s",
+                       name, discord_event.id, guild.name)
+            
+        except discord.HTTPException as e:
+            logger.error("Error creating Discord Event '%s': %s", event['summary'], e)
+        except Exception as e:  # pylint: disable=broad-exception-caught
+            logger.error("Unexpected error creating Discord Event '%s': %s", event['summary'], e)
 
     async def check_feeds(self):
-        """Check all subscribed feeds for new events."""
-        while self.running:
-            for _, feeds in self.feeds.items():
-                for url, _ in feeds.items():
-                    try:
-                        response = requests.get(url, timeout=30)
-                        # Process calendar events...
-                        Calendar.from_ical(response.text)
-                    except (requests.RequestException, ValueError, AttributeError) as e:
-                        logger.error("Error checking feed %s: %s", url, e)
-            await asyncio.sleep(3600)  # Check hourly
+        """Legacy method for backward compatibility."""
+        await self.check_feeds_job()
 
 # Pet response messages
-pet_response_messages = [
-    "PETNAME purrs happily!",
-    "PETNAME rubs against your leg!",
-    "PETNAME gives you a slow blink of affection!",
-    "PETNAME meows appreciatively!",
-    "PETNAME headbutts your hand for more pets!"
-]
-
-def get_time_based_message(pet_name: str) -> str:
-    """Returns a time-based greeting message."""
-    current_hour = datetime.now().hour
-    if 5 <= current_hour < 12:
-        return f"Good morning! {pet_name} is awake and ready for the day!"
-    elif 12 <= current_hour < 17:
-        return f"Good afternoon! {pet_name} is enjoying the day!"
-    elif 17 <= current_hour < 22:
-        return f"Good evening! {pet_name} is winding down."
-    else:
-        return f"{pet_name} is sleeping... shhh!"
 
 
 
 # These will be set when commands are registered
-bot_instance = None  # Renamed to avoid redefining name from outer scope
-tree = None
-cache = None
-reminders = {}
-reminders_lock = None
-reminder_threads = {}
-event_feed = None
-message_dump_servers = {}  # Store active message dump servers
+bot_instance: Optional[Any] = None  # Renamed to avoid redefining name from outer scope
+tree: Optional[Any] = None
+reminders: Dict[int, Dict[str, Any]] = {}
+reminders_lock: Optional[threading.Lock] = None
+reminder_threads: Dict[int, Any] = {}
+event_feed: Optional[EventFeed] = None
+message_dump_servers: Dict[str, Any] = {}  # Store active message dump servers
 
-class MessageDumpServer:
+class MessageDumpServer:  # pylint: disable=too-many-instance-attributes
     """Manages a temporary web server for hosting message dump files."""
     def __init__(self, file_path, zip_path, duration=1800):  # 30 minutes default
         self.file_path = file_path
@@ -154,17 +346,17 @@ class MessageDumpServer:
             if os.path.exists(parent_dir) and not os.listdir(parent_dir):
                 os.rmdir(parent_dir)
                 
-            logger.info(f"Cleaned up message dump files: {self.file_path}, {self.zip_path}")
+            logger.info("Cleaned up message dump files: %s, %s", self.file_path, self.zip_path)
         except (OSError, IOError) as e:
-            logger.error(f"Error cleaning up message dump files: {e}")
+            logger.error("Error cleaning up message dump files: %s", e)
         
         # Remove from active servers
-        for key, server in list(message_dump_servers.items()):
+        for key, server in message_dump_servers.items():
             if server is self:
                 del message_dump_servers[key]
                 break
 
-def register_commands():
+def register_commands():  # pylint: disable=too-many-locals
     """Register all commands with the command tree."""
     # Only register if tree is initialized
     if tree is None:
@@ -179,18 +371,21 @@ def register_commands():
         """Lists all current reminders."""
         try:
             if not reminders:
-                await interaction.response.send_message('There are no reminders set.', ephemeral=True)
+                await interaction.response.send_message('There are no reminders set.',
+                                                       ephemeral=True)
                 return
 
-            reminder_list = '\n'.join([
+            reminder_list = '\n'.join(
                 f"**{reminder['title']}**: {reminder['message']} "
                 f"(every {reminder['interval']} seconds)"
                 for reminder in reminders.values()
-            ])
-            await interaction.response.send_message(f'Current reminders:\n{reminder_list}', ephemeral=True)
+            )
+            await interaction.response.send_message(f'Current reminders:\n{reminder_list}',
+                                                   ephemeral=True)
         except (discord.HTTPException, OSError, IOError) as e:
             logger.error('Error listing reminders: %s', e)
-            await interaction.response.send_message('Failed to list reminders due to an error.', ephemeral=True)
+            await interaction.response.send_message('Failed to list reminders due to an error.',
+                                                   ephemeral=True)
 
     # Register delete_all_reminders command
     @tree.command(name='delete_all_reminders', description='Deletes all active reminders')
@@ -206,44 +401,52 @@ def register_commands():
         await delete_reminder(interaction, title)
 
     # Register purge_last_messages command
-    @tree.command(name='purge_last_messages', description='Purges a specified number of messages from a channel')
-    @app_commands.describe(channel='Channel to purge messages from', limit='Number of messages to delete')
+    @tree.command(name='purge_last_messages',
+                  description='Purges a specified number of messages from a channel')
+    @app_commands.describe(channel='Channel to purge messages from',
+                          limit='Number of messages to delete')
     @app_commands.checks.has_role(MODERATOR_ROLE_NAME)
-    async def _purge_last_messages(interaction: discord.Interaction, channel: discord.TextChannel, limit: int):
+    async def _purge_last_messages(interaction: discord.Interaction,
+                                  channel: discord.TextChannel, limit: int):
         await purge_last_messages(interaction, channel, limit)
 
     # Add error handler for purge_last_messages
-    _purge_last_messages.error(purge_last_messages_error)
+    _purge_last_messages.on_error = purge_last_messages_error
 
     # Register purge_string command
-    @tree.command(name='purge_string', description='Purges all messages containing a specific string from a channel')
-    @app_commands.describe(channel='Channel to purge messages from', search_string='String to search for in messages')
+    @tree.command(name='purge_string',
+                  description='Purges all messages containing a specific string from a channel')
+    @app_commands.describe(channel='Channel to purge messages from',
+                          search_string='String to search for in messages')
     @app_commands.checks.has_role(MODERATOR_ROLE_NAME)
-    async def _purge_string(interaction: discord.Interaction, channel: discord.TextChannel, search_string: str):
+    async def _purge_string(interaction: discord.Interaction,
+                           channel: discord.TextChannel, search_string: str):
         await purge_string(interaction, channel, search_string)
 
     # Add error handler for purge_string
-    _purge_string.error(purge_string_error)
+    _purge_string.on_error = purge_string_error
 
     # Register purge_webhooks command
-    @tree.command(name='purge_webhooks', description='Purges all messages sent by webhooks or apps from a channel')
+    @tree.command(name='purge_webhooks',
+                  description='Purges all messages sent by webhooks or apps from a channel')
     @app_commands.describe(channel='Channel to purge messages from')
     @app_commands.checks.has_role(MODERATOR_ROLE_NAME)
     async def _purge_webhooks(interaction: discord.Interaction, channel: discord.TextChannel):
         await purge_webhooks(interaction, channel)
 
     # Add error handler for purge_webhooks
-    _purge_webhooks.error(purge_webhooks_error)
+    _purge_webhooks.on_error = purge_webhooks_error
 
     # Register kick command
     @tree.command(name='kick', description='Kicks a member from the server')
     @app_commands.describe(member='Member to kick', reason='Reason for kick')
     @app_commands.checks.has_role(MODERATOR_ROLE_NAME)
-    async def _kick(interaction: discord.Interaction, member: discord.Member, reason: str = None):
+    async def _kick(interaction: discord.Interaction, member: discord.Member,
+                   reason: Optional[str] = None):
         await kick_member(interaction, member, reason)
 
     # Add error handler for kick
-    _kick.error(kick_error)
+    _kick.on_error = kick_error
 
     # Register botsay command
     @tree.command(name='botsay', description='Makes the bot send a message to a specified channel')
@@ -253,47 +456,44 @@ def register_commands():
         await botsay_message(interaction, channel, message)
 
     # Add error handler for botsay
-    _botsay.error(botsay_error)
+    _botsay.on_error = botsay_error
 
     # Register timeout command
     @tree.command(name='timeout', description='Timeouts a member for a specified duration')
-    @app_commands.describe(member='Member to timeout', duration='Timeout duration in seconds', reason='Reason for timeout')
+    @app_commands.describe(member='Member to timeout', duration='Timeout duration in seconds',
+                          reason='Reason for timeout')
     @app_commands.checks.has_role(MODERATOR_ROLE_NAME)
-    async def _timeout(interaction: discord.Interaction, member: discord.Member, duration: int, reason: str = None):
+    async def _timeout(interaction: discord.Interaction, member: discord.Member,
+                      duration: int, reason: Optional[str] = None):
         await timeout_member(interaction, member, duration, reason)
 
     # Add error handler for timeout
-    _timeout.error(timeout_error)
+    _timeout.on_error = timeout_error
 
     # Register log_tail command
-    @tree.command(name='log_tail', description='DM the last specified number of lines of the bot log to the user')
+    @tree.command(name='log_tail',
+                  description='DM the last specified number of lines of the bot log to the user')
     @app_commands.describe(lines='Number of lines to retrieve from the log')
     async def _log_tail(interaction: discord.Interaction, lines: int):
         await log_tail_command(interaction, lines)
     
     # Add error handler for log_tail
-    _log_tail.error(log_tail_error)
+    _log_tail.on_error = log_tail_error
 
-    # Register add_event_feed_url command
-    @tree.command(name='add_event_feed_url', description='Adds a calendar feed URL to check for events')
+    # Register add_event_feed command
+    @tree.command(name='add_event_feed',
+                  description='Adds a calendar feed URL to check for events')
     @app_commands.describe(
         calendar_url='URL of the calendar feed',
         channel_name='Channel to post notifications (default: bot-trap)'
     )
-    async def _add_event_feed_url(interaction: discord.Interaction, calendar_url: str, channel_name: str = "bot-trap"):
-        await add_event_feed_url_command(interaction, calendar_url, channel_name)
-
-    # Add error handler for add_event_feed_url
-    _add_event_feed_url.error(add_event_feed_url_error)
-
-    # Register add_event_feed command
-    @tree.command(name='add_event_feed', description='Adds a calendar feed to check for events')
-    @app_commands.describe(calendar_url='URL of the calendar feed')
-    async def _add_event_feed(interaction: discord.Interaction, calendar_url: str):
-        await add_event_feed_command(interaction, calendar_url)
+    async def _add_event_feed(interaction: discord.Interaction, calendar_url: str,
+                                 channel_name: str = "bot-trap"):
+        await add_event_feed_command(interaction, calendar_url, channel_name)
 
     # Add error handler for add_event_feed
-    _add_event_feed.error(add_event_feed_error)
+    _add_event_feed.on_error = add_event_feed_error
+
 
     # Register list_event_feeds command
     @tree.command(name='list_event_feeds', description='Lists all registered calendar feeds')
@@ -306,27 +506,29 @@ def register_commands():
     async def _remove_event_feed(interaction: discord.Interaction, feed_url: str):
         await remove_event_feed_command(interaction, feed_url)
 
-    # Register cat command
-    @tree.command(name='cat', description='Check on JohnnyBot')
-    async def _cat(interaction: discord.Interaction):
-        await cat_command(interaction)
+    # Register bot_mood command
+    @tree.command(name='bot_mood', description='Check on JohnnyBot\'s current mood')
+    async def _bot_mood(interaction: discord.Interaction):
+        await bot_command(interaction)
 
-    # Register pet_cat command
-    @tree.command(name='pet_cat', description='Pet JohnnyBot')
-    async def _pet_cat(interaction: discord.Interaction):
-        await pet_cat_command(interaction)
+    # Register pet_bot command
+    @tree.command(name='pet_bot', description='Pet JohnnyBot')
+    async def _pet_bot(interaction: discord.Interaction):
+        await pet_bot_command(interaction)
 
-    # Register cat_pick_fav command
-    @tree.command(name='cat_pick_fav', description='See who JohnnyBot prefers today')
+    # Register bot_pick_fav command
+    @tree.command(name='bot_pick_fav',
+                  description='See who JohnnyBot prefers today')
     @app_commands.describe(
         user1="First potential favorite",
         user2="Second potential favorite"
     )
-    async def _cat_pick_fav(interaction: discord.Interaction, user1: discord.User, user2: discord.User):
-        await cat_pick_fav_command(interaction, user1, user2)
+    async def _bot_pick_fav(interaction: discord.Interaction, user1: discord.User, user2: discord.User):
+        await bot_pick_fav_command(interaction, user1, user2)
         
     # Register message_dump command
-    @tree.command(name='message_dump', description='Dump a user\'s messages from a channel into a downloadable file')
+    @tree.command(name='message_dump',
+                  description='Dump a user\'s messages from a channel into a downloadable file')
     @app_commands.describe(
         user="User whose messages to dump",
         channel="Channel to dump messages from",
@@ -334,21 +536,23 @@ def register_commands():
         limit="Maximum number of messages to fetch (default: 1000)"
     )
     @app_commands.checks.has_role(MODERATOR_ROLE_NAME)
-    async def _message_dump(interaction: discord.Interaction, user: discord.User, channel: discord.TextChannel,
-                           start_date: str, limit: int = 1000):
+    async def _message_dump(interaction: discord.Interaction, user: discord.User,
+                           channel: discord.TextChannel, start_date: str, limit: int = 1000):
         await message_dump_command(interaction, user, channel, start_date, limit)
     
     # Add error handler for message_dump
-    _message_dump.error(message_dump_error)
+    _message_dump.on_error = message_dump_error
 
 def setup_commands(bot_param):
     """Initialize command module with bot instance and register commands."""
     # Using globals is necessary here to initialize module-level variables
     # pylint: disable=global-statement
-    global bot_instance, tree, cache, reminders, reminders_lock, reminder_threads, event_feed, message_dump_servers
+    global bot_instance, tree, reminders, reminders_lock, reminder_threads, event_feed, message_dump_servers  # pylint: disable=line-too-long
     bot_instance = bot_param
-    tree = bot_instance.tree
-    cache = DiscordCache()
+    if bot_instance:
+        tree = bot_instance.tree
+    # Import cache from bot.py to maintain functionality
+    from bot import cache  # pylint: disable=import-outside-toplevel,unused-import
     reminders = {}
     reminders_lock = threading.Lock()
     reminder_threads = {}
@@ -360,12 +564,12 @@ def setup_commands(bot_param):
     # This attribute is defined outside __init__ because it depends on an import
     # that should happen at function level to avoid circular imports
     # pylint: disable=attribute-defined-outside-init
-    event_feed.scheduler = AsyncIOScheduler()
+    if event_feed:
+        event_feed.scheduler = AsyncIOScheduler()
 
     # Register all commands
     register_commands()
 
-T = TypeVar('T')
 
 class InvalidReminderInterval(Exception):
     """Exception raised when an invalid reminder interval is provided."""
@@ -377,18 +581,27 @@ def validate_reminder_interval(interval: int) -> None:
 
 def create_set_reminder_command():
     """Factory function to create the set_reminder command."""
-    cmd = app_commands.Command(
-        name='set_reminder',
-        description='Sets a reminder message to be sent to a channel at regular intervals',
-        callback=set_reminder_callback
+    # Create the command with proper parameter definitions
+    @app_commands.command(name='set_reminder', description='Sets a reminder message to be sent to a channel at regular intervals')
+    @app_commands.describe(
+        channel='Channel to send reminders to',
+        title='Title of the reminder',
+        message='Message content of the reminder',
+        interval='Interval in seconds between reminders (minimum 60)'
     )
-    cmd.add_check(app_commands.checks.has_role(MODERATOR_ROLE_NAME))
+    @app_commands.checks.has_role(MODERATOR_ROLE_NAME)
+    async def set_reminder_command(interaction: discord.Interaction,
+                                  channel: discord.TextChannel, title: str,
+                                  message: str, interval: int):
+        """Sets a reminder message to be sent to a channel at regular intervals."""
+        await set_reminder_callback(interaction, channel, title, message, interval)
 
     # Add error handler
     async def on_error(interaction: discord.Interaction, error):
         """Handles errors for the set_reminder command."""
         if isinstance(error, app_commands.errors.MissingRole):
-            await interaction.response.send_message('You do not have the required role to use this command.', ephemeral=True)
+            await interaction.response.send_message(
+                'You do not have the required role to use this command.', ephemeral=True)
         elif isinstance(error, InvalidReminderInterval):
             await interaction.response.send_message(f'Invalid interval: {error}', ephemeral=True)
         elif isinstance(error, discord.HTTPException):
@@ -396,64 +609,70 @@ def create_set_reminder_command():
             await interaction.response.send_message('Discord API error occurred.', ephemeral=True)
         else:
             await interaction.response.send_message(f'Error: {error}', ephemeral=True)
-    cmd.on_error = on_error
+    
+    set_reminder_command.on_error = on_error
+    return set_reminder_command
 
-    return cmd
-
-async def set_reminder_callback(interaction: discord.Interaction, channel: discord.TextChannel, title: str, message: str, interval: int):
+async def set_reminder_callback(interaction: discord.Interaction,
+                               channel: discord.TextChannel, title: str,
+                               message: str, interval: int):
     """Callback for the set_reminder command."""
     validate_reminder_interval(interval)
-    with reminders_lock:
-        reminders[channel.id] = {
-            'channel_id': channel.id,
-            'title': title,
-            'message': message,
-            'interval': interval,
-            'next_trigger': time_module.time() + interval
-        }
-        with open(REMINDERS_FILE, 'w', encoding='utf-8') as reminder_file:
-            json.dump(reminders, reminder_file)
+    if reminders_lock:
+        with reminders_lock:
+            reminders[channel.id] = {
+                'channel_id': channel.id,
+                'title': title,
+                'message': message,
+                'interval': interval,
+                'next_trigger': time_module.time() + interval
+            }
+            with open(REMINDERS_FILE, 'w', encoding='utf-8') as reminder_file:
+                json.dump(reminders, reminder_file)
 
-    await interaction.response.send_message(f'Reminder set in {channel.mention} every {interval} seconds.', ephemeral=True)
+    await interaction.response.send_message(
+        f'Reminder set in {channel.mention} every {interval} seconds.', ephemeral=True)
 
 
 # Command functions defined at module level but registered in register_commands()
 async def delete_all_reminders(interaction: discord.Interaction) -> None:
     """Delete all active reminders."""
-    with reminders_lock:
-        reminders.clear()
-        for stop_event in reminder_threads.values():
-            stop_event.set()
-        reminder_threads.clear()
-        try:
-            with open(REMINDERS_FILE, 'w', encoding='utf-8') as reminder_file:
-                json.dump(reminders, reminder_file)
-        except (OSError, IOError) as e:
-            logger.error('Failed to write reminders file: %s', e)
-            await interaction.response.send_message('Failed to delete reminders due to file access error.', ephemeral=True)
-            return
+    if reminders_lock:
+        with reminders_lock:
+            reminders.clear()
+            for stop_event in reminder_threads.values():
+                stop_event.set()
+            reminder_threads.clear()
+            try:
+                with open(REMINDERS_FILE, 'w', encoding='utf-8') as reminder_file:
+                    json.dump(reminders, reminder_file)
+            except (OSError, IOError) as e:
+                logger.error('Failed to write reminders file: %s', e)
+                await interaction.response.send_message('Failed to delete reminders due to file access error.', ephemeral=True)
+                return
     await interaction.response.send_message('All reminders have been deleted.', ephemeral=True)
 
 async def delete_reminder(interaction: discord.Interaction, title: str) -> None:
     """Deletes a reminder by title."""
     try:
-        with reminders_lock:
-            for channel_id, reminder_data in list(reminders.items()):
-                if reminder_data['title'] == title:
-                    del reminders[channel_id]
-                    if channel_id in reminder_threads:
-                        reminder_threads[channel_id].set()
-                        del reminder_threads[channel_id]
-                    try:
-                        with open(REMINDERS_FILE, 'w', encoding='utf-8') as reminder_file:
-                            json.dump(reminders, reminder_file)
-                    except (OSError, IOError) as e:
-                        logger.error('Failed to write reminders file: %s', e)
-                        await interaction.response.send_message('Failed to delete reminder due to file access error.', ephemeral=True)
+        if reminders_lock:
+            with reminders_lock:
+                for channel_id, reminder_data in reminders.items():
+                    if reminder_data['title'] == title:
+                        del reminders[channel_id]
+                        if channel_id in reminder_threads:
+                            reminder_threads[channel_id].set()
+                            del reminder_threads[channel_id]
+                        try:
+                            with open(REMINDERS_FILE, 'w', encoding='utf-8') as reminder_file:
+                                json.dump(reminders, reminder_file)
+                        except (OSError, IOError) as e:
+                            logger.error('Failed to write reminders file: %s', e)
+                            await interaction.response.send_message('Failed to delete reminder due to file access error.', ephemeral=True)
+                            return
+                        await interaction.response.send_message(f'Reminder titled "{title}" has been deleted.', ephemeral=True)
                         return
-                    await interaction.response.send_message(f'Reminder titled "{title}" has been deleted.', ephemeral=True)
-                    return
-        await interaction.response.send_message(f'No reminder found with the title "{title}".', ephemeral=True)
+            await interaction.response.send_message(f'No reminder found with the title "{title}".', ephemeral=True)
     except (discord.HTTPException, OSError, IOError) as e:
         logger.error('Error deleting reminder: %s', e)
         await interaction.response.send_message('Failed to delete reminder due to an error.', ephemeral=True)
@@ -533,7 +752,7 @@ async def purge_webhooks_error(interaction: discord.Interaction, error):
     else:
         await interaction.response.send_message(f'Error: {error}', ephemeral=True)
 
-async def kick_member(interaction: discord.Interaction, member: discord.Member, reason: str = None):
+async def kick_member(interaction: discord.Interaction, member: discord.Member, reason: Optional[str] = None):
     """Kicks a member from the server."""
     try:
         await member.kick(reason=reason)
@@ -581,7 +800,7 @@ async def botsay_error(interaction: discord.Interaction, error):
     else:
         await interaction.response.send_message(f'Error: {error}', ephemeral=True)
 
-async def timeout_member(interaction: discord.Interaction, member: discord.Member, duration: int, reason: str = None):
+async def timeout_member(interaction: discord.Interaction, member: discord.Member, duration: int, reason: Optional[str] = None):
     """Timeouts a member for a specified duration."""
     try:
         until = discord.utils.utcnow() + timedelta(seconds=duration)
@@ -633,55 +852,52 @@ async def log_tail_error(interaction: discord.Interaction, error):
     else:
         await interaction.response.send_message(f"Error: {str(error)}", ephemeral=True)
 
-async def add_event_feed_url_command(interaction: discord.Interaction, calendar_url: str, channel_name: str = "bot-trap"):
+async def add_event_feed_command(interaction: discord.Interaction, calendar_url: str, channel_name: str = "bot-trap"):
     """Adds a calendar feed URL to check for events."""
     try:
         if not calendar_url.startswith(('http://', 'https://')):
             await interaction.response.send_message("Invalid URL format", ephemeral=True)
             return
-        if interaction.guild.id not in event_feed.feeds:
+        
+        # Test the URL to make sure it's a valid calendar feed
+        try:
+            response = requests.get(calendar_url, timeout=10)
+            response.raise_for_status()
+            Calendar.from_ical(response.text)
+        except (requests.RequestException, ValueError) as e:
+            await interaction.response.send_message(
+                f"Error accessing calendar feed: {str(e)}", ephemeral=True)
+            return
+        
+        if event_feed and interaction.guild and interaction.guild.id not in event_feed.feeds:
             event_feed.feeds[interaction.guild.id] = {}
-        event_feed.feeds[interaction.guild.id][calendar_url] = {
-            'last_checked': None,
-            'channel': channel_name
-        }
-        await event_feed.check_feeds()
+        if event_feed and interaction.guild:
+            event_feed.feeds[interaction.guild.id][calendar_url] = {
+                'last_checked': datetime.now(),
+                'channel': channel_name,
+                'posted_events': set()  # Track posted events to avoid duplicates
+            }
+            
+            # Start the scheduler if it's not already running
+            if event_feed.scheduler:
+                if not event_feed.scheduler.running:
+                    event_feed.scheduler.start()
+                
+                # Add the feed checking job if it doesn't exist
+                try:
+                    event_feed.scheduler.get_job('event_feed_checker')
+                except (AttributeError, KeyError):
+                    # Job doesn't exist, add it
+                    event_feed.scheduler.add_job(
+                        event_feed.check_feeds_job,
+                        'interval',
+                        hours=1,
+                        id='event_feed_checker'
+                    )
+        
         await interaction.response.send_message(
             f"Added calendar feed! I'll check for new events hourly and post in "
             f"#{channel_name}",
-            ephemeral=True
-        )
-    except (discord.Forbidden, discord.HTTPException, ValueError, AttributeError) as e:
-        await interaction.response.send_message(
-            f"Error adding feed: {str(e)}",
-            ephemeral=True
-        )
-
-async def add_event_feed_url_error(interaction: discord.Interaction, error):
-    """Handles errors for the add_event_feed_url command.
-    
-    Args:
-        interaction: The Discord interaction object
-        error: The error that occurred
-    """
-    if isinstance(error, discord.HTTPException):
-        logger.error('Discord API error: %s', error)
-        await interaction.response.send_message('Discord API error occurred.', ephemeral=True)
-    else:
-        await interaction.response.send_message(f"Error: {str(error)}", ephemeral=True)
-
-async def add_event_feed_command(interaction: discord.Interaction, calendar_url: str):
-    """Adds a calendar feed to check for events."""
-    try:
-        if not calendar_url.startswith(('http://', 'https://')):
-            await interaction.response.send_message("Invalid URL format", ephemeral=True)
-            return
-        if interaction.guild.id not in event_feed.feeds:
-            event_feed.feeds[interaction.guild.id] = {}
-        event_feed.feeds[interaction.guild.id][calendar_url] = None
-        await event_feed.check_feeds()
-        await interaction.response.send_message(
-            "Added calendar feed! I'll check for new events hourly and post in #bot-trap",
             ephemeral=True
         )
     except (discord.Forbidden, discord.HTTPException, ValueError, AttributeError) as e:
@@ -697,63 +913,74 @@ async def add_event_feed_error(interaction: discord.Interaction, error):
         interaction: The Discord interaction object
         error: The error that occurred
     """
-    if isinstance(error, app_commands.errors.MissingRole):
-        await interaction.response.send_message('You do not have the required role to use this command.', ephemeral=True)
-    elif isinstance(error, discord.HTTPException):
+    if isinstance(error, discord.HTTPException):
         logger.error('Discord API error: %s', error)
         await interaction.response.send_message('Discord API error occurred.', ephemeral=True)
     else:
-        await interaction.response.send_message(f'Error: {error}', ephemeral=True)
+        await interaction.response.send_message(f"Error: {str(error)}", ephemeral=True)
 
 async def list_event_feeds_command(interaction: discord.Interaction):
     """Lists all registered calendar feeds."""
-    if interaction.guild.id not in event_feed.feeds or not event_feed.feeds[interaction.guild.id]:
+    if not event_feed or not interaction.guild or interaction.guild.id not in event_feed.feeds or not event_feed.feeds[interaction.guild.id]:
         await interaction.response.send_message('No calendar feeds registered', ephemeral=True)
         return
-    feed_list = '\n'.join(event_feed.feeds[interaction.guild.id].keys())
+    feed_list = '\n'.join(event_feed.feeds[interaction.guild.id])
     await interaction.response.send_message(f'Registered calendar feeds:\n{feed_list}', ephemeral=True)
 
 async def remove_event_feed_command(interaction: discord.Interaction, feed_url: str):
     """Removes a calendar feed."""
-    if interaction.guild.id not in event_feed.feeds or feed_url not in event_feed.feeds[interaction.guild.id]:
+    if not event_feed or not interaction.guild or interaction.guild.id not in event_feed.feeds or feed_url not in event_feed.feeds[interaction.guild.id]:
         await interaction.response.send_message('Calendar feed not found', ephemeral=True)
         return
     del event_feed.feeds[interaction.guild.id][feed_url]
     await interaction.response.send_message(f'Removed calendar feed: {feed_url}', ephemeral=True)
 
-async def cat_command(interaction: discord.Interaction):
+async def bot_command(interaction: discord.Interaction):
     """Check on JohnnyBot."""
     try:
-        pet_name = os.getenv("PET_NAME", "JohnnyBot")
-        message = get_time_based_message(pet_name)
-        logger.info('[%s] - cat command: %s', interaction.user, message)
+        bot_name = interaction.client.user.display_name if interaction.client.user else "JohnnyBot"
+        # Import the function from bot.py
+        from bot import get_time_based_message  # pylint: disable=import-outside-toplevel
+        message = get_time_based_message(bot_name)
+        logger.info('[%s] - bot command: %s', interaction.user, message)
         await interaction.response.send_message(message)
     except discord.errors.NotFound:
         # Handle case where interaction has timed out
-        logger.warning("Interaction timed out for cat command from %s", interaction.user)
+        logger.warning("Interaction timed out for bot command from %s", interaction.user)
 
-async def pet_cat_command(interaction: discord.Interaction):
+async def pet_bot_command(interaction: discord.Interaction):
     """Pet JohnnyBot."""
     try:
-        pet_name = os.getenv("PET_NAME", "JohnnyBot")
-        message = random.choice(pet_response_messages).replace("PETNAME", pet_name)
-        logger.info('[%s] - pet cat command: %s', interaction.user, message)
+        bot_name = interaction.client.user.display_name if interaction.client.user else "JohnnyBot"
+        # Define bot response messages inline and select efficiently
+        bot_responses = [
+            "BOTNAME purrs happily!",
+            "BOTNAME rubs against your leg!",
+            "BOTNAME gives you a slow blink of affection!",
+            "BOTNAME meows appreciatively!",
+            "BOTNAME headbutts your hand for more pets!"
+        ]
+        selected_response = random.choice(bot_responses)
+        message = selected_response.replace("BOTNAME", bot_name)
+        logger.info('[%s] - pet bot command: %s', interaction.user, message)
         await interaction.response.send_message(message)
     except discord.errors.NotFound:
         # Handle case where interaction has timed out
-        logger.warning("Interaction timed out for pet_cat command from %s", interaction.user)
+        logger.warning("Interaction timed out for pet_bot command from %s", interaction.user)
 
-async def cat_pick_fav_command(interaction: discord.Interaction, user1: discord.User, user2: discord.User):
+async def bot_pick_fav_command(interaction: discord.Interaction, user1: discord.User, user2: discord.User):
     """See who JohnnyBot prefers today."""
     try:
-        pet_name = os.getenv("PET_NAME", "JohnnyBot")
-        chosen_user = random.choice([user1, user2])
-        message = f"{pet_name} is giving attention to {chosen_user.mention}!"
-        logger.info('[%s] - cat pick fav command: %s', interaction.user, message)
+        bot_name = interaction.client.user.display_name if interaction.client.user else "JohnnyBot"
+        # More efficient user selection and message formatting
+        users = [user1, user2]
+        chosen_user = random.choice(users)
+        message = f"{bot_name} is giving attention to {chosen_user.mention}!"
+        logger.info('[%s] - bot pick fav command: %s', interaction.user, message)
         await interaction.response.send_message(message)
     except discord.errors.NotFound:
         # Handle case where interaction has timed out
-        logger.warning("Interaction timed out for cat_pick_fav command from %s", interaction.user)
+        logger.warning("Interaction timed out for bot_pick_fav command from %s", interaction.user)
 
 def cleanup_orphaned_dumps():
     """Clean up orphaned message dump files and folders older than 30 minutes.
@@ -788,11 +1015,11 @@ def cleanup_orphaned_dumps():
                         cleaned_count += 1
         
         return cleaned_count
-    except Exception as e:
-        logger.error(f"Error cleaning up orphaned message dumps: {e}")
+    except Exception as e:  # pylint: disable=broad-exception-caught
+        logger.error("Error cleaning up orphaned message dumps: %s", e)
         return cleaned_count
 
-async def message_dump_command(interaction: discord.Interaction, user: discord.User, channel: discord.TextChannel,
+async def message_dump_command(interaction: discord.Interaction, user: discord.User, channel: discord.TextChannel,  # pylint: disable=too-many-locals,too-many-branches,too-many-statements
                               start_date: str, limit: int = 1000):
     """Dump a user's messages from a channel into a downloadable file starting from a specific date."""
     try:
@@ -800,7 +1027,7 @@ async def message_dump_command(interaction: discord.Interaction, user: discord.U
         logger.info("Checking for orphaned message dump files/folders...")
         cleaned_count = cleanup_orphaned_dumps()
         if cleaned_count > 0:
-            logger.info(f"Cleaned up {cleaned_count} orphaned message dump directories")
+            logger.info("Cleaned up %s orphaned message dump directories", cleaned_count)
         # Defer the response since this might take a while
         await interaction.response.defer(ephemeral=True)
         
@@ -834,8 +1061,8 @@ async def message_dump_command(interaction: discord.Interaction, user: discord.U
         
         # Fetch messages with proper pagination
         messages = []
-        message_count = 0
-        oldest_message = None
+        # message_count = 0  # Unused variable
+        # oldest_message = None  # Unused variable
         
         # Log the user ID we're looking for
         logger.info(f"Looking for messages from user ID: {user.id}, name: {user.name}")
@@ -854,8 +1081,8 @@ async def message_dump_command(interaction: discord.Interaction, user: discord.U
             await interaction.followup.send(f"I don't have permission to read messages in {channel.mention}.", ephemeral=True)
             shutil.rmtree(dump_dir, ignore_errors=True)
             return
-        except Exception as e:
-            logger.error(f"Error accessing channel: {e}")
+        except Exception as e:  # pylint: disable=broad-exception-caught
+            logger.error("Error accessing channel: %s", e)
             await interaction.followup.send(f"Error accessing channel {channel.mention}: {str(e)}", ephemeral=True)
             shutil.rmtree(dump_dir, ignore_errors=True)
             return
@@ -873,7 +1100,7 @@ async def message_dump_command(interaction: discord.Interaction, user: discord.U
         last_message_id = None
         
         # Log the start of message fetching
-        logger.info(f"Starting message fetch for user {user.id} in channel {channel.id}")
+        logger.info("Starting message fetch for user %s in channel %s", user.id, channel.id)
         
         # Rate limit handling variables
         retry_count = 0
@@ -892,7 +1119,7 @@ async def message_dump_command(interaction: discord.Interaction, user: discord.U
                     fetch_kwargs['before'] = discord.Object(id=last_message_id)
                 
                 # Log the current fetch attempt
-                logger.info(f"Fetching batch with params: {fetch_kwargs}, processed so far: {total_processed}")
+                logger.info("Fetching batch with params: %s, processed so far: %s", fetch_kwargs, total_processed)
             
                 # Fetch the batch
                 current_batch = []
@@ -908,26 +1135,29 @@ async def message_dump_command(interaction: discord.Interaction, user: discord.U
                     total_processed += 1
                     
                     # Log message details for debugging
-                    logger.info(f"Message {msg.id} from author ID: {msg.author.id}, target user ID: {user.id}, match: {msg.author.id == user.id}")
+                    logger.info("Message %s from author ID: %s, target user ID: %s, match: %s",
+                               msg.id, msg.author.id, user.id, msg.author.id == user.id)
                     
                     # Check if this message is from our target user
                     if msg.author.id == user.id:
-                        # Format the message
+                        # Format the message more efficiently
                         timestamp = msg.created_at.strftime("%Y-%m-%d %H:%M:%S")
-                        content = msg.content if msg.content else "[No text content]"
+                        content = msg.content or "[No text content]"
+                        
+                        # Build message parts list for efficient joining
+                        message_parts = [f"[{timestamp}] {content}"]
                         
                         # Handle attachments
-                        attachments = ""
                         if msg.attachments:
-                            attachments = "\nAttachments: " + ", ".join([a.url for a in msg.attachments])
+                            attachment_urls = [a.url for a in msg.attachments]
+                            message_parts.append(f"\nAttachments: {', '.join(attachment_urls)}")
                         
                         # Handle embeds
-                        embeds = ""
                         if msg.embeds:
-                            embeds = "\nEmbeds: " + str(len(msg.embeds)) + " embed(s)"
+                            message_parts.append(f"\nEmbeds: {len(msg.embeds)} embed(s)")
                         
-                        # Add to our collection
-                        formatted_message = f"[{timestamp}] {content}{attachments}{embeds}\n\n"
+                        # Join all parts efficiently
+                        formatted_message = ''.join(message_parts) + "\n\n"
                         current_batch.append(formatted_message)
                 
                 # Reset retry count on successful fetch
@@ -937,7 +1167,8 @@ async def message_dump_command(interaction: discord.Interaction, user: discord.U
                 if "rate limited" in str(e).lower():
                     retry_delay = base_delay * (2 ** retry_count)
                     retry_count += 1
-                    logger.warning(f"Rate limited. Retrying in {retry_delay} seconds. Retry {retry_count}/{max_retries}")
+                    logger.warning("Rate limited. Retrying in %s seconds. Retry %s/%s",
+                                  retry_delay, retry_count, max_retries)
                     
                     if retry_count <= max_retries:
                         await interaction.followup.send(
@@ -947,21 +1178,21 @@ async def message_dump_command(interaction: discord.Interaction, user: discord.U
                         await asyncio.sleep(retry_delay)
                         # Skip the rest of this iteration and retry
                         continue
-                    else:
-                        logger.error(f"Max retries ({max_retries}) reached for rate limiting")
-                        await interaction.followup.send(
-                            "Hit Discord rate limit too many times. Try again later or with a smaller limit.",
-                            ephemeral=True
-                        )
-                        # Break out of the loop entirely
-                        break
+                    
+                    logger.error("Max retries (%s) reached for rate limiting", max_retries)
+                    await interaction.followup.send(
+                        "Hit Discord rate limit too many times. Try again later or with a smaller limit.",
+                        ephemeral=True
+                    )
+                    # Break out of the loop entirely
+                    break
                 else:
                     # Re-raise other HTTP exceptions
                     raise
             
             # Log the results of this batch
             batch_count = len(current_batch)
-            logger.info(f"Batch complete: processed {batch_count} messages from target user")
+            logger.info("Batch complete: processed %s messages from target user", batch_count)
             
             # Add the batch to our collection
             messages.extend(current_batch)
@@ -974,11 +1205,13 @@ async def message_dump_command(interaction: discord.Interaction, user: discord.U
                 )
             
             # Log the batch results
-            logger.info(f"Batch complete: got {messages_in_this_batch} messages in batch, of which {batch_count} were from target user")
+            logger.info("Batch complete: got %s messages in batch, of which %s were from target user",
+                       messages_in_this_batch, batch_count)
             
             # If we got fewer messages than requested, we've reached the end
             if messages_in_this_batch == 0 or messages_in_this_batch < batch_size:
-                logger.info(f"End of channel history reached. Total processed: {total_processed}, found: {len(messages)}")
+                logger.info("End of channel history reached. Total processed: %s, found: %s",
+                           total_processed, len(messages))
                 break
             
             # Add a delay to avoid rate limiting
@@ -1010,13 +1243,18 @@ async def message_dump_command(interaction: discord.Interaction, user: discord.U
             return
         
         # Write messages to file
+        # Write file more efficiently using a single write operation
+        header_parts = [
+            f"Messages from {user.name} (ID: {user.id}) in #{channel.name}\n",
+            f"Dump created at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n",
+            f"Start date: {start_date}\n",
+            f"Messages found: {len(messages)}\n",
+            f"Total messages processed: {total_processed}\n\n",
+            "="*50 + "\n\n"
+        ]
+        
         with open(file_path, 'w', encoding='utf-8') as f:
-            f.write(f"Messages from {user.name} (ID: {user.id}) in #{channel.name}\n")
-            f.write(f"Dump created at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write(f"Start date: {start_date}\n")
-            f.write(f"Messages found: {len(messages)}\n")
-            f.write(f"Total messages processed: {total_processed}\n\n")
-            f.write("="*50 + "\n\n")
+            f.write(''.join(header_parts))
             f.writelines(messages)
         
         # Compress the file
@@ -1033,16 +1271,18 @@ async def message_dump_command(interaction: discord.Interaction, user: discord.U
         
         # Send DM to the user with the download link
         expiry_time = (datetime.now() + timedelta(seconds=1800)).strftime("%Y-%m-%d %H:%M:%S")
-        dm_message = (
-            f"Here's the message dump you requested from {channel.mention}:\n\n"
-            f"**Download Link:** {download_url}\n"
-            f"**User:** {user.mention}\n"
-            f"**Start Date:** {start_date}\n"
-            f"**Messages found:** {len(messages)}\n"
-            f"**Messages processed:** {total_processed}\n"
-            f"**Link expires:** {expiry_time} (30 minutes from now)\n\n"
-            f"The file will be automatically deleted after the link expires."
-        )
+        # Build DM message more efficiently
+        dm_parts = [
+            f"Here's the message dump you requested from {channel.mention}:\n\n",
+            f"**Download Link:** {download_url}\n",
+            f"**User:** {user.mention}\n",
+            f"**Start Date:** {start_date}\n",
+            f"**Messages found:** {len(messages)}\n",
+            f"**Messages processed:** {total_processed}\n",
+            f"**Link expires:** {expiry_time} (30 minutes from now)\n\n",
+            "The file will be automatically deleted after the link expires."
+        ]
+        dm_message = ''.join(dm_parts)
         
         await interaction.user.send(dm_message)
         
@@ -1061,7 +1301,7 @@ async def message_dump_command(interaction: discord.Interaction, user: discord.U
     except (OSError, IOError) as e:
         logger.error('File operation error: %s', e)
         await interaction.followup.send("An error occurred while creating the message dump file.", ephemeral=True)
-    except Exception as e:
+    except Exception as e:  # pylint: disable=broad-exception-caught
         logger.error('Unexpected error in message_dump_command: %s', e)
         await interaction.followup.send("An unexpected error occurred.", ephemeral=True)
 
@@ -1069,7 +1309,7 @@ async def message_dump_error(interaction: discord.Interaction, error):
     """Handles errors for the message_dump command."""
     if isinstance(error, app_commands.errors.MissingRole):
         await interaction.response.send_message('You do not have the required role to use this command.', ephemeral=True)
-    elif isinstance(error, app_commands.errors.MissingRequiredArgument):
+    elif hasattr(app_commands, 'MissingRequiredArgument') and isinstance(error, getattr(app_commands, 'MissingRequiredArgument')):
         await interaction.response.send_message(
             'Missing required argument. Make sure to provide user, channel, and start_date.',
             ephemeral=True

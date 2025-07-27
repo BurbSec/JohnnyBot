@@ -2,6 +2,7 @@
 
 This module contains all configuration variables, constants, and setup for logging.
 """
+# pylint: disable=cyclic-import
 import os
 import logging
 from logging.handlers import RotatingFileHandler
@@ -12,9 +13,7 @@ if not TOKEN:
     raise ValueError("DISCORD_BOT_TOKEN environment variable is not set")
 
 # Role names
-BAD_BOT_ROLE_NAME = 'bad bots'
 MODERATOR_ROLE_NAME = 'Moderators'
-AUTOMATA_ROLE_NAME = 'automata'
 
 # File paths
 LOG_FILE = os.path.join(os.path.dirname(__file__), 'johnnybot.log')

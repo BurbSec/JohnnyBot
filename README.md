@@ -4,44 +4,39 @@ JohnnyBot is a Discord moderation bot designed to automate role management and e
 
 ## Features
 
-- **Automatic Role Management:**
-  - Assigns the "bad bots" role to new members automatically.
-  - Removes the "bad bots" role from members who complete onboarding.
-
-- **Moderation Automation:**
-  - Deletes messages sent by members with the "bad bots" role in non-DM channels.
-  - Kicks members with the "bad bots" role who violate server guidelines.
-  - Bans members with the "bad bots" role or no role who DM the bot, deleting their messages across the server.
-
-- **Forum Management:**
-  - Automatically replies to new threads in the "🧑💻・job_postings" forum with a required message
-
 - **Command-based Moderation:**
   - Provides moderators with slash commands to manage members, messages, and post announcements.
 
+- **Reminder System:**
+  - Set recurring reminders to be sent to specific channels at regular intervals
+  - Persistent reminder storage with automatic scheduling
+
+- **Event Feed Integration:**
+  - Subscribe to calendar feeds and get notifications for new events
+  - Configurable notification channels
+
 - **Logging and Notifications:**
-  - Logs actions and errors to a rotating log file.
-  - Sends notifications to a designated moderators-only channel.
+  - Logs actions and errors to a rotating log file in the bot directory
+  - DM a tail of the log on request
 
 - **Message Archive:**
   - Allows moderators to dump and archive user messages from specific channels
   - Provides temporary download links for message archives
   - Automatically cleans up old archive files
 
-- **Pet Interactions:**
-  - Includes JohnnyBot functionality with time-based messages
-  - `/pet` command to interact with JohnnyBot
+- **Bot Interactions:**
+  - Includes [PetBot](https://github.com/0xMetr0/PetBot) functionality with time-based messages
+  - Bot commands to interact with JohnnyBot
 
 ## Requirements
 
-- Python 3.7 or higher
-- Official Discord.py library version 2.4 or higher
-- Flask 2.0.0 or higher (for message dump web server)
-- Waitress 2.1.2 or higher (for production-ready web server)
+- Python 3.7 (tested up to 3.13)
+- All modules in `requirements.txt`
+- Firewall allowing inbound connections on port TCP port 80 (for message archive hosting)
 
 ## Concurrency Model
 
-Note the bot uses both asyncio and threading for different purposes. DON'T CHANGE THIS:
+Note the bot uses both asyncio and threading for different purposes. DO NOT CHANGE THIS:
 
 - **asyncio** is used for:
   - All Discord API interactions (primary event loop)
@@ -50,12 +45,12 @@ Note the bot uses both asyncio and threading for different purposes. DON'T CHANG
   - Network operations
 
 - **threading** is used for:
-  - Synchronous operations that can't be made async (like file I/O)
+  - Synchronous operations that cannot be made async (like file I/O)
   - Thread-safe caching of Discord objects
   - Synchronization primitives (locks) for shared resources
 
 This hybrid approach allows the bot to:
-1. Handle Discord's async API efficiently
+1. Handle Discord async API efficiently
 2. Perform blocking operations without stalling the event loop
 3. Maintain thread safety for shared resources
 4. Scale well under load
@@ -73,13 +68,11 @@ This hybrid approach allows the bot to:
    ```
 
 3. Configure the bot settings:
-   - Open the `bot.py` file in a text editor.
+   - Open the config.py file in a text editor.
    - Modify the following constants according to your server's setup:
-     - `BAD_BOT_ROLE_NAME`: Role assigned to bad bots (default: 'bad bots').
-     - `MODERATOR_ROLE_NAME`: Moderator role name (default: 'Moderators').
-     - `DELAY_MINUTES`: Delay before assigning the "bad bots" role to new members (default: 4 minutes).
-     - `LOG_FILE`: Name of the log file (default: 'johnnybot.log').
-     - `MODERATORS_CHANNEL_NAME`: Name of the moderators channel for notifications (default: 'moderators_only').
+     - `MODERATOR_ROLE_NAME`: Moderator role name (default: "Moderators").
+     - `LOG_FILE`: Name of the log file (default: "johnnybot.log").
+     - `MODERATORS_CHANNEL_NAME`: Name of the moderators channel for notifications (default: "moderators_only").
 
 ## Running the Bot
 
@@ -162,18 +155,12 @@ This hybrid approach allows the bot to:
 - **Parameters:**
   - `lines`: Number of lines to retrieve.
 
-### 12. `/add_event_feed_url`
-**Description:** Adds a calendar feed URL to check for events.
+### 12. `/add_event_feed`
+**Description:** Adds a calendar feed URL to check for events, and posts them to a channel. Adds events to Discord Server Events as well.
 
 - **Parameters:**
   - `calendar_url`: URL of the calendar feed.
   - `channel_name`: Channel to post notifications (default: bot-trap).
-
-### 13. `/add_event_feed`
-**Description:** Adds a calendar feed to check for events.
-
-- **Parameters:**
-  - `calendar_url`: URL of the calendar feed.
 
 ### 14. `/list_event_feeds`
 **Description:** Lists all registered calendar feeds.
@@ -184,13 +171,13 @@ This hybrid approach allows the bot to:
 - **Parameters:**
   - `feed_url`: URL of the calendar feed to remove.
 
-### 16. `/cat`
-**Description:** Check on JohnnyBot.
+### 16. `/bot_mood`
+**Description:** Check on what the PetBot is up to.
 
-### 17. `/pet_cat`
+### 17. `/pet_bot`
 **Description:** Pet JohnnyBot.
 
-### 18. `/cat_pick_fav`
+### 18. `/bot_pick_fav`
 **Description:** See who JohnnyBot prefers today.
 
 - **Parameters:**
@@ -198,7 +185,7 @@ This hybrid approach allows the bot to:
   - `user2`: Second potential favorite.
 
 ### 19. `/message_dump`
-**Description:** Dumps a user's messages from a specified channel into a downloadable file. Compresses the file and hosts it via a temporary web server for 30 minutes.
+**Description:** Dumps a user's messages from a specified channel into a downloadable file. Compresses the file and hosts it via a temporary web server for 30 minutes. Make sure your firewall rules are set to allow inbound connections on port TCP port 80.
 
 - **Parameters:**
   - `user`: User whose messages to dump.
@@ -215,8 +202,10 @@ This hybrid approach allows the bot to:
 
 ## Usage
 
-- The bot automatically manages roles and moderates the server based on the configured rules.
 - Moderators can perform actions using the slash commands listed above.
+- Set up recurring reminders for important announcements or events.
+- Subscribe to calendar feeds to get automatic event notifications.
+- Use message dump functionality to archive user messages when needed.
 - Log files are accessible, and the bot can DM logs on request through the `/log_tail` command.
 
 ## Contributing
@@ -225,7 +214,7 @@ Contributions are welcome! If you encounter any bugs or have suggestions, feel f
 
 ## Attribution
 
-Cat functionality adapted from [PetBot](https://github.com/0xMetr0/PetBot) under MIT License.
+Bot interaction functionality adapted from [PetBot](https://github.com/0xMetr0/PetBot) under MIT License.
 
 ## License
 
