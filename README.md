@@ -1,6 +1,6 @@
 # JohnnyBot - Discord Moderation Bot
 
-JohnnyBot is a Discord moderation bot designed to automate role management and enforce server rules. It provides features such as automatic role assignment, message deletion, and user management to ensure a smooth server experience.
+JohnnyBot is a Discord moderation bot designed to automate role management and enforce server rules. It provides features such as automatic role assignment, message deletion, and user management to ensure a smooth server experience. Most commands are limited to users with the MODERATOR_ROLE_NAME, however the PetBot commands can be leveraged by all users.  
 
 ## Features
 
@@ -24,15 +24,14 @@ JohnnyBot is a Discord moderation bot designed to automate role management and e
   - Provides temporary download links for message archives
   - Automatically cleans up old archive files
 
-- **Bot Interactions:**
-  - Includes [PetBot](https://github.com/0xMetr0/PetBot) functionality with time-based messages
-  - Bot commands to interact with JohnnyBot
+- **PetBot Interactions:**
+  - Includes [PetBot](https://github.com/0xMetr0/PetBot) functionality with time-themed messages
 
 ## Requirements
 
 - Python 3.7 (tested up to 3.13)
 - All modules in `requirements.txt`
-- Firewall allowing inbound connections on port TCP port 80 (for message archive hosting)
+- Firewall rule allowing inbound connections on port TCP port 80 (for message archive hosting)
 
 ## Concurrency Model
 
@@ -59,7 +58,7 @@ This hybrid approach allows the bot to:
 
 1. Clone the repository:
    ```shell
-   git clone https://github.com/yourusername/johnnybot.git
+   git clone https://github.com/burbsec/johnnybot.git
    ```
 
 2. Install the required dependencies:
@@ -77,12 +76,15 @@ This hybrid approach allows the bot to:
 ## Running the Bot
 
 1. Ensure all installation steps are complete.
-2. Add your Discord bot token to an environment variable called `DISCORD_BOT_TOKEN`
+2. Add your Discord bot token to an environment variable called `DISCORD_BOT_TOKEN` via any secure means you desire.
 3. Run the bot:
    ```shell
    python bot.py
    ```
-4. The bot should now be online and moderating your Discord server.
+   
+   You may optionally choose to run the bot as a system service that starts at boot (recommended).
+
+4. The bot should now show as online/active in your Discord server. If not, check the logs!
 
 ## Available Commands
 
@@ -199,14 +201,6 @@ This hybrid approach allows the bot to:
   - Automatically cleans up orphaned dump files
   - Provides a download link via DM
   - Link expires after 30 minutes
-
-## Usage
-
-- Moderators can perform actions using the slash commands listed above.
-- Set up recurring reminders for important announcements or events.
-- Subscribe to calendar feeds to get automatic event notifications.
-- Use message dump functionality to archive user messages when needed.
-- Log files are accessible, and the bot can DM logs on request through the `/log_tail` command.
 
 ## Contributing
 
