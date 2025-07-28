@@ -1,6 +1,6 @@
-# JohnnyBot - Discord Moderation Bot
+# JohnnyBot - The Missing Discord Server Management Tookit
 
-JohnnyBot is the missing toolkit for Discord! Designed to automate tons of server management and enforce
+JohnnyBot does all of the stuff Discord bizarrely won't let you do! Designed to automate tons of server management and enforce
 some rules while you're at it. It provides features such as automatic role assignment, message
 deletion, and user management to ensure a smooth server experience. Most commands are limited to users with the MODERATOR_ROLE_NAME, however the PetBot
 commands can be leveraged by all users.
