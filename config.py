@@ -15,6 +15,9 @@ MODERATOR_ROLE_NAME = 'Moderators'
 ADULT_ROLE_NAMES = ['Dads', 'GrownUps']
 CHILD_ROLE_NAMES = ['Kids', 'Bambinos', 'Girls']
 
+# The IP of the interface which will host downloadable archives
+HOST_IP = "0.0.0.0"
+
 TOKEN = os.environ.get('DISCORD_BOT_TOKEN')
 if not TOKEN:
     raise ValueError("DISCORD_BOT_TOKEN environment variable is not set")

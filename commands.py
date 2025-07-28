@@ -22,6 +22,7 @@ from config import (
     LOG_FILE,
     REMINDERS_FILE,
     TEMP_DIR,
+    HOST_IP,
     logger
 )
 
@@ -293,7 +294,7 @@ class MessageDumpServer:  # pylint: disable=too-many-instance-attributes
         self.server_thread = None
         self.shutdown_timer = None
         self.port = self._find_free_port()
-        self.ip = self._get_public_ip()
+        self.host_ip = self._get_host_ip()
         
         # Set up Flask route
         @self.app.route('/')
@@ -306,21 +307,33 @@ class MessageDumpServer:  # pylint: disable=too-many-instance-attributes
             s.bind(('', 0))
             return s.getsockname()[1]
     
-    def _get_public_ip(self):
-        """Get the public IP address of the server."""
+    def _get_host_ip(self):
+        """Get the IP address to bind the server to based on config."""
+        if HOST_IP != "0.0.0.0":
+            # Use the specific IP from config
+            return HOST_IP
+        
+        # If HOST_IP is 0.0.0.0, find the interface with route to internet
+        return self._get_internet_facing_ip()
+    
+    def _get_internet_facing_ip(self):
+        """Get the IP of the interface that has a route to the internet."""
         try:
-            # This should be made async in a future refactor
-            import requests  # pylint: disable=import-outside-toplevel
-            response = requests.get('https://api.ipify.org', timeout=5)
-            return response.text
+            # Create a socket and connect to a remote address to determine which interface is used
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                # Connect to Google's DNS server (doesn't actually send data)
+                s.connect(("8.8.8.8", 80))
+                local_ip = s.getsockname()[0]
+                return local_ip
         except Exception:  # pylint: disable=broad-exception-caught
-            hostname = socket.gethostname()
-            return socket.gethostbyname(hostname)
+            # Fallback to localhost if we can't determine the internet-facing interface
+            logger.warning("Could not determine internet-facing interface, falling back to localhost")
+            return "127.0.0.1"
     
     def start(self):
         """Start the web server in a separate thread."""
         def run_server():
-            serve(self.app, host='0.0.0.0', port=self.port)
+            serve(self.app, host=self.host_ip, port=self.port)
         
         self.server_thread = threading.Thread(target=run_server, daemon=True)
         self.server_thread.start()
@@ -329,7 +342,7 @@ class MessageDumpServer:  # pylint: disable=too-many-instance-attributes
         self.shutdown_timer = threading.Timer(self.duration, self.cleanup)
         self.shutdown_timer.start()
         
-        return f"http://{self.ip}:{self.port}"
+        return f"http://{self.host_ip}:{self.port}"
     
     def cleanup(self):
         """Clean up resources when the server is shut down."""
