@@ -2,5 +2,6 @@ discord.py>=2.4
 apscheduler>=3.10.1
 icalendar>=5.0.11
 requests>=2.32.0
+aiohttp>=3.8.0
 flask>=2.0.0
 waitress>=2.1.2

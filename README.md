@@ -1,15 +1,18 @@
-# JohnnyBot - The Missing Discord Server Management Tookit
+# JohnnyBot - The Missing Discord Server Management Toolkit
 
-JohnnyBot does all of the stuff Discord bizarrely won't let you do! Designed to automate tons of server management and enforce
-some rules while you're at it. It provides features such as automatic role assignment, message
-deletion, and user management to ensure a smooth server experience. Most commands are limited to users with the MODERATOR_ROLE_NAME, however the PetBot
-commands can be leveraged by all users.
+JohnnyBot does all of the stuff Discord bizarrely won't let you do!
+Designed to automate tons of server management and enforce some rules while
+you're at it. It provides features such as automatic role assignment, message
+deletion, and user management to ensure a smooth server experience. Most
+commands are limited to users with the MODERATOR_ROLE_NAME, however the
+PetBot commands can be leveraged by all users.
 
 ## Features
 
 - **Command-based Moderation:**
   - Provides moderators with slash commands to manage members, messages, and
     post announcements.
+  - Mass role assignment for efficient user management
 
 - **Voice Channel Chaperone:**
   - Monitors voice channels and mutes all members if only one adult and one
@@ -90,19 +93,28 @@ This hybrid approach allows the bot to:
 3. Configure the bot settings:
    - Open the config.py file in a text editor.
    - Modify the following constants according to your server's setup:
-     - `MODERATOR_ROLE_NAME`: Name of the modifier role. Necessary for mods to use the bot commands.
-     - `PROTECTED_CHANNELS`: Channels you wish to force to read-only when Discord requires them not to be.
-     - `MODERATORS_CHANNEL_NAME`: Name of the moderators chat channel for bot notifications to be sent to.
+     - `MODERATOR_ROLE_NAME`: Name of the modifier role. Necessary for mods
+       to use the bot commands.
+     - `PROTECTED_CHANNELS`: Channels you wish to force to read-only when
+       Discord requires them not to be.
+     - `MODERATORS_CHANNEL_NAME`: Name of the moderators chat channel for
+       bot notifications to be sent to.
 
 ## Registering for a Discord Bot Token
 
-Follow [THIS GUDE](https://www.upwork.com/resources/how-to-make-discord-bot) to register your bot with Discord and receive the `DISCORD_BOT_TOKEN` you will use when running the bot. 
+Follow [THIS GUIDE](https://www.upwork.com/resources/how-to-make-discord-bot)
+to register your bot with Discord and receive the `DISCORD_BOT_TOKEN` you
+will use when running the bot.
 
-**FOR STEP 8 IN THE ABOVE GUIDE**: JohnnyBot requires specific Discord permissions to function properly. When creating your bot application and generating an invite link, ensure these permissions are selected:
+**FOR STEP 8 IN THE ABOVE GUIDE**: JohnnyBot requires specific Discord
+permissions to function properly. When creating your bot application and
+generating an invite link, ensure these permissions are selected:
 
 ### General Permissions
+
 - **Manage Server** - Required for server management features
-- **Manage Roles** - Required for role permission cloning and voice channel safety features
+- **Manage Roles** - Required for role permission cloning and voice channel
+  safety features
 - **Manage Channels** - Required for channel permission cloning and management
 - **Kick Members** - Required for the `/kick` command
 - **Manage Nicknames** - Required for voice channel safety (muting members)
@@ -111,41 +123,54 @@ Follow [THIS GUDE](https://www.upwork.com/resources/how-to-make-discord-bot) to 
 - **Moderate Members** - Required for the `/timeout` command
 
 ### Text Permissions
+
 - **Send Messages** - Required to send bot responses and notifications
-- **Manage Messages** - Required for purge commands and protected channel enforcement
-- **Read Message History** - Required for message dump functionality and purge commands
+- **Manage Messages** - Required for purge commands and protected channel
+  enforcement
+- **Read Message History** - Required for message dump functionality and
+  purge commands
 - **Use Slash Commands** - Required for all slash command functionality
 - **Embed Links** - Required for rich embed messages (event notifications)
 - **Attach Files** - Required for log file attachments
 
 ### Voice Permissions
+
 - **Connect** - Required to monitor voice channels for safety features
 - **Mute Members** - Required for voice channel chaperone functionality
 - **Move Members** - Required for voice channel management
 
 ### Additional Notes
-- The bot does **NOT** require Administrator permissions
-- Ensure the bot's role is positioned high enough in the role hierarchy to manage the roles and channels it needs to work with
-- For permission cloning commands, the bot cannot clone permissions to/from roles higher than its own highest role
 
+- The bot does **NOT** require Administrator permissions
+- Ensure the bot's role is positioned high enough in the role hierarchy to
+  manage the roles and channels it needs to work with
+- For permission cloning commands, the bot cannot clone permissions to/from
+  roles higher than its own highest role
 
 ## Running the Bot
 
 1. Ensure all installation steps are complete.
-2. Add your Discord bot token to an OS environment variable called `DISCORD_BOT_TOKEN` via any secure means you desire.
+2. Add your Discord bot token to an OS environment variable called
+   `DISCORD_BOT_TOKEN` via any secure means you desire.
+
 3. Run the bot:
+
    ```shell
    python bot.py
    ```
-   
-   You may optionally choose to run the bot as a system service that starts at boot (recommended).
 
-4. The bot should now show as online/active in your Discord server. If not, check the logs!
+   You may optionally choose to run the bot as a system service that starts
+   at boot (recommended).
+
+4. The bot should now show as online/active in your Discord server. If not,
+   check the logs!
 
 ## Available Commands
 
 ### 1. `/set_reminder`
-**Description:** Sets a reminder message to be sent to a specified channel at regular intervals.
+
+**Description:** Sets a reminder message to be sent to a specified channel at
+regular intervals.
 
 - **Parameters:**
   - `channel`: The target channel.
@@ -154,18 +179,22 @@ Follow [THIS GUDE](https://www.upwork.com/resources/how-to-make-discord-bot) to 
   - `interval`: Interval (in seconds) between reminders.
 
 ### 2. `/list_reminders`
+
 **Description:** Lists all current reminders.
 
 ### 3. `/delete_all_reminders`
+
 **Description:** Deletes all active reminders.
 
 ### 4. `/delete_reminder`
+
 **Description:** Deletes a reminder by title.
 
 - **Parameters:**
   - `title`: Title of the reminder to delete.
 
 ### 5. `/purge_last_messages`
+
 **Description:** Deletes a specified number of messages from a channel.
 
 - **Parameters:**
@@ -173,33 +202,39 @@ Follow [THIS GUDE](https://www.upwork.com/resources/how-to-make-discord-bot) to 
   - `limit`: Number of messages to delete.
 
 ### 6. `/purge_string`
-**Description:** Deletes all messages containing a specific string from a channel.
+
+**Description:** Deletes all messages containing a specific string from a
+channel.
 
 - **Parameters:**
   - `channel`: The channel to purge messages from.
   - `search_string`: String to search for in messages.
 
 ### 7. `/purge_webhooks`
+
 **Description:** Deletes all messages sent by webhooks or apps from a channel.
 
 - **Parameters:**
   - `channel`: The channel to purge messages from.
 
 ### 8. `/kick`
-**Description:** Kicks a member from the server.
+
+**Description:** Kicks up to 64 members from the server.
 
 - **Parameters:**
-  - `member`: Member to kick.
+  - `members`: Members to kick (separate multiple users with spaces).
   - `reason`: Reason for the kick (optional).
 
 ### 9. `/kick_role`
-**Description:** Kicks all members with a specified role from the server.
+
+**Description:** Kicks up to 64 members with a specified role from the server.
 
 - **Parameters:**
   - `role`: Role whose members to kick.
   - `reason`: Reason for the kick (optional).
 
 ### 10. `/botsay`
+
 **Description:** Makes the bot send a message to a specified channel.
 
 - **Parameters:**
@@ -207,6 +242,7 @@ Follow [THIS GUDE](https://www.upwork.com/resources/how-to-make-discord-bot) to 
   - `message`: Message to send.
 
 ### 11. `/timeout`
+
 **Description:** Timeouts a member for a specified duration.
 
 - **Parameters:**
@@ -215,34 +251,43 @@ Follow [THIS GUDE](https://www.upwork.com/resources/how-to-make-discord-bot) to 
   - `reason`: Reason for the timeout (optional).
 
 ### 12. `/log_tail`
-**Description:** Sends the last specified number of lines from the bot's log file to the user via DM.
+
+**Description:** Sends the last specified number of lines from the bot's log
+file to the user via DM.
 
 - **Parameters:**
   - `lines`: Number of lines to retrieve.
 
 ### 13. `/add_event_feed`
-**Description:** Adds a calendar feed URL to check for events, and posts them to a channel. Adds events to Discord Server Events as well.
+
+**Description:** Adds a calendar feed URL to check for events, and posts them
+to a channel. Adds events to Discord Server Events as well.
 
 - **Parameters:**
   - `calendar_url`: URL of the calendar feed.
   - `channel_name`: Channel to post notifications (default: bot-trap).
 
 ### 14. `/list_event_feeds`
+
 **Description:** Lists all registered calendar feeds.
 
 ### 15. `/remove_event_feed`
+
 **Description:** Removes a calendar feed.
 
 - **Parameters:**
   - `feed_url`: URL of the calendar feed to remove.
 
 ### 16. `/bot_mood`
+
 **Description:** Check on what the PetBot is up to.
 
 ### 17. `/pet_bot`
+
 **Description:** Pet JohnnyBot.
 
 ### 18. `/bot_pick_fav`
+
 **Description:** See who JohnnyBot prefers today.
 
 - **Parameters:**
@@ -250,7 +295,11 @@ Follow [THIS GUDE](https://www.upwork.com/resources/how-to-make-discord-bot) to 
   - `user2`: Second potential favorite.
 
 ### 19. `/message_dump`
-**Description:** Dumps a user's messages from a specified channel into a downloadable file. Compresses the file and hosts it via a temporary web server for 30 minutes. Make sure your firewall rules are set to allow inbound connections on port TCP port 80.
+
+**Description:** Dumps a user's messages from a specified channel into a
+downloadable file. Compresses the file and hosts it via a temporary web
+server for 30 minutes. Make sure your firewall rules are set to allow
+inbound connections on port TCP port 80.
 
 - **Parameters:**
   - `user`: User whose messages to dump.
@@ -266,28 +315,62 @@ Follow [THIS GUDE](https://www.upwork.com/resources/how-to-make-discord-bot) to 
   - Link expires after 30 minutes
 
 ### 20. Mass Permission Management Commands
-**Description:** Mass clone or clear permissions. All copy commands remove existing permissions from the destination before copying new ones. 
 
-*Note:The bot cannot manage roles which are at the same level or above any roles the bot has. Also, Discord blocks bots from managing permissions for roles that have moderator capabilities. You will have to manage these manually*
+**Description:** Mass clone or clear permissions. All copy commands remove
+existing permissions from the destination before copying new ones.
 
-- **`/clone_category_permissions`, `/clone_channel_permissions`, `/clone_role_permissions`** - Clone permissions from a source to a destination
+#### Note
+
+The bot cannot manage roles which are at the same level or above any roles
+the bot has. Also, Discord blocks bots from managing permissions for roles
+that have moderator capabilities. You will have to manage these manually.
+
+- **`/clone_category_permissions`, `/clone_channel_permissions`,
+  `/clone_role_permissions`** - Clone permissions from a source to a
+  destination
   - `source_*`: Source category, channel or role to copy permissions from
-  - `destination_*`: Destination category, channel or role to copy permissions to
+  - `destination_*`: Destination category, channel or role to copy
+    permissions to
 
-- **`/clear_category_permissions`, `/clear_channel_permissions`, `/clear_role_permissions`** - Clear permissions from categories, channels or roles
-  - `category/channel/role`: Source category, channel or role to clear permissions from
+- **`/clear_category_permissions`, `/clear_channel_permissions`,
+  `/clear_role_permissions`** - Clear permissions from categories, channels
+  or roles
+  - `category/channel/role`: Source category, channel or role to clear
+    permissions from
 
-- **`/sync_channel_perms`** - Sync permissions for all channels in a category with the category's permissions
-  - `source_category`: Category whose permissions will be synced to all its channels
+- **`/sync_channel_perms`** - Sync permissions for all channels in a category
+  with the category's permissions
+  - `source_category`: Category whose permissions will be synced to all its
+    channels
+
+### 21. `/list_users_without_roles`
+
+**Description:** Lists all users that do not have any server role assigned
+(excluding bots).
+
+### 22. `/assign_role`, `/remove_role`
+
+**Description:** Assigns or removes a role from up to 64 users at once.
+
+- **Parameters:**
+  - `role`: Role to assign to the users
+  - `members`: Members to assign or remove the role
+
+- **Features:**
+  - Accepts user mentions, user IDs, usernames, or display names
+  - Supports both spaces and newlines as separators for user lists
 
 ## Contributing
 
-Contributions are welcome! If you encounter any bugs or have suggestions, feel free to open an issue or submit a pull request.
+Contributions are welcome! If you encounter any bugs or have suggestions,
+feel free to open an issue or submit a pull request.
 
 ## Attribution
 
-Bot interaction functionality adapted from [PetBot](https://github.com/0xMetr0/PetBot) under MIT License.
+Bot interaction functionality adapted from
+[PetBot](https://github.com/0xMetr0/PetBot) under MIT License.
 
 ## License
 
-This project is licensed under the [GNU General Public License v3.0](LICENSE).
+This project is licensed under the
+[GNU General Public License v3.0](LICENSE).

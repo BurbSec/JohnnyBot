@@ -13,7 +13,7 @@ from datetime import datetime, timedelta
 from typing import Optional, Dict, Any
 import discord
 from discord import app_commands
-import requests
+import aiohttp
 from icalendar import Calendar
 from flask import Flask, send_file
 from waitress import serve
@@ -58,14 +58,16 @@ class EventFeed:  # pylint: disable=too-few-public-methods
             new_events = self._parse_calendar_events(calendar, feed_data)
             await self._process_new_events(guild, channel, new_events, feed_data)
             
-        except (requests.RequestException, ValueError, AttributeError) as e:
+        except (aiohttp.ClientError, ValueError, AttributeError) as e:
             logger.error("Error checking feed %s: %s", url, e)
 
     async def _fetch_calendar(self, url: str):
         """Fetch and parse calendar from URL."""
-        response = requests.get(url, timeout=30)
-        response.raise_for_status()
-        return Calendar.from_ical(response.text)
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as response:
+                response.raise_for_status()
+                text = await response.text()
+                return Calendar.from_ical(text)
 
     def _get_notification_channel(self, guild, channel_name: str):
         """Get the Discord channel for notifications."""
@@ -262,6 +264,8 @@ class EventFeed:  # pylint: disable=too-few-public-methods
             logger.info("Created Discord Event '%s' (ID: %s) in guild %s",
                        name, discord_event.id, guild.name)
             
+        except (discord.Forbidden, ValueError, TypeError) as e:
+            logger.error("Error creating Discord Event '%s': %s", event['summary'], e)
         except discord.HTTPException as e:
             logger.error("Error creating Discord Event '%s': %s", event['summary'], e)
         except Exception as e:  # pylint: disable=broad-exception-caught
@@ -271,11 +275,6 @@ class EventFeed:  # pylint: disable=too-few-public-methods
         """Legacy method for backward compatibility."""
         await self.check_feeds_job()
 
-# Pet response messages
-
-
-
-# These will be set when commands are registered
 bot_instance: Optional[Any] = None  # Renamed to avoid redefining name from outer scope
 tree: Optional[Any] = None
 reminders: Dict[int, Dict[str, Any]] = {}
@@ -310,11 +309,11 @@ class MessageDumpServer:  # pylint: disable=too-many-instance-attributes
     def _get_public_ip(self):
         """Get the public IP address of the server."""
         try:
-            # This is a simple way to get the public IP, but it requires internet access
+            # This should be made async in a future refactor
+            import requests  # pylint: disable=import-outside-toplevel
             response = requests.get('https://api.ipify.org', timeout=5)
             return response.text
-        except requests.RequestException:
-            # Fallback to local IP if public IP can't be determined
+        except Exception:  # pylint: disable=broad-exception-caught
             hostname = socket.gethostname()
             return socket.gethostbyname(hostname)
     
@@ -334,14 +333,12 @@ class MessageDumpServer:  # pylint: disable=too-many-instance-attributes
     
     def cleanup(self):
         """Clean up resources when the server is shut down."""
-        # Remove the files
         try:
             if os.path.exists(self.file_path):
                 os.remove(self.file_path)
             if os.path.exists(self.zip_path):
                 os.remove(self.zip_path)
             
-            # Remove parent directory if it's empty
             parent_dir = os.path.dirname(self.file_path)
             if os.path.exists(parent_dir) and not os.listdir(parent_dir):
                 os.rmdir(parent_dir)
@@ -350,22 +347,19 @@ class MessageDumpServer:  # pylint: disable=too-many-instance-attributes
         except (OSError, IOError) as e:
             logger.error("Error cleaning up message dump files: %s", e)
         
-        # Remove from active servers
-        for key, server in message_dump_servers.items():
+        # Use list() to avoid modifying dict during iteration
+        for key, server in list(message_dump_servers.items()):
             if server is self:
                 del message_dump_servers[key]
                 break
 
-def register_commands():  # pylint: disable=too-many-locals
+def register_commands():  # pylint: disable=too-many-locals,too-many-statements
     """Register all commands with the command tree."""
-    # Only register if tree is initialized
     if tree is None:
         return
 
-    # Add all commands
     tree.add_command(create_set_reminder_command())
 
-    # Create list_reminders command
     @tree.command(name='list_reminders', description='Lists all current reminders')
     async def list_reminders(interaction: discord.Interaction):
         """Lists all current reminders."""
@@ -387,20 +381,17 @@ def register_commands():  # pylint: disable=too-many-locals
             await interaction.response.send_message('Failed to list reminders due to an error.',
                                                    ephemeral=True)
 
-    # Register delete_all_reminders command
     @tree.command(name='delete_all_reminders', description='Deletes all active reminders')
     @app_commands.checks.has_role(MODERATOR_ROLE_NAME)
     async def _delete_all_reminders(interaction: discord.Interaction) -> None:
         await delete_all_reminders(interaction)
 
-    # Register delete_reminder command
     @tree.command(name='delete_reminder', description='Deletes a reminder by title')
     @app_commands.describe(title='Title of the reminder to delete')
     @app_commands.checks.has_role(MODERATOR_ROLE_NAME)
     async def _delete_reminder(interaction: discord.Interaction, title: str) -> None:
         await delete_reminder(interaction, title)
 
-    # Register purge_last_messages command
     @tree.command(name='purge_last_messages',
                   description='Purges a specified number of messages from a channel')
     @app_commands.describe(channel='Channel to purge messages from',
@@ -410,10 +401,8 @@ def register_commands():  # pylint: disable=too-many-locals
                                   channel: discord.TextChannel, limit: int):
         await purge_last_messages(interaction, channel, limit)
 
-    # Add error handler for purge_last_messages
     _purge_last_messages.on_error = purge_last_messages_error
 
-    # Register purge_string command
     @tree.command(name='purge_string',
                   description='Purges all messages containing a specific string from a channel')
     @app_commands.describe(channel='Channel to purge messages from',
@@ -423,10 +412,8 @@ def register_commands():  # pylint: disable=too-many-locals
                            channel: discord.TextChannel, search_string: str):
         await purge_string(interaction, channel, search_string)
 
-    # Add error handler for purge_string
     _purge_string.on_error = purge_string_error
 
-    # Register purge_webhooks command
     @tree.command(name='purge_webhooks',
                   description='Purges all messages sent by webhooks or apps from a channel')
     @app_commands.describe(channel='Channel to purge messages from')
@@ -434,21 +421,20 @@ def register_commands():  # pylint: disable=too-many-locals
     async def _purge_webhooks(interaction: discord.Interaction, channel: discord.TextChannel):
         await purge_webhooks(interaction, channel)
 
-    # Add error handler for purge_webhooks
     _purge_webhooks.on_error = purge_webhooks_error
 
-    # Register kick command
-    @tree.command(name='kick', description='Kicks a member from the server')
-    @app_commands.describe(member='Member to kick', reason='Reason for kick')
+    @tree.command(name='kick', description='Kicks one or more members from the server')
+    @app_commands.describe(
+        members='Members to kick (separate multiple users with spaces)',
+        reason='Reason for kick'
+    )
     @app_commands.checks.has_role(MODERATOR_ROLE_NAME)
-    async def _kick(interaction: discord.Interaction, member: discord.Member,
+    async def _kick(interaction: discord.Interaction, members: str,
                    reason: Optional[str] = None):
-        await kick_member(interaction, member, reason)
+        await kick_members(interaction, members, reason)
 
-    # Add error handler for kick
     _kick.on_error = kick_error
 
-    # Register kick_role command
     @tree.command(name='kick_role', description='Kicks all members with a specified role from the server')
     @app_commands.describe(role='Role whose members to kick', reason='Reason for kick')
     @app_commands.checks.has_role(MODERATOR_ROLE_NAME)
@@ -456,20 +442,16 @@ def register_commands():  # pylint: disable=too-many-locals
                         reason: Optional[str] = None):
         await kick_role(interaction, role, reason)
 
-    # Add error handler for kick_role
     _kick_role.on_error = kick_role_error
 
-    # Register botsay command
     @tree.command(name='botsay', description='Makes the bot send a message to a specified channel')
     @app_commands.describe(channel='Channel to send the message to', message='Message to send')
     @app_commands.checks.has_role(MODERATOR_ROLE_NAME)
     async def _botsay(interaction: discord.Interaction, channel: discord.TextChannel, message: str):
         await botsay_message(interaction, channel, message)
 
-    # Add error handler for botsay
     _botsay.on_error = botsay_error
 
-    # Register timeout command
     @tree.command(name='timeout', description='Timeouts a member for a specified duration')
     @app_commands.describe(member='Member to timeout', duration='Timeout duration in seconds',
                           reason='Reason for timeout')
@@ -478,20 +460,16 @@ def register_commands():  # pylint: disable=too-many-locals
                       duration: int, reason: Optional[str] = None):
         await timeout_member(interaction, member, duration, reason)
 
-    # Add error handler for timeout
     _timeout.on_error = timeout_error
 
-    # Register log_tail command
     @tree.command(name='log_tail',
                   description='DM the last specified number of lines of the bot log to the user')
     @app_commands.describe(lines='Number of lines to retrieve from the log')
     async def _log_tail(interaction: discord.Interaction, lines: int):
         await log_tail_command(interaction, lines)
     
-    # Add error handler for log_tail
     _log_tail.on_error = log_tail_error
 
-    # Register add_event_feed command
     @tree.command(name='add_event_feed',
                   description='Adds a calendar feed URL to check for events')
     @app_commands.describe(
@@ -502,32 +480,25 @@ def register_commands():  # pylint: disable=too-many-locals
                                  channel_name: str = "bot-trap"):
         await add_event_feed_command(interaction, calendar_url, channel_name)
 
-    # Add error handler for add_event_feed
     _add_event_feed.on_error = add_event_feed_error
 
-
-    # Register list_event_feeds command
     @tree.command(name='list_event_feeds', description='Lists all registered calendar feeds')
     async def _list_event_feeds(interaction: discord.Interaction):
         await list_event_feeds_command(interaction)
 
-    # Register remove_event_feed command
     @tree.command(name='remove_event_feed', description='Removes a calendar feed')
     @app_commands.describe(feed_url='URL of the calendar feed to remove')
     async def _remove_event_feed(interaction: discord.Interaction, feed_url: str):
         await remove_event_feed_command(interaction, feed_url)
 
-    # Register bot_mood command
     @tree.command(name='bot_mood', description='Check on JohnnyBot\'s current mood')
     async def _bot_mood(interaction: discord.Interaction):
         await bot_command(interaction)
 
-    # Register pet_bot command
     @tree.command(name='pet_bot', description='Pet JohnnyBot')
     async def _pet_bot(interaction: discord.Interaction):
         await pet_bot_command(interaction)
 
-    # Register bot_pick_fav command
     @tree.command(name='bot_pick_fav',
                   description='See who JohnnyBot prefers today')
     @app_commands.describe(
@@ -537,7 +508,6 @@ def register_commands():  # pylint: disable=too-many-locals
     async def _bot_pick_fav(interaction: discord.Interaction, user1: discord.User, user2: discord.User):
         await bot_pick_fav_command(interaction, user1, user2)
         
-    # Register message_dump command
     @tree.command(name='message_dump',
                   description='Dump a user\'s messages from a channel into a downloadable file')
     @app_commands.describe(
@@ -551,10 +521,8 @@ def register_commands():  # pylint: disable=too-many-locals
                            channel: discord.TextChannel, start_date: str, limit: int = 1000):
         await message_dump_command(interaction, user, channel, start_date, limit)
     
-    # Add error handler for message_dump
     _message_dump.on_error = message_dump_error
 
-    # Register clone_category_permissions command
     @tree.command(name='clone_category_permissions',
                   description='Clone permissions from source category to destination category')
     @app_commands.describe(
@@ -567,10 +535,8 @@ def register_commands():  # pylint: disable=too-many-locals
                                         destination_category: discord.CategoryChannel):
         await clone_category_permissions(interaction, source_category, destination_category)
 
-    # Add error handler for clone_category_permissions
     _clone_category_permissions.on_error = clone_category_permissions_error
 
-    # Register clone_channel_permissions command
     @tree.command(name='clone_channel_permissions',
                   description='Clone permissions from source channel to destination channel')
     @app_commands.describe(
@@ -583,10 +549,8 @@ def register_commands():  # pylint: disable=too-many-locals
                                        destination_channel: discord.abc.GuildChannel):
         await clone_channel_permissions(interaction, source_channel, destination_channel)
 
-    # Add error handler for clone_channel_permissions
     _clone_channel_permissions.on_error = clone_channel_permissions_error
 
-    # Register clone_role_permissions command
     @tree.command(name='clone_role_permissions',
                   description='Clone permissions from source role to destination role')
     @app_commands.describe(
@@ -658,6 +622,45 @@ def register_commands():  # pylint: disable=too-many-locals
     # Add error handler for sync_channel_perms
     _sync_channel_perms.on_error = sync_channel_perms_error
 
+    # Register list_users_without_roles command
+    @tree.command(name='list_users_without_roles',
+                  description='Lists all users that do not have any server role assigned')
+    async def _list_users_without_roles(interaction: discord.Interaction):
+        await list_users_without_roles(interaction)
+
+    # Add error handler for list_users_without_roles
+    _list_users_without_roles.on_error = list_users_without_roles_error
+
+    # Register assign_role command
+    @tree.command(name='assign_role',
+                  description='Assigns a role to multiple users at once')
+    @app_commands.describe(
+        role='Role to assign to the users',
+        members='Members to assign the role to (separate multiple users with spaces or newlines)'
+    )
+    @app_commands.checks.has_role(MODERATOR_ROLE_NAME)
+    async def _assign_role(interaction: discord.Interaction, role: discord.Role,
+                          members: str):
+        await assign_role(interaction, role, members)
+
+    # Add error handler for assign_role
+    _assign_role.on_error = assign_role_error
+
+    # Register remove_role command
+    @tree.command(name='remove_role',
+                  description='Removes a role from multiple users at once')
+    @app_commands.describe(
+        role='Role to remove from the users',
+        members='Members to remove the role from (separate multiple users with spaces or newlines)'
+    )
+    @app_commands.checks.has_role(MODERATOR_ROLE_NAME)
+    async def _remove_role(interaction: discord.Interaction, role: discord.Role,
+                          members: str):
+        await remove_role(interaction, role, members)
+
+    # Add error handler for remove_role
+    _remove_role.on_error = remove_role_error
+
 def setup_commands(bot_param):
     """Initialize command module with bot instance and register commands."""
     # Using globals is necessary here to initialize module-level variables
@@ -666,7 +669,6 @@ def setup_commands(bot_param):
     bot_instance = bot_param
     if bot_instance:
         tree = bot_instance.tree
-    # Import cache from bot.py to maintain functionality
     from bot import cache  # pylint: disable=import-outside-toplevel,unused-import
     reminders = {}
     reminders_lock = threading.Lock()
@@ -674,7 +676,6 @@ def setup_commands(bot_param):
     event_feed = EventFeed(bot_instance)
     message_dump_servers = {}
 
-    # Initialize scheduler for EventFeed
     from apscheduler.schedulers.asyncio import AsyncIOScheduler
     # This attribute is defined outside __init__ because it depends on an import
     # that should happen at function level to avoid circular imports
@@ -682,7 +683,6 @@ def setup_commands(bot_param):
     if event_feed:
         event_feed.scheduler = AsyncIOScheduler()
 
-    # Register all commands
     register_commands()
 
 
@@ -696,7 +696,6 @@ def validate_reminder_interval(interval: int) -> None:
 
 def create_set_reminder_command():
     """Factory function to create the set_reminder command."""
-    # Create the command with proper parameter definitions
     @app_commands.command(name='set_reminder', description='Sets a reminder message to be sent to a channel at regular intervals')
     @app_commands.describe(
         channel='Channel to send reminders to',
@@ -711,7 +710,6 @@ def create_set_reminder_command():
         """Sets a reminder message to be sent to a channel at regular intervals."""
         await set_reminder_callback(interaction, channel, title, message, interval)
 
-    # Add error handler
     async def on_error(interaction: discord.Interaction, error):
         """Handles errors for the set_reminder command."""
         if isinstance(error, app_commands.errors.MissingRole):
@@ -749,7 +747,6 @@ async def set_reminder_callback(interaction: discord.Interaction,
         f'Reminder set in {channel.mention} every {interval} seconds.', ephemeral=True)
 
 
-# Command functions defined at module level but registered in register_commands()
 async def delete_all_reminders(interaction: discord.Interaction) -> None:
     """Delete all active reminders."""
     if reminders_lock:
@@ -867,6 +864,119 @@ async def purge_webhooks_error(interaction: discord.Interaction, error):
     else:
         await interaction.response.send_message(f'Error: {error}', ephemeral=True)
 
+async def kick_members(interaction: discord.Interaction, members: str, reason: Optional[str] = None):  # pylint: disable=too-many-locals,too-many-branches,too-many-statements
+    """Kicks one or more members from the server."""
+    try:
+        await interaction.response.defer(ephemeral=True)
+        
+        # Check if guild exists
+        if not interaction.guild:
+            await interaction.followup.send('This command can only be used in a server.', ephemeral=True)
+            return
+        
+        # Parse member mentions/IDs from the string
+        member_objects = []
+        failed_to_find = []
+        
+        # Split the members string and process each part
+        member_parts = members.split()
+        
+        for part in member_parts:
+            # Remove mention formatting if present
+            user_id_str = part.strip('<@!>')
+            
+            try:
+                # Try to convert to int (user ID)
+                user_id = int(user_id_str)
+                member = interaction.guild.get_member(user_id)
+                
+                if member:
+                    member_objects.append(member)
+                else:
+                    failed_to_find.append(part)
+            except ValueError:
+                # If it's not a valid ID, try to find by name
+                member = discord.utils.get(interaction.guild.members, name=part)
+                if not member:
+                    member = discord.utils.get(interaction.guild.members, display_name=part)
+                
+                if member:
+                    member_objects.append(member)
+                else:
+                    failed_to_find.append(part)
+        
+        if not member_objects:
+            await interaction.followup.send(
+                'No valid members found to kick. Please mention users or provide valid user IDs.',
+                ephemeral=True
+            )
+            return
+        
+        # Check if the bot has permission to kick members
+        if not interaction.guild.me or not interaction.guild.me.guild_permissions.kick_members:
+            await interaction.followup.send('I do not have permission to kick members.', ephemeral=True)
+            return
+        
+        # Kick each member
+        kicked_members = []
+        failed_kicks = []
+        
+        for member in member_objects:
+            try:
+                # Skip the bot itself
+                if member == interaction.guild.me:
+                    failed_kicks.append(f"{member.display_name} (cannot kick myself)")
+                    continue
+                
+                # Skip members with higher roles than the bot
+                if interaction.guild.me and member.top_role >= interaction.guild.me.top_role:
+                    failed_kicks.append(f"{member.display_name} (higher role)")
+                    continue
+                
+                # Skip the command user
+                if member.id == interaction.user.id:
+                    failed_kicks.append(f"{member.display_name} (cannot kick yourself)")
+                    continue
+                
+                await member.kick(reason=f"Kicked by {interaction.user}. Reason: {reason}" if reason else f"Kicked by {interaction.user}")
+                kicked_members.append(member)
+                logger.info('Kicked member %s by user %s', member, interaction.user)
+                
+            except discord.Forbidden:
+                failed_kicks.append(f"{member.display_name} (insufficient permissions)")
+                logger.error('Failed to kick member %s: insufficient permissions', member)
+            except discord.HTTPException as e:
+                failed_kicks.append(f"{member.display_name} (API error)")
+                logger.error('Failed to kick member %s: %s', member, e)
+        
+        # Build response message
+        response_parts = []
+        
+        if kicked_members:
+            kicked_list = ', '.join([member.display_name for member in kicked_members])
+            response_parts.append(f'✅ **Successfully kicked {len(kicked_members)} member(s):** {kicked_list}')
+        
+        if failed_to_find:
+            failed_find_list = ', '.join(failed_to_find)
+            response_parts.append(f'❌ **Could not find:** {failed_find_list}')
+        
+        if failed_kicks:
+            failed_kick_list = '\n'.join(f'• {name}' for name in failed_kicks[:10])
+            if len(failed_kicks) > 10:
+                failed_kick_list += f'\n... and {len(failed_kicks) - 10} more'
+            response_parts.append(f'⚠️ **Failed to kick {len(failed_kicks)} member(s):**\n{failed_kick_list}')
+        
+        if reason:
+            response_parts.append(f'📝 **Reason:** {reason}')
+        
+        response_message = '\n\n'.join(response_parts)
+        await interaction.followup.send(response_message, ephemeral=True)
+        
+    except (discord.Forbidden, discord.HTTPException) as e:
+        logger.error('Discord API error in kick_members: %s', e)
+        await interaction.followup.send('A Discord API error occurred.', ephemeral=True)
+
+# Keep the old function for backward compatibility
 async def kick_member(interaction: discord.Interaction, member: discord.Member, reason: Optional[str] = None):
     """Kicks a member from the server."""
     try:
@@ -1053,10 +1163,12 @@ async def add_event_feed_command(interaction: discord.Interaction, calendar_url:
         
         # Test the URL to make sure it's a valid calendar feed
         try:
-            response = requests.get(calendar_url, timeout=10)
-            response.raise_for_status()
-            Calendar.from_ical(response.text)
-        except (requests.RequestException, ValueError) as e:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(calendar_url, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                    response.raise_for_status()
+                    text = await response.text()
+                    Calendar.from_ical(text)
+        except (aiohttp.ClientError, ValueError) as e:
             await interaction.response.send_message(
                 f"Error accessing calendar feed: {str(e)}", ephemeral=True)
             return
@@ -1182,26 +1294,19 @@ def cleanup_orphaned_dumps():
     """
     cleaned_count = 0
     try:
-        # Get the current time
         now = datetime.now()
         
-        # Check if the temp directory exists
         if not os.path.exists(TEMP_DIR):
             return cleaned_count
             
-        # Iterate through all subdirectories in the temp directory
         for item in os.listdir(TEMP_DIR):
             if item.startswith("message_dump_"):
                 item_path = os.path.join(TEMP_DIR, item)
                 
-                # Check if it's a directory
                 if os.path.isdir(item_path):
-                    # Get the creation time of the directory
                     creation_time = datetime.fromtimestamp(os.path.getctime(item_path))
                     
-                    # Check if it's older than 30 minutes
                     if (now - creation_time).total_seconds() > 1800:  # 30 minutes in seconds
-                        # Delete the directory and all its contents
                         shutil.rmtree(item_path, ignore_errors=True)
                         logger.info(f"Cleaned up orphaned message dump directory: {item_path}")
                         cleaned_count += 1
@@ -1211,29 +1316,24 @@ def cleanup_orphaned_dumps():
         logger.error("Error cleaning up orphaned message dumps: %s", e)
         return cleaned_count
 
-async def message_dump_command(interaction: discord.Interaction, user: discord.User, channel: discord.TextChannel,  # pylint: disable=too-many-locals,too-many-branches,too-many-statements
+async def message_dump_command(interaction: discord.Interaction, user: discord.User, channel: discord.TextChannel,  # pylint: disable=too-many-locals,too-many-branches,too-many-statements,too-many-nested-blocks
                               start_date: str, limit: int = 1000):
     """Dump a user's messages from a channel into a downloadable file starting from a specific date."""
     try:
-        # Clean up any orphaned dump files/folders
         logger.info("Checking for orphaned message dump files/folders...")
         cleaned_count = cleanup_orphaned_dumps()
         if cleaned_count > 0:
             logger.info("Cleaned up %s orphaned message dump directories", cleaned_count)
-        # Defer the response since this might take a while
         await interaction.response.defer(ephemeral=True)
         
-        # Notify user if any orphaned dumps were cleaned up
         if cleaned_count > 0:
             await interaction.followup.send(
                 f"Cleaned up {cleaned_count} orphaned message dump files that were older than 30 minutes.",
                 ephemeral=True
             )
         
-        # Parse the start date
         try:
             start_datetime = datetime.strptime(start_date, "%Y-%m-%d")
-            # Set time to beginning of the day (midnight)
             start_datetime = start_datetime.replace(hour=0, minute=0, second=0, microsecond=0)
         except ValueError:
             await interaction.followup.send(
@@ -1242,30 +1342,21 @@ async def message_dump_command(interaction: discord.Interaction, user: discord.U
             )
             return
             
-        # Create a unique directory for this dump
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         dump_dir = os.path.join(TEMP_DIR, f"message_dump_{interaction.user.id}_{timestamp}")
         os.makedirs(dump_dir, exist_ok=True)
         
-        # Create file paths
         file_path = os.path.join(dump_dir, f"{user.name}_messages.txt")
         zip_path = os.path.join(dump_dir, f"{user.name}_messages.zip")
         
-        # Fetch messages with proper pagination
         messages = []
-        # message_count = 0  # Unused variable
-        # oldest_message = None  # Unused variable
         
-        # Log the user ID we're looking for
         logger.info(f"Looking for messages from user ID: {user.id}, name: {user.name}")
         
-        # Check if the channel exists and is accessible
         try:
-            # Try to fetch one message to verify channel access
             async for _ in channel.history(limit=1):
                 break
             else:
-                # No messages in the channel
                 await interaction.followup.send(f"The channel {channel.mention} appears to be empty.", ephemeral=True)
                 shutil.rmtree(dump_dir, ignore_errors=True)
                 return
@@ -1490,9 +1581,9 @@ async def message_dump_command(interaction: discord.Interaction, user: discord.U
     except discord.HTTPException as e:
         logger.error('Discord API error: %s', e)
         await interaction.followup.send("A Discord API error occurred.", ephemeral=True)
-    except (OSError, IOError) as e:
-        logger.error('File operation error: %s', e)
-        await interaction.followup.send("An error occurred while creating the message dump file.", ephemeral=True)
+    except (OSError, IOError, PermissionError) as e:
+        logger.error('File system error in message_dump_command: %s', e)
+        await interaction.followup.send("A file system error occurred while creating the message dump.", ephemeral=True)
     except Exception as e:  # pylint: disable=broad-exception-caught
         logger.error('Unexpected error in message_dump_command: %s', e)
         await interaction.followup.send("An unexpected error occurred.", ephemeral=True)
@@ -1513,7 +1604,7 @@ async def message_dump_error(interaction: discord.Interaction, error):
         logger.error('Error in message_dump command: %s', error)
         await interaction.response.send_message(f'Error: {error}', ephemeral=True)
 
-async def clone_category_permissions(interaction: discord.Interaction,  # pylint: disable=too-many-branches
+async def clone_category_permissions(interaction: discord.Interaction,  # pylint: disable=too-many-branches,too-many-locals,too-many-statements,too-many-nested-blocks
                                    source_category: discord.CategoryChannel,
                                    destination_category: discord.CategoryChannel):
     """Clone permissions from source category to destination category."""
@@ -1760,7 +1851,7 @@ async def clone_category_permissions_error(interaction: discord.Interaction, err
             ephemeral=True
         )
 
-async def clone_channel_permissions(interaction: discord.Interaction,  # pylint: disable=too-many-branches
+async def clone_channel_permissions(interaction: discord.Interaction,  # pylint: disable=too-many-branches,too-many-statements,too-many-nested-blocks
                                   source_channel: discord.abc.GuildChannel,
                                   destination_channel: discord.abc.GuildChannel):
     """Clone permissions from source channel to destination channel."""
@@ -2139,7 +2230,7 @@ async def clone_role_permissions_error(interaction: discord.Interaction, error):
         )
 
 
-async def clear_category_permissions(interaction: discord.Interaction,
+async def clear_category_permissions(interaction: discord.Interaction,  # pylint: disable=too-many-branches,too-many-statements,too-many-nested-blocks
                                    category: discord.CategoryChannel):
     """Clear all permission overwrites from a category."""
     try:
@@ -2309,7 +2400,7 @@ async def clear_category_permissions_error(interaction: discord.Interaction, err
             ephemeral=True
         )
 
-async def clear_channel_permissions(interaction: discord.Interaction,
+async def clear_channel_permissions(interaction: discord.Interaction,  # pylint: disable=too-many-branches,too-many-statements,too-many-nested-blocks
                                   channel: discord.abc.GuildChannel):
     """Clear all permission overwrites from a channel."""
     try:
@@ -2476,7 +2567,7 @@ async def clear_channel_permissions_error(interaction: discord.Interaction, erro
             ephemeral=True
         )
 
-async def clear_role_permissions(interaction: discord.Interaction,
+async def clear_role_permissions(interaction: discord.Interaction,  # pylint: disable=too-many-branches
                                role: discord.Role):
     """Clear all permissions from a role (reset to default)."""
     try:
@@ -2627,7 +2718,7 @@ async def clear_role_permissions_error(interaction: discord.Interaction, error):
             ephemeral=True
         )
 
-async def sync_channel_perms(interaction: discord.Interaction,
+async def sync_channel_perms(interaction: discord.Interaction,  # pylint: disable=too-many-locals,too-many-branches,too-many-statements,too-many-nested-blocks
                            source_category: discord.CategoryChannel):
     """Sync permissions for all channels in the source category with the category's permissions."""
     try:
@@ -2798,6 +2889,367 @@ async def sync_channel_perms_error(interaction: discord.Interaction, error):
         )
     else:
         logger.error('Error in sync_channel_perms command: %s', error)
+        await interaction.response.send_message(
+            f'Error: {error}',
+            ephemeral=True
+        )
+
+async def list_users_without_roles(interaction: discord.Interaction):
+    """Lists all users that do not have any server role assigned."""
+    try:
+        await interaction.response.defer(ephemeral=True)
+        
+        # Check if guild exists
+        if not interaction.guild:
+            await interaction.followup.send('This command can only be used in a server.', ephemeral=True)
+            return
+        
+        # Get all members in the guild
+        guild = interaction.guild
+        
+        # Find users without any roles (only have @everyone role)
+        users_without_roles = []
+        
+        for member in guild.members:
+            # Skip bots
+            if member.bot:
+                continue
+            
+            # Check if member only has the @everyone role
+            # member.roles includes @everyone, so if they only have 1 role, it's just @everyone
+            if len(member.roles) == 1:
+                users_without_roles.append(member)
+        
+        # If no users found without roles
+        if not users_without_roles:
+            await interaction.followup.send(
+                'All users in this server have at least one role assigned.',
+                ephemeral=True
+            )
+            return
+        
+        # Format the response
+        user_count = len(users_without_roles)
+        
+        # Create embed for better formatting
+        embed = discord.Embed(
+            title=f"Users Without Roles ({user_count})",
+            description=f"Found {user_count} user(s) with no server roles assigned:",
+            color=0xff9900
+        )
+        
+        # Split users into chunks to avoid Discord's 1024 character limit per field
+        chunk_size = 20  # Conservative chunk size to stay under 1024 characters
+        user_chunks = [users_without_roles[i:i + chunk_size] for i in range(0, len(users_without_roles), chunk_size)]
+        
+        for i, chunk in enumerate(user_chunks):
+            field_name = f"Users {i * chunk_size + 1}-{min((i + 1) * chunk_size, user_count)}"
+            user_list = '\n'.join([f"• {member.display_name} ({member.mention})" for member in chunk])
+            embed.add_field(name=field_name, value=user_list, inline=False)
+        
+        # Add footer with additional info
+        embed.set_footer(text="Note: This list excludes bots and only shows users with no roles beyond @everyone")
+        
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        
+        logger.info('Listed %d users without roles for user %s in guild %s',
+                   user_count, interaction.user, guild.name)
+        
+    except discord.Forbidden:
+        await interaction.followup.send(
+            'I don\'t have permission to view server members.\n'
+            'Please ensure I have the "View Server Members" permission.',
+            ephemeral=True
+        )
+
+async def assign_role(interaction: discord.Interaction, role: discord.Role,  # pylint: disable=too-many-locals,too-many-branches,too-many-statements
+                     members: str):
+    """Assigns a role to multiple users at once."""
+    try:
+        await interaction.response.defer(ephemeral=True)
+        
+        # Check if guild exists
+        if not interaction.guild:
+            await interaction.followup.send('This command can only be used in a server.', ephemeral=True)
+            return
+        
+        # Check if the bot has permission to manage roles
+        if not interaction.guild.me or not interaction.guild.me.guild_permissions.manage_roles:
+            await interaction.followup.send('I do not have permission to manage roles.', ephemeral=True)
+            return
+        
+        # Check if the role can be assigned by the bot (hierarchy check)
+        bot_member = interaction.guild.me
+        if bot_member and role >= bot_member.top_role:
+            await interaction.followup.send(
+                f'I cannot assign the role **{role.name}** because it is higher than or equal to my highest role (**{bot_member.top_role.name}**).\n'
+                f'Please move my role higher in the server settings.',
+                ephemeral=True
+            )
+            return
+        
+        # Check if the user can assign this role (hierarchy check)
+        if isinstance(interaction.user, discord.Member):
+            if role >= interaction.user.top_role:
+                await interaction.followup.send(
+                    f'You cannot assign the role **{role.name}** because it is higher than or equal to your highest role (**{interaction.user.top_role.name}**).',
+                    ephemeral=True
+                )
+                return
+        
+        # Parse member mentions/IDs from the string
+        member_objects = []
+        failed_to_find = []
+        
+        # Split the members string and process each part (handle both spaces and newlines)
+        member_parts = members.replace('\n', ' ').split()
+        
+        for part in member_parts:
+            # Remove mention formatting if present
+            user_id_str = part.strip('<@!>')
+            
+            try:
+                # Try to convert to int (user ID)
+                user_id = int(user_id_str)
+                member = interaction.guild.get_member(user_id)
+                
+                if member:
+                    member_objects.append(member)
+                else:
+                    failed_to_find.append(part)
+            except ValueError:
+                # If it's not a valid ID, try to find by name
+                member = discord.utils.get(interaction.guild.members, name=part)
+                if not member:
+                    member = discord.utils.get(interaction.guild.members, display_name=part)
+                
+                if member:
+                    member_objects.append(member)
+                else:
+                    failed_to_find.append(part)
+        
+        if not member_objects:
+            await interaction.followup.send(
+                'No valid members found to assign the role to. Please mention users or provide valid user IDs.',
+                ephemeral=True
+            )
+            return
+        
+        # Assign role to each member
+        assigned_members = []
+        already_had_role = []
+        failed_assignments = []
+        
+        for member in member_objects:
+            try:
+                # Check if member already has the role
+                if role in member.roles:
+                    already_had_role.append(member)
+                    continue
+                
+                # Skip the bot itself
+                if member == interaction.guild.me:
+                    failed_assignments.append(f"{member.display_name} (cannot assign role to myself)")
+                    continue
+                
+                await member.add_roles(role, reason=f"Mass role assignment by {interaction.user}")
+                assigned_members.append(member)
+                logger.info('Assigned role %s to member %s by user %s', role.name, member, interaction.user)
+                
+            except discord.Forbidden:
+                failed_assignments.append(f"{member.display_name} (insufficient permissions)")
+                logger.error('Failed to assign role %s to member %s: insufficient permissions', role.name, member)
+            except discord.HTTPException as e:
+                failed_assignments.append(f"{member.display_name} (API error)")
+                logger.error('Failed to assign role %s to member %s: %s', role.name, member, e)
+        
+        # Build response message
+        response_parts = []
+        
+        if assigned_members:
+            assigned_list = ', '.join([member.display_name for member in assigned_members])
+            response_parts.append(f'✅ **Successfully assigned {role.mention} to {len(assigned_members)} member(s):** {assigned_list}')
+        
+        if already_had_role:
+            already_had_list = ', '.join([member.display_name for member in already_had_role])
+            response_parts.append(f'ℹ️ **Already had the role ({len(already_had_role)} member(s)):** {already_had_list}')
+        
+        if failed_to_find:
+            failed_find_list = ', '.join(failed_to_find)
+            response_parts.append(f'❌ **Could not find:** {failed_find_list}')
+        
+        if failed_assignments:
+            failed_assignment_list = '\n'.join(f'• {name}' for name in failed_assignments[:10])
+            if len(failed_assignments) > 10:
+                failed_assignment_list += f'\n... and {len(failed_assignments) - 10} more'
+            response_parts.append(f'⚠️ **Failed to assign role to {len(failed_assignments)} member(s):**\n{failed_assignment_list}')
+        
+        response_message = '\n\n'.join(response_parts)
+        await interaction.followup.send(response_message, ephemeral=True)
+        
+    except (discord.Forbidden, discord.HTTPException) as e:
+        logger.error('Discord API error in assign_role: %s', e)
+        await interaction.followup.send('A Discord API error occurred.', ephemeral=True)
+
+async def assign_role_error(interaction: discord.Interaction, error):
+    """Handles errors for the assign_role command."""
+    if isinstance(error, app_commands.errors.MissingRole):
+        await interaction.response.send_message('You do not have the required role to use this command.', ephemeral=True)
+    elif isinstance(error, discord.HTTPException):
+        logger.error('Discord API error: %s', error)
+        await interaction.response.send_message('Discord API error occurred.', ephemeral=True)
+    else:
+        await interaction.response.send_message(f'Error: {error}', ephemeral=True)
+
+async def remove_role(interaction: discord.Interaction, role: discord.Role,  # pylint: disable=too-many-locals,too-many-branches,too-many-statements
+                     members: str):
+    """Removes a role from multiple users at once."""
+    try:
+        await interaction.response.defer(ephemeral=True)
+        
+        # Check if guild exists
+        if not interaction.guild:
+            await interaction.followup.send('This command can only be used in a server.', ephemeral=True)
+            return
+        
+        # Check if the bot has permission to manage roles
+        if not interaction.guild.me or not interaction.guild.me.guild_permissions.manage_roles:
+            await interaction.followup.send('I do not have permission to manage roles.', ephemeral=True)
+            return
+        
+        # Check if the role can be managed by the bot (hierarchy check)
+        bot_member = interaction.guild.me
+        if bot_member and role >= bot_member.top_role:
+            await interaction.followup.send(
+                f'I cannot remove the role **{role.name}** because it is higher than or equal to my highest role (**{bot_member.top_role.name}**).\n'
+                f'Please move my role higher in the server settings.',
+                ephemeral=True
+            )
+            return
+        
+        # Check if the user can manage this role (hierarchy check)
+        if isinstance(interaction.user, discord.Member):
+            if role >= interaction.user.top_role:
+                await interaction.followup.send(
+                    f'You cannot remove the role **{role.name}** because it is higher than or equal to your highest role (**{interaction.user.top_role.name}**).',
+                    ephemeral=True
+                )
+                return
+        
+        # Parse member mentions/IDs from the string
+        member_objects = []
+        failed_to_find = []
+        
+        # Split the members string and process each part (handle both spaces and newlines)
+        member_parts = members.replace('\n', ' ').split()
+        
+        for part in member_parts:
+            # Remove mention formatting if present
+            user_id_str = part.strip('<@!>')
+            
+            try:
+                # Try to convert to int (user ID)
+                user_id = int(user_id_str)
+                member = interaction.guild.get_member(user_id)
+                
+                if member:
+                    member_objects.append(member)
+                else:
+                    failed_to_find.append(part)
+            except ValueError:
+                # If it's not a valid ID, try to find by name
+                member = discord.utils.get(interaction.guild.members, name=part)
+                if not member:
+                    member = discord.utils.get(interaction.guild.members, display_name=part)
+                
+                if member:
+                    member_objects.append(member)
+                else:
+                    failed_to_find.append(part)
+        
+        if not member_objects:
+            await interaction.followup.send(
+                'No valid members found to remove the role from. Please mention users or provide valid user IDs.',
+                ephemeral=True
+            )
+            return
+        
+        # Remove role from each member
+        removed_members = []
+        didnt_have_role = []
+        failed_removals = []
+        
+        for member in member_objects:
+            try:
+                # Check if member doesn't have the role
+                if role not in member.roles:
+                    didnt_have_role.append(member)
+                    continue
+                
+                # Skip the bot itself
+                if member == interaction.guild.me:
+                    failed_removals.append(f"{member.display_name} (cannot remove role from myself)")
+                    continue
+                
+                await member.remove_roles(role, reason=f"Mass role removal by {interaction.user}")
+                removed_members.append(member)
+                logger.info('Removed role %s from member %s by user %s', role.name, member, interaction.user)
+                
+            except discord.Forbidden:
+                failed_removals.append(f"{member.display_name} (insufficient permissions)")
+                logger.error('Failed to remove role %s from member %s: insufficient permissions', role.name, member)
+            except discord.HTTPException as e:
+                failed_removals.append(f"{member.display_name} (API error)")
+                logger.error('Failed to remove role %s from member %s: %s', role.name, member, e)
+        
+        # Build response message
+        response_parts = []
+        
+        if removed_members:
+            removed_list = ', '.join([member.display_name for member in removed_members])
+            response_parts.append(f'✅ **Successfully removed {role.mention} from {len(removed_members)} member(s):** {removed_list}')
+        
+        if didnt_have_role:
+            didnt_have_list = ', '.join([member.display_name for member in didnt_have_role])
+            response_parts.append(f'ℹ️ **Didn\'t have the role ({len(didnt_have_role)} member(s)):** {didnt_have_list}')
+        
+        if failed_to_find:
+            failed_find_list = ', '.join(failed_to_find)
+            response_parts.append(f'❌ **Could not find:** {failed_find_list}')
+        
+        if failed_removals:
+            failed_removal_list = '\n'.join(f'• {name}' for name in failed_removals[:10])
+            if len(failed_removals) > 10:
+                failed_removal_list += f'\n... and {len(failed_removals) - 10} more'
+            response_parts.append(f'⚠️ **Failed to remove role from {len(failed_removals)} member(s):**\n{failed_removal_list}')
+        
+        response_message = '\n\n'.join(response_parts)
+        await interaction.followup.send(response_message, ephemeral=True)
+        
+    except (discord.Forbidden, discord.HTTPException) as e:
+        logger.error('Discord API error in remove_role: %s', e)
+        await interaction.followup.send('A Discord API error occurred.', ephemeral=True)
+
+async def remove_role_error(interaction: discord.Interaction, error):
+    """Handles errors for the remove_role command."""
+    if isinstance(error, app_commands.errors.MissingRole):
+        await interaction.response.send_message('You do not have the required role to use this command.', ephemeral=True)
+    elif isinstance(error, discord.HTTPException):
+        logger.error('Discord API error: %s', error)
+        await interaction.response.send_message('Discord API error occurred.', ephemeral=True)
+    else:
+        await interaction.response.send_message(f'Error: {error}', ephemeral=True)
+
+async def list_users_without_roles_error(interaction: discord.Interaction, error):
+    """Handles errors for the list_users_without_roles command."""
+    if isinstance(error, discord.HTTPException):
+        logger.error('Discord API error: %s', error)
+        await interaction.response.send_message(
+            'Discord API error occurred.',
+            ephemeral=True
+        )
+    else:
+        logger.error('Error in list_users_without_roles command: %s', error)
         await interaction.response.send_message(
             f'Error: {error}',
             ephemeral=True
