@@ -23,6 +23,7 @@ from config import (
     REMINDERS_FILE,
     TEMP_DIR,
     HOST_IP,
+    VOICE_CHAPERONE_ENABLED,
     logger
 )
 
@@ -673,6 +674,17 @@ def register_commands():  # pylint: disable=too-many-locals,too-many-statements
 
     # Add error handler for remove_role
     _remove_role.on_error = remove_role_error
+
+    # Register voice_chaperone command
+    @tree.command(name='voice_chaperone',
+                  description='Enable or disable the voice channel chaperone functionality')
+    @app_commands.describe(enabled='True to enable, False to disable voice chaperone')
+    @app_commands.checks.has_role(MODERATOR_ROLE_NAME)
+    async def _voice_chaperone(interaction: discord.Interaction, enabled: bool):
+        await voice_chaperone_command(interaction, enabled)
+
+    # Add error handler for voice_chaperone
+    _voice_chaperone.on_error = voice_chaperone_error
 
 def setup_commands(bot_param):
     """Initialize command module with bot instance and register commands."""
@@ -3263,6 +3275,55 @@ async def list_users_without_roles_error(interaction: discord.Interaction, error
         )
     else:
         logger.error('Error in list_users_without_roles command: %s', error)
+        await interaction.response.send_message(
+            f'Error: {error}',
+            ephemeral=True
+        )
+
+async def voice_chaperone_command(interaction: discord.Interaction, enabled: bool):
+    """Enable or disable the voice channel chaperone functionality."""
+    try:
+        # Import config module to modify the setting
+        import config
+        
+        # Update the configuration in the config module
+        config.VOICE_CHAPERONE_ENABLED = enabled
+        
+        status = "enabled" if enabled else "disabled"
+        current_status = "✅ Enabled" if config.VOICE_CHAPERONE_ENABLED else "❌ Disabled"
+        
+        await interaction.response.send_message(
+            f'Voice channel chaperone functionality has been **{status}**.\n'
+            f'Current status: {current_status}\n\n'
+            f'ℹ️ This setting controls whether the bot monitors voice channels for adult/child combinations '
+            f'and takes protective action when only one adult and one child are present.',
+            ephemeral=True
+        )
+        
+        logger.info('Voice chaperone %s by user %s', status, interaction.user)
+        
+    except Exception as e:
+        logger.error('Error in voice_chaperone command: %s', e)
+        await interaction.response.send_message(
+            'An error occurred while updating the voice chaperone setting.',
+            ephemeral=True
+        )
+
+async def voice_chaperone_error(interaction: discord.Interaction, error):
+    """Handles errors for the voice_chaperone command."""
+    if isinstance(error, app_commands.errors.MissingRole):
+        await interaction.response.send_message(
+            'You do not have the required role to use this command.',
+            ephemeral=True
+        )
+    elif isinstance(error, discord.HTTPException):
+        logger.error('Discord API error: %s', error)
+        await interaction.response.send_message(
+            'Discord API error occurred.',
+            ephemeral=True
+        )
+    else:
+        logger.error('Error in voice_chaperone command: %s', error)
         await interaction.response.send_message(
             f'Error: {error}',
             ephemeral=True

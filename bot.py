@@ -22,6 +22,7 @@ from config import (
     MODERATORS_CHANNEL_NAME,
     ADULT_ROLE_NAMES,
     CHILD_ROLE_NAMES,
+    VOICE_CHAPERONE_ENABLED,
     logger
 )
 
@@ -457,6 +458,11 @@ async def on_guild_channel_create(channel):
 async def on_voice_state_update(member, before, after):
     """Handle voice state changes - monitor for adult/child combinations."""
     if member.bot:
+        return
+    
+    # Check if voice chaperone functionality is enabled (check config module directly for runtime changes)
+    import config
+    if not config.VOICE_CHAPERONE_ENABLED:
         return
     
     channels_to_check = set()
