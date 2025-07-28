@@ -192,16 +192,16 @@ class EventFeed:  # pylint: disable=too-few-public-methods
             
             # Build the message
             embed = discord.Embed(
-                title=f"📅 {event['summary']}",
+                title=f" {event['summary']}",
                 color=0x00ff00,
                 description="🎉 **Also added to Discord Events!**"
             )
             
-            embed.add_field(name="📅 Date", value=date_str, inline=True)
-            embed.add_field(name="🕐 Time", value=time_str, inline=True)
+            embed.add_field(name=" Date", value=date_str, inline=True)
+            embed.add_field(name=" Time", value=time_str, inline=True)
             
             if event['location']:
-                embed.add_field(name="📍 Location", value=event['location'], inline=False)
+                embed.add_field(name=" Location", value=event['location'], inline=False)
             
             if event['description']:
                 # Truncate description if too long
@@ -954,7 +954,7 @@ async def kick_members(interaction: discord.Interaction, members: str, reason: O
         
         if kicked_members:
             kicked_list = ', '.join([member.display_name for member in kicked_members])
-            response_parts.append(f'✅ **Successfully kicked {len(kicked_members)} member(s):** {kicked_list}')
+            response_parts.append(f' **Successfully kicked {len(kicked_members)} member(s):** {kicked_list}')
         
         if failed_to_find:
             failed_find_list = ', '.join(failed_to_find)
@@ -964,7 +964,7 @@ async def kick_members(interaction: discord.Interaction, members: str, reason: O
             failed_kick_list = '\n'.join(f'• {name}' for name in failed_kicks[:10])
             if len(failed_kicks) > 10:
                 failed_kick_list += f'\n... and {len(failed_kicks) - 10} more'
-            response_parts.append(f'⚠️ **Failed to kick {len(failed_kicks)} member(s):**\n{failed_kick_list}')
+            response_parts.append(f' **Failed to kick {len(failed_kicks)} member(s):**\n{failed_kick_list}')
         
         if reason:
             response_parts.append(f'📝 **Reason:** {reason}')
@@ -1771,7 +1771,7 @@ async def clone_category_permissions(interaction: discord.Interaction,  # pylint
                     if any(dangerous_perms):
                         logger.error('Failed to copy permissions for role %s - Discord restricts bots from managing roles with moderation permissions (ban_members, kick_members, etc.): %s', target.name, e)
                         await interaction.followup.send(
-                            f'⚠️ **Discord Restriction**: Cannot copy permissions for role **{target.name}** because Discord prevents bots from managing roles with moderation permissions like ban_members, kick_members, manage_roles, etc. You\'ll need to copy these permissions manually.',
+                            f' **Discord Restriction**: Cannot copy permissions for role **{target.name}** because Discord prevents bots from managing roles with moderation permissions like ban_members, kick_members, manage_roles, etc. You\'ll need to copy these permissions manually.',
                             ephemeral=True
                         )
                     else:
@@ -1800,7 +1800,7 @@ async def clone_category_permissions(interaction: discord.Interaction,  # pylint
             notes.append(f'Skipped {skipped_hierarchy_count} role(s) due to Discord\'s restrictions on bots managing roles with moderation permissions (ban_members, kick_members, etc.)')
         
         if notes:
-            success_msg += f'\n\n⚠️ **Note:** {", ".join(notes)}.'
+            success_msg += f'\n\n **Note:** {", ".join(notes)}.'
         
         await interaction.followup.send(success_msg, ephemeral=True)
         
@@ -1986,7 +1986,7 @@ async def clone_channel_permissions(interaction: discord.Interaction,  # pylint:
                     if any(dangerous_perms):
                         logger.error('Failed to copy permissions for role %s - Discord restricts bots from managing roles with moderation permissions: %s', target.name, e)
                         await interaction.followup.send(
-                            f'⚠️ **Discord Restriction**: Cannot copy permissions for role **{target.name}** because Discord prevents bots from managing roles with moderation permissions like ban_members, kick_members, manage_roles, etc. You\'ll need to copy these permissions manually.',
+                            f' **Discord Restriction**: Cannot copy permissions for role **{target.name}** because Discord prevents bots from managing roles with moderation permissions like ban_members, kick_members, manage_roles, etc. You\'ll need to copy these permissions manually.',
                             ephemeral=True
                         )
                     else:
@@ -2015,7 +2015,7 @@ async def clone_channel_permissions(interaction: discord.Interaction,  # pylint:
             notes.append(f'Skipped {skipped_hierarchy_count} role(s) due to hierarchy or Discord\'s restrictions on bots managing roles with moderation permissions')
         
         if notes:
-            success_msg += f'\n\n⚠️ **Note:** {", ".join(notes)}.'
+            success_msg += f'\n\n **Note:** {", ".join(notes)}.'
         
         await interaction.followup.send(success_msg, ephemeral=True)
         
@@ -2163,7 +2163,7 @@ async def clone_role_permissions(interaction: discord.Interaction,  # pylint: di
             )
             
             if admin_excluded:
-                success_msg += '\n\n⚠️ **Note:** Administrator permission was excluded for security reasons.'
+                success_msg += '\n\n **Note:** Administrator permission was excluded for security reasons.'
             
             await interaction.followup.send(success_msg, ephemeral=True)
             
@@ -2320,7 +2320,7 @@ async def clear_category_permissions(interaction: discord.Interaction,  # pylint
                     if any(dangerous_perms):
                         logger.error('Failed to clear permissions for role %s - Discord restricts bots from managing roles with moderation permissions: %s', target.name, e)
                         await interaction.followup.send(
-                            f'⚠️ **Discord Restriction**: Cannot clear permissions for role **{target.name}** because Discord prevents bots from managing roles with moderation permissions. You\'ll need to clear these permissions manually.',
+                            f' **Discord Restriction**: Cannot clear permissions for role **{target.name}** because Discord prevents bots from managing roles with moderation permissions. You\'ll need to clear these permissions manually.',
                             ephemeral=True
                         )
                     else:
@@ -2349,7 +2349,7 @@ async def clear_category_permissions(interaction: discord.Interaction,  # pylint
             notes.append(f'Skipped {skipped_hierarchy_count} role(s) due to Discord\'s restrictions on bots managing roles with moderation permissions')
         
         if notes:
-            success_msg += f'\n\n⚠️ **Note:** {", ".join(notes)}.'
+            success_msg += f'\n\n **Note:** {", ".join(notes)}.'
         
         await interaction.followup.send(success_msg, ephemeral=True)
         
@@ -2487,7 +2487,7 @@ async def clear_channel_permissions(interaction: discord.Interaction,  # pylint:
                     if any(dangerous_perms):
                         logger.error('Failed to clear permissions for role %s - Discord restricts bots from managing roles with moderation permissions: %s', target.name, e)
                         await interaction.followup.send(
-                            f'⚠️ **Discord Restriction**: Cannot clear permissions for role **{target.name}** because Discord prevents bots from managing roles with moderation permissions. You\'ll need to clear these permissions manually.',
+                            f' **Discord Restriction**: Cannot clear permissions for role **{target.name}** because Discord prevents bots from managing roles with moderation permissions. You\'ll need to clear these permissions manually.',
                             ephemeral=True
                         )
                     else:
@@ -2516,7 +2516,7 @@ async def clear_channel_permissions(interaction: discord.Interaction,  # pylint:
             notes.append(f'Skipped {skipped_hierarchy_count} role(s) due to hierarchy or Discord\'s restrictions on bots managing roles with moderation permissions')
         
         if notes:
-            success_msg += f'\n\n⚠️ **Note:** {", ".join(notes)}.'
+            success_msg += f'\n\n **Note:** {", ".join(notes)}.'
         
         await interaction.followup.send(success_msg, ephemeral=True)
         
@@ -2629,7 +2629,7 @@ async def clear_role_permissions(interaction: discord.Interaction,  # pylint: di
         
         if any(dangerous_perms):
             await interaction.followup.send(
-                f'⚠️ **Discord Restriction**: Cannot clear permissions from role **{role.name}** because Discord prevents bots from managing roles with moderation permissions like ban_members, kick_members, manage_roles, etc. You\'ll need to clear these permissions manually.',
+                f' **Discord Restriction**: Cannot clear permissions from role **{role.name}** because Discord prevents bots from managing roles with moderation permissions like ban_members, kick_members, manage_roles, etc. You\'ll need to clear these permissions manually.',
                 ephemeral=True
             )
             return
@@ -2839,7 +2839,7 @@ async def sync_channel_perms(interaction: discord.Interaction,  # pylint: disabl
         )
         
         if failed_channels:
-            success_msg += f'\n\n⚠️ **Failed to sync {len(failed_channels)} channel(s):**\n' + '\n'.join(f'• {name}' for name in failed_channels[:10])
+            success_msg += f'\n\n **Failed to sync {len(failed_channels)} channel(s):**\n' + '\n'.join(f'• {name}' for name in failed_channels[:10])
             if len(failed_channels) > 10:
                 success_msg += f'\n... and {len(failed_channels) - 10} more'
         
@@ -3068,11 +3068,11 @@ async def assign_role(interaction: discord.Interaction, role: discord.Role,  # p
         
         if assigned_members:
             assigned_list = ', '.join([member.display_name for member in assigned_members])
-            response_parts.append(f'✅ **Successfully assigned {role.mention} to {len(assigned_members)} member(s):** {assigned_list}')
+            response_parts.append(f' **Successfully assigned {role.mention} to {len(assigned_members)} member(s):** {assigned_list}')
         
         if already_had_role:
             already_had_list = ', '.join([member.display_name for member in already_had_role])
-            response_parts.append(f'ℹ️ **Already had the role ({len(already_had_role)} member(s)):** {already_had_list}')
+            response_parts.append(f' **Already had the role ({len(already_had_role)} member(s)):** {already_had_list}')
         
         if failed_to_find:
             failed_find_list = ', '.join(failed_to_find)
@@ -3082,7 +3082,7 @@ async def assign_role(interaction: discord.Interaction, role: discord.Role,  # p
             failed_assignment_list = '\n'.join(f'• {name}' for name in failed_assignments[:10])
             if len(failed_assignments) > 10:
                 failed_assignment_list += f'\n... and {len(failed_assignments) - 10} more'
-            response_parts.append(f'⚠️ **Failed to assign role to {len(failed_assignments)} member(s):**\n{failed_assignment_list}')
+            response_parts.append(f' **Failed to assign role to {len(failed_assignments)} member(s):**\n{failed_assignment_list}')
         
         response_message = '\n\n'.join(response_parts)
         await interaction.followup.send(response_message, ephemeral=True)
@@ -3207,11 +3207,11 @@ async def remove_role(interaction: discord.Interaction, role: discord.Role,  # p
         
         if removed_members:
             removed_list = ', '.join([member.display_name for member in removed_members])
-            response_parts.append(f'✅ **Successfully removed {role.mention} from {len(removed_members)} member(s):** {removed_list}')
+            response_parts.append(f' **Successfully removed {role.mention} from {len(removed_members)} member(s):** {removed_list}')
         
         if didnt_have_role:
             didnt_have_list = ', '.join([member.display_name for member in didnt_have_role])
-            response_parts.append(f'ℹ️ **Didn\'t have the role ({len(didnt_have_role)} member(s)):** {didnt_have_list}')
+            response_parts.append(f' **Didn\'t have the role ({len(didnt_have_role)} member(s)):** {didnt_have_list}')
         
         if failed_to_find:
             failed_find_list = ', '.join(failed_to_find)
@@ -3221,7 +3221,7 @@ async def remove_role(interaction: discord.Interaction, role: discord.Role,  # p
             failed_removal_list = '\n'.join(f'• {name}' for name in failed_removals[:10])
             if len(failed_removals) > 10:
                 failed_removal_list += f'\n... and {len(failed_removals) - 10} more'
-            response_parts.append(f'⚠️ **Failed to remove role from {len(failed_removals)} member(s):**\n{failed_removal_list}')
+            response_parts.append(f' **Failed to remove role from {len(failed_removals)} member(s):**\n{failed_removal_list}')
         
         response_message = '\n\n'.join(response_parts)
         await interaction.followup.send(response_message, ephemeral=True)
