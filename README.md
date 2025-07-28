@@ -1,9 +1,8 @@
 # JohnnyBot - Discord Moderation Bot
 
-JohnnyBot is a Discord bot designed to automate server management and enforce
-server rules. It provides features such as automatic role assignment, message
-deletion, and user management to ensure a smooth server experience. Most
-commands are limited to users with the MODERATOR_ROLE_NAME, however the PetBot
+JohnnyBot is the missing toolkit for Discord! Designed to automate tons of server management and enforce
+some rules while you're at it. It provides features such as automatic role assignment, message
+deletion, and user management to ensure a smooth server experience. Most commands are limited to users with the MODERATOR_ROLE_NAME, however the PetBot
 commands can be leveraged by all users.
 
 ## Features
@@ -193,14 +192,21 @@ Follow [THIS GUDE](https://www.upwork.com/resources/how-to-make-discord-bot) to 
   - `member`: Member to kick.
   - `reason`: Reason for the kick (optional).
 
-### 9. `/botsay`
+### 9. `/kick_role`
+**Description:** Kicks all members with a specified role from the server.
+
+- **Parameters:**
+  - `role`: Role whose members to kick.
+  - `reason`: Reason for the kick (optional).
+
+### 10. `/botsay`
 **Description:** Makes the bot send a message to a specified channel.
 
 - **Parameters:**
   - `channel`: Target channel.
   - `message`: Message to send.
 
-### 10. `/timeout`
+### 11. `/timeout`
 **Description:** Timeouts a member for a specified duration.
 
 - **Parameters:**
@@ -208,13 +214,13 @@ Follow [THIS GUDE](https://www.upwork.com/resources/how-to-make-discord-bot) to 
   - `duration`: Timeout duration in seconds.
   - `reason`: Reason for the timeout (optional).
 
-### 11. `/log_tail`
+### 12. `/log_tail`
 **Description:** Sends the last specified number of lines from the bot's log file to the user via DM.
 
 - **Parameters:**
   - `lines`: Number of lines to retrieve.
 
-### 12. `/add_event_feed`
+### 13. `/add_event_feed`
 **Description:** Adds a calendar feed URL to check for events, and posts them to a channel. Adds events to Discord Server Events as well.
 
 - **Parameters:**
@@ -260,18 +266,19 @@ Follow [THIS GUDE](https://www.upwork.com/resources/how-to-make-discord-bot) to 
   - Link expires after 30 minutes
 
 ### 20. Mass Permission Management Commands
-**Description:** Clone permissions between categories, channels, or roles. All commands remove existing permissions from the destination before copying new ones.
+**Description:** Mass clone or clear permissions. All copy commands remove existing permissions from the destination before copying new ones. 
+
+*Note:The bot cannot manage roles which are at the same level or above any roles the bot has. Also, Discord blocks bots from managing permissions for roles that have moderator capabilities. You will have to manage these manually*
 
 - **`/clone_category_permissions`, `/clone_channel_permissions`, `/clone_role_permissions`** - Clone permissions from a source to a destination
   - `source_*`: Source category, channel or role to copy permissions from
   - `destination_*`: Destination category, channel or role to copy permissions to
-  - *Note: The bot cannot manage (clone) roles which are at the same level or above any roles the bot has*
-  - *Note: Discord blocks bots from manging permissions for roles that have moderator capabilites. You will have to manage these manually*
 
 - **`/clear_category_permissions`, `/clear_channel_permissions`, `/clear_role_permissions`** - Clear permissions from categories, channels or roles
   - `category/channel/role`: Source category, channel or role to clear permissions from
-  - *Note: The bot cannot manage (clone) roles which are at the same level or above any roles the bot has*
-  - *Note: Discord blocks bots from manging permissions for roles that have moderator capabilites. You will have to manage these manually*
+
+- **`/sync_channel_perms`** - Sync permissions for all channels in a category with the category's permissions
+  - `source_category`: Category whose permissions will be synced to all its channels
 
 ## Contributing
 

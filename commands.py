@@ -448,6 +448,17 @@ def register_commands():  # pylint: disable=too-many-locals
     # Add error handler for kick
     _kick.on_error = kick_error
 
+    # Register kick_role command
+    @tree.command(name='kick_role', description='Kicks all members with a specified role from the server')
+    @app_commands.describe(role='Role whose members to kick', reason='Reason for kick')
+    @app_commands.checks.has_role(MODERATOR_ROLE_NAME)
+    async def _kick_role(interaction: discord.Interaction, role: discord.Role,
+                        reason: Optional[str] = None):
+        await kick_role(interaction, role, reason)
+
+    # Add error handler for kick_role
+    _kick_role.on_error = kick_role_error
+
     # Register botsay command
     @tree.command(name='botsay', description='Makes the bot send a message to a specified channel')
     @app_commands.describe(channel='Channel to send the message to', message='Message to send')
@@ -632,6 +643,20 @@ def register_commands():  # pylint: disable=too-many-locals
 
     # Add error handler for clear_role_permissions
     _clear_role_permissions.on_error = clear_role_permissions_error
+
+    # Register sync_channel_perms command
+    @tree.command(name='sync_channel_perms',
+                  description='Sync permissions for all channels in a category with the category permissions')
+    @app_commands.describe(
+        source_category='Category whose permissions will be synced to all its channels'
+    )
+    @app_commands.checks.has_role(MODERATOR_ROLE_NAME)
+    async def _sync_channel_perms(interaction: discord.Interaction,
+                                source_category: discord.CategoryChannel):
+        await sync_channel_perms(interaction, source_category)
+
+    # Add error handler for sync_channel_perms
+    _sync_channel_perms.on_error = sync_channel_perms_error
 
 def setup_commands(bot_param):
     """Initialize command module with bot instance and register commands."""
@@ -853,6 +878,83 @@ async def kick_member(interaction: discord.Interaction, member: discord.Member, 
 
 async def kick_error(interaction: discord.Interaction, error):
     """Handles errors for the kick command.
+    
+    Args:
+        interaction: The Discord interaction object
+        error: The error that occurred
+    """
+    if isinstance(error, app_commands.errors.MissingRole):
+        await interaction.response.send_message('You do not have the required role to use this command.', ephemeral=True)
+    elif isinstance(error, discord.HTTPException):
+        logger.error('Discord API error: %s', error)
+        await interaction.response.send_message('Discord API error occurred.', ephemeral=True)
+    else:
+        await interaction.response.send_message(f'Error: {error}', ephemeral=True)
+
+async def kick_role(interaction: discord.Interaction, role: discord.Role, reason: Optional[str] = None):
+    """Kicks all members with a specified role from the server."""
+    try:
+        await interaction.response.defer(ephemeral=True)
+        
+        # Check if guild exists
+        if not interaction.guild:
+            await interaction.followup.send('This command can only be used in a server.', ephemeral=True)
+            return
+        
+        # Get all members with the specified role
+        members_with_role = [member for member in interaction.guild.members if role in member.roles]
+        
+        if not members_with_role:
+            await interaction.followup.send(f'No members found with the role {role.mention}.', ephemeral=True)
+            return
+        
+        # Check if the bot has permission to kick members
+        if not interaction.guild.me or not interaction.guild.me.guild_permissions.kick_members:
+            await interaction.followup.send('I do not have permission to kick members.', ephemeral=True)
+            return
+        
+        # Kick each member with the role
+        kicked_count = 0
+        failed_kicks = []
+        
+        for member in members_with_role:
+            try:
+                # Skip the bot itself
+                if member == interaction.guild.me:
+                    continue
+                    
+                # Skip members with higher roles than the bot
+                if interaction.guild.me and member.top_role >= interaction.guild.me.top_role:
+                    failed_kicks.append(f"{member.display_name} (higher role)")
+                    continue
+                
+                await member.kick(reason=f"Role kick: {role.name}. {reason}" if reason else f"Role kick: {role.name}")
+                kicked_count += 1
+                logger.info('Kicked member %s for having role %s', member, role.name)
+                
+            except discord.Forbidden:
+                failed_kicks.append(f"{member.display_name} (insufficient permissions)")
+                logger.error('Failed to kick member %s: insufficient permissions', member)
+            except discord.HTTPException as e:
+                failed_kicks.append(f"{member.display_name} (API error)")
+                logger.error('Failed to kick member %s: %s', member, e)
+        
+        # Send results
+        result_message = f'Kicked {kicked_count} member(s) with the role {role.mention}.'
+        
+        if failed_kicks:
+            result_message += f'\n\nFailed to kick {len(failed_kicks)} member(s):\n' + '\n'.join(f'• {name}' for name in failed_kicks[:10])
+            if len(failed_kicks) > 10:
+                result_message += f'\n... and {len(failed_kicks) - 10} more'
+        
+        await interaction.followup.send(result_message, ephemeral=True)
+        
+    except (discord.Forbidden, discord.HTTPException) as e:
+        logger.error('Discord API error in kick_role: %s', e)
+        await interaction.followup.send('A Discord API error occurred.', ephemeral=True)
+
+async def kick_role_error(interaction: discord.Interaction, error):
+    """Handles errors for the kick_role command.
     
     Args:
         interaction: The Discord interaction object
@@ -2520,6 +2622,182 @@ async def clear_role_permissions_error(interaction: discord.Interaction, error):
         )
     else:
         logger.error('Error in clear_role_permissions command: %s', error)
+        await interaction.response.send_message(
+            f'Error: {error}',
+            ephemeral=True
+        )
+
+async def sync_channel_perms(interaction: discord.Interaction,
+                           source_category: discord.CategoryChannel):
+    """Sync permissions for all channels in the source category with the category's permissions."""
+    try:
+        await interaction.response.defer(ephemeral=True)
+        
+        # Check if guild exists
+        if not interaction.guild:
+            await interaction.followup.send('This command can only be used in a server.', ephemeral=True)
+            return
+        
+        # Get all channels in the source category
+        channels_in_category = source_category.channels
+        
+        if not channels_in_category:
+            await interaction.followup.send(f'No channels found in category **{source_category.name}**.', ephemeral=True)
+            return
+        
+        await interaction.followup.send(
+            f'Syncing permissions for {len(channels_in_category)} channel(s) in **{source_category.name}** with the category permissions...',
+            ephemeral=True
+        )
+        
+        # Get the bot's highest role for hierarchy checking
+        bot_member = source_category.guild.me
+        bot_top_role = bot_member.top_role if bot_member else None
+        
+        synced_count = 0
+        failed_channels = []
+        total_overwrites_synced = 0
+        
+        for channel in channels_in_category:
+            try:
+                # Clear existing permissions on the channel first
+                cleared_count = 0
+                for target in list(channel.overwrites.keys()):
+                    try:
+                        # Only process Member and Role objects, skip others
+                        if isinstance(target, (discord.Member, discord.Role)):
+                            # Skip roles with Administrator permission to preserve Server Owner permissions
+                            if isinstance(target, discord.Role) and target.permissions.administrator:
+                                continue
+                            # Skip managed roles (bot roles, booster roles, etc.) that can't be modified
+                            if isinstance(target, discord.Role) and target.managed:
+                                continue
+                            # Skip roles that are higher than or equal to the bot's highest role
+                            if isinstance(target, discord.Role) and bot_top_role and target >= bot_top_role:
+                                continue
+                            # Check for Discord's restricted permissions that bots cannot manage
+                            if isinstance(target, discord.Role):
+                                dangerous_perms = [
+                                    target.permissions.ban_members,
+                                    target.permissions.kick_members,
+                                    target.permissions.manage_roles,
+                                    target.permissions.manage_guild,
+                                    target.permissions.manage_channels,
+                                    target.permissions.manage_messages,
+                                    target.permissions.moderate_members,
+                                    target.permissions.administrator
+                                ]
+                                if any(dangerous_perms):
+                                    continue
+                            
+                            await channel.set_permissions(target, overwrite=None)
+                            cleared_count += 1
+                    except (discord.Forbidden, discord.HTTPException):
+                        # Continue if we can't clear a specific permission
+                        continue
+                
+                # Copy permissions from category to channel
+                copied_count = 0
+                for target, overwrite in source_category.overwrites.items():
+                    try:
+                        # Only process Member and Role objects, skip others
+                        if isinstance(target, (discord.Member, discord.Role)):
+                            # Skip roles with Administrator permission to preserve Server Owner permissions
+                            if isinstance(target, discord.Role) and target.permissions.administrator:
+                                continue
+                            # Skip managed roles (bot roles, booster roles, etc.) that can't be modified
+                            if isinstance(target, discord.Role) and target.managed:
+                                continue
+                            # Skip roles that are higher than or equal to the bot's highest role
+                            if isinstance(target, discord.Role) and bot_top_role and target >= bot_top_role:
+                                continue
+                            # Check for Discord's restricted permissions that bots cannot manage
+                            if isinstance(target, discord.Role):
+                                dangerous_perms = [
+                                    target.permissions.ban_members,
+                                    target.permissions.kick_members,
+                                    target.permissions.manage_roles,
+                                    target.permissions.manage_guild,
+                                    target.permissions.manage_channels,
+                                    target.permissions.manage_messages,
+                                    target.permissions.moderate_members,
+                                    target.permissions.administrator
+                                ]
+                                if any(dangerous_perms):
+                                    continue
+                            
+                            await channel.set_permissions(target, overwrite=overwrite)
+                            copied_count += 1
+                    except (discord.Forbidden, discord.HTTPException):
+                        # Continue if we can't copy a specific permission
+                        continue
+                
+                synced_count += 1
+                total_overwrites_synced += copied_count
+                logger.info('Synced permissions for channel %s in category %s (cleared: %d, copied: %d)',
+                           channel.name, source_category.name, cleared_count, copied_count)
+                
+            except (discord.Forbidden, discord.HTTPException) as e:
+                failed_channels.append(f"{channel.name} ({type(e).__name__})")
+                logger.error('Failed to sync permissions for channel %s: %s', channel.name, e)
+        
+        # Send results
+        success_msg = (
+            f'Successfully synced permissions for **{synced_count}** out of **{len(channels_in_category)}** channel(s) in **{source_category.name}**.\n'
+            f'Total permission overwrites synced: **{total_overwrites_synced}**'
+        )
+        
+        if failed_channels:
+            success_msg += f'\n\n⚠️ **Failed to sync {len(failed_channels)} channel(s):**\n' + '\n'.join(f'• {name}' for name in failed_channels[:10])
+            if len(failed_channels) > 10:
+                success_msg += f'\n... and {len(failed_channels) - 10} more'
+        
+        success_msg += '\n\n📝 **Note:** Skipped Administrator roles, managed roles, and roles with moderation permissions for security reasons.'
+        
+        await interaction.followup.send(success_msg, ephemeral=True)
+        
+    except discord.Forbidden:
+        await interaction.followup.send(
+            'I don\'t have permission to manage permissions on this category or its channels.\n\n'
+            '**Possible causes:**\n'
+            '• I lack "Manage Channels" permission\n'
+            '• I lack "Manage Roles" permission\n'
+            '• My role is not high enough in the hierarchy to modify permissions for some roles/members\n'
+            '• Discord restricts bots from managing roles with moderation permissions\n\n'
+            '**Solutions:**\n'
+            '• Ensure I have "Manage Channels" and "Manage Roles" permissions\n'
+            '• Move my role higher than the roles you want to sync permissions for\n'
+            '• For roles with moderation permissions, you\'ll need to sync their permissions manually',
+            ephemeral=True
+        )
+    except discord.HTTPException as e:
+        logger.error('Discord API error in sync_channel_perms: %s', e)
+        await interaction.followup.send(
+            'A Discord API error occurred while syncing permissions.',
+            ephemeral=True
+        )
+    except Exception as e:
+        logger.error('Unexpected error in sync_channel_perms: %s', e)
+        await interaction.followup.send(
+            'An unexpected error occurred while syncing permissions.',
+            ephemeral=True
+        )
+
+async def sync_channel_perms_error(interaction: discord.Interaction, error):
+    """Handles errors for the sync_channel_perms command."""
+    if isinstance(error, app_commands.errors.MissingRole):
+        await interaction.response.send_message(
+            'You do not have the required role to use this command.',
+            ephemeral=True
+        )
+    elif isinstance(error, discord.HTTPException):
+        logger.error('Discord API error: %s', error)
+        await interaction.response.send_message(
+            'Discord API error occurred.',
+            ephemeral=True
+        )
+    else:
+        logger.error('Error in sync_channel_perms command: %s', error)
         await interaction.response.send_message(
             f'Error: {error}',
             ephemeral=True
