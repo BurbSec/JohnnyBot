@@ -1628,7 +1628,7 @@ async def clone_category_permissions(interaction: discord.Interaction,  # pylint
     except discord.HTTPException as e:
         logger.error('Discord API error in clone_category_permissions: %s', e)
         await interaction.followup.send(
-            'A Discord API error occurred while cloning permissions.',
+            'A Discord API error occurred. Probably rate limiting. Trying a workaround...',
             ephemeral=True
         )
     except Exception as e:
@@ -1845,7 +1845,7 @@ async def clone_channel_permissions(interaction: discord.Interaction,  # pylint:
     except discord.HTTPException as e:
         logger.error('Discord API error in clone_channel_permissions: %s', e)
         await interaction.followup.send(
-            'A Discord API error occurred while cloning permissions.',
+            'A Discord API error occurred. Probably rate limiting. Trying a workaround...',
             ephemeral=True
         )
     except Exception as e:
@@ -2006,7 +2006,7 @@ async def clone_role_permissions(interaction: discord.Interaction,  # pylint: di
     except discord.HTTPException as e:
         logger.error('Discord API error in clone_role_permissions: %s', e)
         await interaction.followup.send(
-            'A Discord API error occurred while cloning permissions.',
+            'A Discord API error occurred. Probably rate limiting. Trying a workaround...',
             ephemeral=True
         )
     except Exception as e:
