@@ -23,9 +23,21 @@ from config import (
     REMINDERS_FILE,
     TEMP_DIR,
     HOST_IP,
-    VOICE_CHAPERONE_ENABLED,
     logger
 )
+
+
+def get_last_log_line():
+    """Get the last line from the log file."""
+    try:
+        with open(LOG_FILE, 'r', encoding='utf-8') as log_file:
+            lines = log_file.readlines()
+            if lines:
+                return lines[-1].strip()
+            return "No log entries found"
+    except (OSError, IOError) as e:
+        logger.error('Failed to read log file for last line: %s', e)
+        return f"Error reading log file: {e}"
 
 
 class EventFeed:  # pylint: disable=too-few-public-methods
@@ -737,16 +749,17 @@ def create_set_reminder_command():
 
     async def on_error(interaction: discord.Interaction, error):
         """Handles errors for the set_reminder command."""
+        last_log = get_last_log_line()
         if isinstance(error, app_commands.errors.MissingRole):
             await interaction.response.send_message(
-                'You do not have the required role to use this command.', ephemeral=True)
+                f'You do not have the required role to use this command.\n\nLast log: {last_log}', ephemeral=True)
         elif isinstance(error, InvalidReminderInterval):
-            await interaction.response.send_message(f'Invalid interval: {error}', ephemeral=True)
+            await interaction.response.send_message(f'Invalid interval: {error}\n\nLast log: {last_log}', ephemeral=True)
         elif isinstance(error, discord.HTTPException):
             logger.error('Discord API error: %s', error)
-            await interaction.response.send_message('Discord API error occurred.', ephemeral=True)
+            await interaction.response.send_message(f'Discord API error occurred.\n\nLast log: {last_log}', ephemeral=True)
         else:
-            await interaction.response.send_message(f'Error: {error}', ephemeral=True)
+            await interaction.response.send_message(f'Error: {error}\n\nLast log: {last_log}', ephemeral=True)
     
     set_reminder_command.on_error = on_error
     return set_reminder_command
@@ -833,13 +846,14 @@ async def purge_last_messages_error(interaction: discord.Interaction, error):
         interaction: The Discord interaction object
         error: The error that occurred
     """
+    last_log = get_last_log_line()
     if isinstance(error, app_commands.errors.MissingRole):
-        await interaction.response.send_message('You do not have the required role to use this command.', ephemeral=True)
+        await interaction.response.send_message(f'You do not have the required role to use this command.\n\nLast log: {last_log}', ephemeral=True)
     elif isinstance(error, discord.HTTPException):
         logger.error('Discord API error: %s', error)
-        await interaction.response.send_message('Discord API error occurred.', ephemeral=True)
+        await interaction.response.send_message(f'Discord API error occurred.\n\nLast log: {last_log}', ephemeral=True)
     else:
-        await interaction.response.send_message(f'Error: {error}', ephemeral=True)
+        await interaction.response.send_message(f'Error: {error}\n\nLast log: {last_log}', ephemeral=True)
 
 async def purge_string(interaction: discord.Interaction, channel: discord.TextChannel, search_string: str):
     """Purges all messages containing a specific string from a channel."""
@@ -860,10 +874,11 @@ async def purge_string_error(interaction: discord.Interaction, error):
         interaction: The Discord interaction object
         error: The error that occurred
     """
+    last_log = get_last_log_line()
     if isinstance(error, app_commands.errors.MissingRole):
-        await interaction.response.send_message('You do not have the required role to use this command.', ephemeral=True)
+        await interaction.response.send_message(f'You do not have the required role to use this command.\n\nLast log: {last_log}', ephemeral=True)
     else:
-        await interaction.response.send_message(f'Error: {error}', ephemeral=True)
+        await interaction.response.send_message(f'Error: {error}\n\nLast log: {last_log}', ephemeral=True)
 
 async def purge_webhooks(interaction: discord.Interaction, channel: discord.TextChannel):
     """Purges all messages sent by webhooks or apps from a channel."""
@@ -884,10 +899,11 @@ async def purge_webhooks_error(interaction: discord.Interaction, error):
         interaction: The Discord interaction object
         error: The error that occurred
     """
+    last_log = get_last_log_line()
     if isinstance(error, app_commands.errors.MissingRole):
-        await interaction.response.send_message('You do not have the required role to use this command.', ephemeral=True)
+        await interaction.response.send_message(f'You do not have the required role to use this command.\n\nLast log: {last_log}', ephemeral=True)
     else:
-        await interaction.response.send_message(f'Error: {error}', ephemeral=True)
+        await interaction.response.send_message(f'Error: {error}\n\nLast log: {last_log}', ephemeral=True)
 
 async def kick_members(interaction: discord.Interaction, members: str, reason: Optional[str] = None):  # pylint: disable=too-many-locals,too-many-branches,too-many-statements
     """Kicks one or more members from the server."""
@@ -1018,13 +1034,14 @@ async def kick_error(interaction: discord.Interaction, error):
         interaction: The Discord interaction object
         error: The error that occurred
     """
+    last_log = get_last_log_line()
     if isinstance(error, app_commands.errors.MissingRole):
-        await interaction.response.send_message('You do not have the required role to use this command.', ephemeral=True)
+        await interaction.response.send_message(f'You do not have the required role to use this command.\n\nLast log: {last_log}', ephemeral=True)
     elif isinstance(error, discord.HTTPException):
         logger.error('Discord API error: %s', error)
-        await interaction.response.send_message('Discord API error occurred.', ephemeral=True)
+        await interaction.response.send_message(f'Discord API error occurred.\n\nLast log: {last_log}', ephemeral=True)
     else:
-        await interaction.response.send_message(f'Error: {error}', ephemeral=True)
+        await interaction.response.send_message(f'Error: {error}\n\nLast log: {last_log}', ephemeral=True)
 
 async def kick_role(interaction: discord.Interaction, role: discord.Role, reason: Optional[str] = None):
     """Kicks all members with a specified role from the server."""
@@ -1095,13 +1112,14 @@ async def kick_role_error(interaction: discord.Interaction, error):
         interaction: The Discord interaction object
         error: The error that occurred
     """
+    last_log = get_last_log_line()
     if isinstance(error, app_commands.errors.MissingRole):
-        await interaction.response.send_message('You do not have the required role to use this command.', ephemeral=True)
+        await interaction.response.send_message(f'You do not have the required role to use this command.\n\nLast log: {last_log}', ephemeral=True)
     elif isinstance(error, discord.HTTPException):
         logger.error('Discord API error: %s', error)
-        await interaction.response.send_message('Discord API error occurred.', ephemeral=True)
+        await interaction.response.send_message(f'Discord API error occurred.\n\nLast log: {last_log}', ephemeral=True)
     else:
-        await interaction.response.send_message(f'Error: {error}', ephemeral=True)
+        await interaction.response.send_message(f'Error: {error}\n\nLast log: {last_log}', ephemeral=True)
 
 async def botsay_message(interaction: discord.Interaction, channel: discord.TextChannel, message: str):
     """Makes the bot send a message to a specified channel."""
@@ -1119,13 +1137,14 @@ async def botsay_error(interaction: discord.Interaction, error):
         interaction: The Discord interaction object
         error: The error that occurred
     """
+    last_log = get_last_log_line()
     if isinstance(error, app_commands.errors.MissingRole):
-        await interaction.response.send_message('You do not have the required role to use this command.', ephemeral=True)
+        await interaction.response.send_message(f'You do not have the required role to use this command.\n\nLast log: {last_log}', ephemeral=True)
     elif isinstance(error, discord.HTTPException):
         logger.error('Discord API error: %s', error)
-        await interaction.response.send_message('Discord API error occurred.', ephemeral=True)
+        await interaction.response.send_message(f'Discord API error occurred.\n\nLast log: {last_log}', ephemeral=True)
     else:
-        await interaction.response.send_message(f'Error: {error}', ephemeral=True)
+        await interaction.response.send_message(f'Error: {error}\n\nLast log: {last_log}', ephemeral=True)
 
 async def timeout_member(interaction: discord.Interaction, member: discord.Member, duration: int, reason: Optional[str] = None):
     """Timeouts a member for a specified duration."""
@@ -1144,10 +1163,11 @@ async def timeout_error(interaction: discord.Interaction, error):
         interaction: The Discord interaction object
         error: The error that occurred
     """
+    last_log = get_last_log_line()
     if isinstance(error, app_commands.errors.MissingRole):
-        await interaction.response.send_message('You do not have the required role to use this command.', ephemeral=True)
+        await interaction.response.send_message(f'You do not have the required role to use this command.\n\nLast log: {last_log}', ephemeral=True)
     else:
-        await interaction.response.send_message(f'Error: {error}', ephemeral=True)
+        await interaction.response.send_message(f'Error: {error}\n\nLast log: {last_log}', ephemeral=True)
 
 async def log_tail_command(interaction: discord.Interaction, lines: int):
     """DM the last specified number of lines of the bot log to the user."""
@@ -1173,11 +1193,12 @@ async def log_tail_error(interaction: discord.Interaction, error):
         interaction: The Discord interaction object
         error: The error that occurred
     """
+    last_log = get_last_log_line()
     if isinstance(error, discord.HTTPException):
         logger.error('Discord API error: %s', error)
-        await interaction.response.send_message('Discord API error occurred.', ephemeral=True)
+        await interaction.response.send_message(f'Discord API error occurred.\n\nLast log: {last_log}', ephemeral=True)
     else:
-        await interaction.response.send_message(f"Error: {str(error)}", ephemeral=True)
+        await interaction.response.send_message(f"Error: {str(error)}\n\nLast log: {last_log}", ephemeral=True)
 
 async def add_event_feed_command(interaction: discord.Interaction, calendar_url: str, channel_name: str = "bot-trap"):
     """Adds a calendar feed URL to check for events."""
@@ -1242,11 +1263,12 @@ async def add_event_feed_error(interaction: discord.Interaction, error):
         interaction: The Discord interaction object
         error: The error that occurred
     """
+    last_log = get_last_log_line()
     if isinstance(error, discord.HTTPException):
         logger.error('Discord API error: %s', error)
-        await interaction.response.send_message('Discord API error occurred.', ephemeral=True)
+        await interaction.response.send_message(f'Discord API error occurred.\n\nLast log: {last_log}', ephemeral=True)
     else:
-        await interaction.response.send_message(f"Error: {str(error)}", ephemeral=True)
+        await interaction.response.send_message(f"Error: {str(error)}\n\nLast log: {last_log}", ephemeral=True)
 
 async def list_event_feeds_command(interaction: discord.Interaction):
     """Lists all registered calendar feeds."""
@@ -1615,19 +1637,20 @@ async def message_dump_command(interaction: discord.Interaction, user: discord.U
 
 async def message_dump_error(interaction: discord.Interaction, error):
     """Handles errors for the message_dump command."""
+    last_log = get_last_log_line()
     if isinstance(error, app_commands.errors.MissingRole):
-        await interaction.response.send_message('You do not have the required role to use this command.', ephemeral=True)
+        await interaction.response.send_message(f'You do not have the required role to use this command.\n\nLast log: {last_log}', ephemeral=True)
     elif hasattr(app_commands, 'MissingRequiredArgument') and isinstance(error, getattr(app_commands, 'MissingRequiredArgument')):
         await interaction.response.send_message(
-            'Missing required argument. Make sure to provide user, channel, and start_date.',
+            f'Missing required argument. Make sure to provide user, channel, and start_date.\n\nLast log: {last_log}',
             ephemeral=True
         )
     elif isinstance(error, discord.HTTPException):
         logger.error('Discord API error: %s', error)
-        await interaction.response.send_message('Discord API error occurred.', ephemeral=True)
+        await interaction.response.send_message(f'Discord API error occurred.\n\nLast log: {last_log}', ephemeral=True)
     else:
         logger.error('Error in message_dump command: %s', error)
-        await interaction.response.send_message(f'Error: {error}', ephemeral=True)
+        await interaction.response.send_message(f'Error: {error}\n\nLast log: {last_log}', ephemeral=True)
 
 async def clone_category_permissions(interaction: discord.Interaction,  # pylint: disable=too-many-branches,too-many-locals,too-many-statements,too-many-nested-blocks
                                    source_category: discord.CategoryChannel,
@@ -1858,21 +1881,22 @@ async def clone_category_permissions(interaction: discord.Interaction,  # pylint
 
 async def clone_category_permissions_error(interaction: discord.Interaction, error):
     """Handles errors for the clone_category_permissions command."""
+    last_log = get_last_log_line()
     if isinstance(error, app_commands.errors.MissingRole):
         await interaction.response.send_message(
-            'You do not have the required role to use this command.',
+            f'You do not have the required role to use this command.\n\nLast log: {last_log}',
             ephemeral=True
         )
     elif isinstance(error, discord.HTTPException):
         logger.error('Discord API error: %s', error)
         await interaction.response.send_message(
-            'Discord API error occurred.',
+            f'Discord API error occurred.\n\nLast log: {last_log}',
             ephemeral=True
         )
     else:
         logger.error('Error in clone_category_permissions command: %s', error)
         await interaction.response.send_message(
-            f'Error: {error}',
+            f'Error: {error}\n\nLast log: {last_log}',
             ephemeral=True
         )
 
@@ -2075,21 +2099,22 @@ async def clone_channel_permissions(interaction: discord.Interaction,  # pylint:
 
 async def clone_channel_permissions_error(interaction: discord.Interaction, error):
     """Handles errors for the clone_channel_permissions command."""
+    last_log = get_last_log_line()
     if isinstance(error, app_commands.errors.MissingRole):
         await interaction.response.send_message(
-            'You do not have the required role to use this command.',
+            f'You do not have the required role to use this command.\n\nLast log: {last_log}',
             ephemeral=True
         )
     elif isinstance(error, discord.HTTPException):
         logger.error('Discord API error: %s', error)
         await interaction.response.send_message(
-            'Discord API error occurred.',
+            f'Discord API error occurred.\n\nLast log: {last_log}',
             ephemeral=True
         )
     else:
         logger.error('Error in clone_channel_permissions command: %s', error)
         await interaction.response.send_message(
-            f'Error: {error}',
+            f'Error: {error}\n\nLast log: {last_log}',
             ephemeral=True
         )
 
@@ -2236,21 +2261,22 @@ async def clone_role_permissions(interaction: discord.Interaction,  # pylint: di
 
 async def clone_role_permissions_error(interaction: discord.Interaction, error):
     """Handles errors for the clone_role_permissions command."""
+    last_log = get_last_log_line()
     if isinstance(error, app_commands.errors.MissingRole):
         await interaction.response.send_message(
-            'You do not have the required role to use this command.',
+            f'You do not have the required role to use this command.\n\nLast log: {last_log}',
             ephemeral=True
         )
     elif isinstance(error, discord.HTTPException):
         logger.error('Discord API error: %s', error)
         await interaction.response.send_message(
-            'Discord API error occurred.',
+            f'Discord API error occurred.\n\nLast log: {last_log}',
             ephemeral=True
         )
     else:
         logger.error('Error in clone_role_permissions command: %s', error)
         await interaction.response.send_message(
-            f'Error: {error}',
+            f'Error: {error}\n\nLast log: {last_log}',
             ephemeral=True
         )
 
@@ -2407,21 +2433,22 @@ async def clear_category_permissions(interaction: discord.Interaction,  # pylint
 
 async def clear_category_permissions_error(interaction: discord.Interaction, error):
     """Handles errors for the clear_category_permissions command."""
+    last_log = get_last_log_line()
     if isinstance(error, app_commands.errors.MissingRole):
         await interaction.response.send_message(
-            'You do not have the required role to use this command.',
+            f'You do not have the required role to use this command.\n\nLast log: {last_log}',
             ephemeral=True
         )
     elif isinstance(error, discord.HTTPException):
         logger.error('Discord API error: %s', error)
         await interaction.response.send_message(
-            'Discord API error occurred.',
+            f'Discord API error occurred.\n\nLast log: {last_log}',
             ephemeral=True
         )
     else:
         logger.error('Error in clear_category_permissions command: %s', error)
         await interaction.response.send_message(
-            f'Error: {error}',
+            f'Error: {error}\n\nLast log: {last_log}',
             ephemeral=True
         )
 
@@ -2574,21 +2601,22 @@ async def clear_channel_permissions(interaction: discord.Interaction,  # pylint:
 
 async def clear_channel_permissions_error(interaction: discord.Interaction, error):
     """Handles errors for the clear_channel_permissions command."""
+    last_log = get_last_log_line()
     if isinstance(error, app_commands.errors.MissingRole):
         await interaction.response.send_message(
-            'You do not have the required role to use this command.',
+            f'You do not have the required role to use this command.\n\nLast log: {last_log}',
             ephemeral=True
         )
     elif isinstance(error, discord.HTTPException):
         logger.error('Discord API error: %s', error)
         await interaction.response.send_message(
-            'Discord API error occurred.',
+            f'Discord API error occurred.\n\nLast log: {last_log}',
             ephemeral=True
         )
     else:
         logger.error('Error in clear_channel_permissions command: %s', error)
         await interaction.response.send_message(
-            f'Error: {error}',
+            f'Error: {error}\n\nLast log: {last_log}',
             ephemeral=True
         )
 
@@ -2725,21 +2753,22 @@ async def clear_role_permissions(interaction: discord.Interaction,  # pylint: di
 
 async def clear_role_permissions_error(interaction: discord.Interaction, error):
     """Handles errors for the clear_role_permissions command."""
+    last_log = get_last_log_line()
     if isinstance(error, app_commands.errors.MissingRole):
         await interaction.response.send_message(
-            'You do not have the required role to use this command.',
+            f'You do not have the required role to use this command.\n\nLast log: {last_log}',
             ephemeral=True
         )
     elif isinstance(error, discord.HTTPException):
         logger.error('Discord API error: %s', error)
         await interaction.response.send_message(
-            'Discord API error occurred.',
+            f'Discord API error occurred.\n\nLast log: {last_log}',
             ephemeral=True
         )
     else:
         logger.error('Error in clear_role_permissions command: %s', error)
         await interaction.response.send_message(
-            f'Error: {error}',
+            f'Error: {error}\n\nLast log: {last_log}',
             ephemeral=True
         )
 
@@ -2901,21 +2930,22 @@ async def sync_channel_perms(interaction: discord.Interaction,  # pylint: disabl
 
 async def sync_channel_perms_error(interaction: discord.Interaction, error):
     """Handles errors for the sync_channel_perms command."""
+    last_log = get_last_log_line()
     if isinstance(error, app_commands.errors.MissingRole):
         await interaction.response.send_message(
-            'You do not have the required role to use this command.',
+            f'You do not have the required role to use this command.\n\nLast log: {last_log}',
             ephemeral=True
         )
     elif isinstance(error, discord.HTTPException):
         logger.error('Discord API error: %s', error)
         await interaction.response.send_message(
-            'Discord API error occurred.',
+            f'Discord API error occurred.\n\nLast log: {last_log}',
             ephemeral=True
         )
     else:
         logger.error('Error in sync_channel_perms command: %s', error)
         await interaction.response.send_message(
-            f'Error: {error}',
+            f'Error: {error}\n\nLast log: {last_log}',
             ephemeral=True
         )
 
@@ -3118,13 +3148,14 @@ async def assign_role(interaction: discord.Interaction, role: discord.Role,  # p
 
 async def assign_role_error(interaction: discord.Interaction, error):
     """Handles errors for the assign_role command."""
+    last_log = get_last_log_line()
     if isinstance(error, app_commands.errors.MissingRole):
-        await interaction.response.send_message('You do not have the required role to use this command.', ephemeral=True)
+        await interaction.response.send_message(f'You do not have the required role to use this command.\n\nLast log: {last_log}', ephemeral=True)
     elif isinstance(error, discord.HTTPException):
         logger.error('Discord API error: %s', error)
-        await interaction.response.send_message('Discord API error occurred.', ephemeral=True)
+        await interaction.response.send_message(f'Discord API error occurred.\n\nLast log: {last_log}', ephemeral=True)
     else:
-        await interaction.response.send_message(f'Error: {error}', ephemeral=True)
+        await interaction.response.send_message(f'Error: {error}\n\nLast log: {last_log}', ephemeral=True)
 
 async def remove_role(interaction: discord.Interaction, role: discord.Role,  # pylint: disable=too-many-locals,too-many-branches,too-many-statements
                      members: str):
@@ -3257,26 +3288,28 @@ async def remove_role(interaction: discord.Interaction, role: discord.Role,  # p
 
 async def remove_role_error(interaction: discord.Interaction, error):
     """Handles errors for the remove_role command."""
+    last_log = get_last_log_line()
     if isinstance(error, app_commands.errors.MissingRole):
-        await interaction.response.send_message('You do not have the required role to use this command.', ephemeral=True)
+        await interaction.response.send_message(f'You do not have the required role to use this command.\n\nLast log: {last_log}', ephemeral=True)
     elif isinstance(error, discord.HTTPException):
         logger.error('Discord API error: %s', error)
-        await interaction.response.send_message('Discord API error occurred.', ephemeral=True)
+        await interaction.response.send_message(f'Discord API error occurred.\n\nLast log: {last_log}', ephemeral=True)
     else:
-        await interaction.response.send_message(f'Error: {error}', ephemeral=True)
+        await interaction.response.send_message(f'Error: {error}\n\nLast log: {last_log}', ephemeral=True)
 
 async def list_users_without_roles_error(interaction: discord.Interaction, error):
     """Handles errors for the list_users_without_roles command."""
+    last_log = get_last_log_line()
     if isinstance(error, discord.HTTPException):
         logger.error('Discord API error: %s', error)
         await interaction.response.send_message(
-            'Discord API error occurred.',
+            f'Discord API error occurred.\n\nLast log: {last_log}',
             ephemeral=True
         )
     else:
         logger.error('Error in list_users_without_roles command: %s', error)
         await interaction.response.send_message(
-            f'Error: {error}',
+            f'Error: {error}\n\nLast log: {last_log}',
             ephemeral=True
         )
 
@@ -3311,20 +3344,21 @@ async def voice_chaperone_command(interaction: discord.Interaction, enabled: boo
 
 async def voice_chaperone_error(interaction: discord.Interaction, error):
     """Handles errors for the voice_chaperone command."""
+    last_log = get_last_log_line()
     if isinstance(error, app_commands.errors.MissingRole):
         await interaction.response.send_message(
-            'You do not have the required role to use this command.',
+            f'You do not have the required role to use this command.\n\nLast log: {last_log}',
             ephemeral=True
         )
     elif isinstance(error, discord.HTTPException):
         logger.error('Discord API error: %s', error)
         await interaction.response.send_message(
-            'Discord API error occurred.',
+            f'Discord API error occurred.\n\nLast log: {last_log}',
             ephemeral=True
         )
     else:
         logger.error('Error in voice_chaperone command: %s', error)
         await interaction.response.send_message(
-            f'Error: {error}',
+            f'Error: {error}\n\nLast log: {last_log}',
             ephemeral=True
         )
