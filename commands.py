@@ -698,6 +698,10 @@ def register_commands():  # pylint: disable=too-many-locals,too-many-statements
     # Add error handler for voice_chaperone
     _voice_chaperone.on_error = voice_chaperone_error
 
+    # Register update checking command
+    register_update_checking_command()
+
+
 def setup_commands(bot_param):
     """Initialize command module with bot instance and register commands."""
     # Using globals is necessary here to initialize module-level variables
@@ -3362,3 +3366,68 @@ async def voice_chaperone_error(interaction: discord.Interaction, error):
             f'Error: {error}\n\nLast log: {last_log}',
             ephemeral=True
         )
+
+async def update_checking_command(interaction: discord.Interaction, enabled: bool):
+    """Enable or disable the automatic update checking functionality."""
+    try:
+        # Import config module to modify the setting
+        import config
+        
+        # Update the configuration in the config module
+        config.UPDATE_CHECKING_ENABLED = enabled
+        
+        status = "enabled" if enabled else "disabled"
+        current_status = "✅ Enabled" if config.UPDATE_CHECKING_ENABLED else "❌ Disabled"
+        
+        await interaction.response.send_message(
+            f'Automatic update checking has been **{status}**.\n'
+            f'Current status: {current_status}\n\n'
+            f'ℹ️ This setting controls whether the bot automatically checks for updates from the GitHub repository '
+            f'daily and notifies moderators when updates are available.',
+            ephemeral=True
+        )
+        
+        logger.info('Update checking %s by user %s', status, interaction.user)
+        
+    except Exception as e:
+        logger.error('Error in update_checking command: %s', e)
+        await interaction.response.send_message(
+            'An error occurred while updating the update checking setting.',
+            ephemeral=True
+        )
+
+async def update_checking_error(interaction: discord.Interaction, error):
+    """Handles errors for the update_checking command."""
+    last_log = get_last_log_line()
+    if isinstance(error, app_commands.errors.MissingRole):
+        await interaction.response.send_message(
+            f'You do not have the required role to use this command.\n\nLast log: {last_log}',
+            ephemeral=True
+        )
+    elif isinstance(error, discord.HTTPException):
+        logger.error('Discord API error: %s', error)
+        await interaction.response.send_message(
+            f'Discord API error occurred.\n\nLast log: {last_log}',
+            ephemeral=True
+        )
+    else:
+        logger.error('Error in update_checking command: %s', error)
+        await interaction.response.send_message(
+            f'Error: {error}\n\nLast log: {last_log}',
+            ephemeral=True
+        )
+
+def register_update_checking_command():
+    """Register the update checking command."""
+    if tree is None:
+        return
+
+    @tree.command(name='update_checking',
+                  description='Enable or disable the automatic update checking functionality')
+    @app_commands.describe(enabled='True to enable, False to disable update checking')
+    @app_commands.checks.has_role(MODERATOR_ROLE_NAME)
+    async def _update_checking(interaction: discord.Interaction, enabled: bool):
+        await update_checking_command(interaction, enabled)
+
+    # Add error handler for update_checking
+    _update_checking.on_error = update_checking_error

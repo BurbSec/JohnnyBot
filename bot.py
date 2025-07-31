@@ -4,13 +4,15 @@ import os
 import asyncio
 import json
 import random
+import subprocess
 import threading
 import time as time_module
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 from typing import TypeVar
 
 from apscheduler.triggers.interval import IntervalTrigger
 
+import aiohttp
 import discord
 from discord.ext import commands
 
@@ -23,6 +25,8 @@ from config import (
     ADULT_ROLE_NAMES,
     CHILD_ROLE_NAMES,
     VOICE_CHAPERONE_ENABLED,
+    UPDATE_CHECKING_ENABLED,
+    UPDATE_CHECK_REPO_URL,
     logger
 )
 
@@ -122,6 +126,90 @@ def get_time_based_message(bot_name: str = "BOTNAME"):
     
     selected_message = random.choice(message_list)
     return selected_message.replace("BOTNAME", bot_name)
+
+async def check_for_updates():
+    """Check for updates from the GitHub repository by comparing commit hashes."""
+    if not UPDATE_CHECKING_ENABLED:
+        return
+    
+    try:
+        # Get the current local commit hash
+        try:
+            result = subprocess.run(
+                ['git', 'rev-parse', 'HEAD'],
+                capture_output=True,
+                text=True,
+                cwd=os.path.dirname(__file__),
+                check=False
+            )
+            if result.returncode != 0:
+                logger.error("Failed to get local git commit hash: %s", result.stderr)
+                return
+            local_commit = result.stdout.strip()
+        except (subprocess.SubprocessError, OSError) as e:
+            logger.error("Error getting local git commit: %s", e)
+            return
+        
+        # Get the latest commit hash from GitHub API
+        try:
+            api_url = UPDATE_CHECK_REPO_URL.replace("github.com", "api.github.com/repos") + "/commits/main"
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.get(api_url, timeout=aiohttp.ClientTimeout(total=30)) as response:
+                    if response.status != 200:
+                        logger.error("Failed to fetch remote commit info: HTTP %s", response.status)
+                        return
+                    
+                    data = await response.json()
+                    remote_commit = data['sha']
+        except (aiohttp.ClientError, KeyError, ValueError) as e:
+            logger.error("Error fetching remote git commit: %s", e)
+            return
+        
+        # Compare commits
+        if local_commit != remote_commit:
+            logger.info("Update available: local=%s, remote=%s", local_commit[:8], remote_commit[:8])
+            await send_update_notification(local_commit, remote_commit)
+        else:
+            logger.info("Bot is up to date: %s", local_commit[:8])
+            
+    except (subprocess.SubprocessError, aiohttp.ClientError, OSError) as e:
+        logger.error("Error in check_for_updates: %s", e)
+
+async def send_update_notification(local_commit, remote_commit):
+    """Send update notification to the moderators channel."""
+    try:
+        # Find the moderators channel
+        moderators_channel = None
+        for guild in bot.guilds:
+            for channel in guild.text_channels:
+                if channel.name == MODERATORS_CHANNEL_NAME:
+                    moderators_channel = channel
+                    break
+            if moderators_channel:
+                break
+        
+        if not moderators_channel:
+            logger.error("Moderators channel '%s' not found", MODERATORS_CHANNEL_NAME)
+            return
+        
+        # Create update message
+        message = (
+            "🤖 **Bot Update Available!**\n\n"
+            f"A new version of JohnnyBot is available on GitHub.\n"
+            f"Current version: `{local_commit[:8]}`\n"
+            f"Latest version: `{remote_commit[:8]}`\n\n"
+            f"**To update:**\n"
+            f"1. Run `git pull` from the bot directory on the server\n"
+            f"2. Restart the bot service\n\n"
+            f"Repository: {UPDATE_CHECK_REPO_URL}"
+        )
+        
+        await moderators_channel.send(message)
+        logger.info("Update notification sent to %s", moderators_channel.name)
+        
+    except (discord.HTTPException, discord.Forbidden) as e:
+        logger.error("Error sending update notification: %s", e)
 
 class DiscordCache:
     """Simple in-memory cache for Discord objects."""
@@ -325,6 +413,15 @@ async def on_ready():  # pylint: disable=too-many-statements
                     logger.info('Event feed scheduler started successfully')
                 else:
                     logger.warning('Event feed check_feeds method not available')
+                
+                # Add daily update checking job
+                if UPDATE_CHECKING_ENABLED:
+                    scheduler.add_job(
+                        check_for_updates,
+                        trigger=IntervalTrigger(hours=24),
+                        next_run_time=datetime.now() + timedelta(minutes=5)  # Start 5 minutes after bot startup
+                    )
+                    logger.info('Update checking scheduler started successfully')
             else:
                 logger.info('Event feed scheduler already running')
         else:

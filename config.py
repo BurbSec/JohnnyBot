@@ -16,6 +16,10 @@ VOICE_CHAPERONE_ENABLED = True  # Set to False to disable voice chaperone functi
 ADULT_ROLE_NAMES = ['Dads', 'GrownUps']
 CHILD_ROLE_NAMES = ['Kids', 'Bambinos', 'Girls']
 
+# Update checking configuration
+UPDATE_CHECKING_ENABLED = True  # Set to False to disable automatic update checking
+UPDATE_CHECK_REPO_URL = "https://github.com/BurbSec/JohnnyBot"
+
 # The IP of the interface which will host downloadable archives
 HOST_IP = "0.0.0.0"
 
