@@ -1126,9 +1126,18 @@ async def kick_role_error(interaction: discord.Interaction, error):
         await interaction.response.send_message(f'Error: {error}\n\nLast log: {last_log}', ephemeral=True)
 
 async def botsay_message(interaction: discord.Interaction, channel: discord.TextChannel, message: str):
-    """Makes the bot send a message to a specified channel."""
+    """Makes the bot send a message to a specified channel with proper markdown formatting."""
     try:
-        await channel.send(message)
+        # Send the message with allowed mentions disabled for safety
+        # Discord will automatically render markdown formatting in the message content
+        await channel.send(
+            message,
+            allowed_mentions=discord.AllowedMentions(
+                everyone=False,
+                users=True,
+                roles=False
+            )
+        )
         await interaction.response.send_message(f'Message sent to {channel.mention}', ephemeral=True)
     except (discord.Forbidden, discord.HTTPException) as e:
         logger.error('Discord API error: %s', e)
