@@ -1302,7 +1302,7 @@ async def remove_event_feed_command(interaction: discord.Interaction, feed_url: 
 async def bot_command(interaction: discord.Interaction):
     """Check on the bot."""
     try:
-        bot_name = interaction.client.user.display_name if interaction.client.user else "JohnnyBot"
+        bot_name = interaction.client.user.display_name if interaction.client.user else "the bot"
         # Import the function from bot.py
         from bot import get_time_based_message  # pylint: disable=import-outside-toplevel
         message = get_time_based_message(bot_name)
@@ -1315,7 +1315,7 @@ async def bot_command(interaction: discord.Interaction):
 async def pet_bot_command(interaction: discord.Interaction):
     """Pet the bot."""
     try:
-        bot_name = interaction.client.user.display_name if interaction.client.user else "JohnnyBot"
+        bot_name = interaction.client.user.display_name if interaction.client.user else "the bot"
         # Define bot response messages inline and select efficiently
         bot_responses = [
             "BOTNAME purrs happily!",
@@ -1335,7 +1335,7 @@ async def pet_bot_command(interaction: discord.Interaction):
 async def bot_pick_fav_command(interaction: discord.Interaction, user1: discord.User, user2: discord.User):
     """See who the bot prefers today."""
     try:
-        bot_name = interaction.client.user.display_name if interaction.client.user else "JohnnyBot"
+        bot_name = interaction.client.user.display_name if interaction.client.user else "the bot"
         # More efficient user selection and message formatting
         users = [user1, user2]
         chosen_user = random.choice(users)
