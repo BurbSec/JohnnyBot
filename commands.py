@@ -724,6 +724,14 @@ def setup_commands(bot_param):
     if event_feed:
         event_feed.scheduler = AsyncIOScheduler()
 
+    # Clear existing commands before registering new ones
+    try:
+        if tree:
+            tree.clear_commands()
+            logger.info("Cleared existing commands before registration")
+    except Exception as e:
+        logger.error("Error clearing commands: %s", e)
+    
     register_commands()
 
 
