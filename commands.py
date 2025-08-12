@@ -517,16 +517,16 @@ def register_commands():  # pylint: disable=too-many-locals,too-many-statements
     async def _remove_event_feed(interaction: discord.Interaction, feed_url: str):
         await remove_event_feed_command(interaction, feed_url)
 
-    @tree.command(name='bot_mood', description='Check on JohnnyBot\'s current mood')
+    @tree.command(name='bot_mood', description='Check on the bot\'s current mood')
     async def _bot_mood(interaction: discord.Interaction):
         await bot_command(interaction)
 
-    @tree.command(name='pet_bot', description='Pet JohnnyBot')
+    @tree.command(name='pet_bot', description='Pet the bot')
     async def _pet_bot(interaction: discord.Interaction):
         await pet_bot_command(interaction)
 
     @tree.command(name='bot_pick_fav',
-                  description='See who JohnnyBot prefers today')
+                  description='See who the bot prefers today')
     @app_commands.describe(
         user1="First potential favorite",
         user2="Second potential favorite"
@@ -1300,7 +1300,7 @@ async def remove_event_feed_command(interaction: discord.Interaction, feed_url: 
     await interaction.response.send_message(f'Removed calendar feed: {feed_url}', ephemeral=True)
 
 async def bot_command(interaction: discord.Interaction):
-    """Check on JohnnyBot."""
+    """Check on the bot."""
     try:
         bot_name = interaction.client.user.display_name if interaction.client.user else "JohnnyBot"
         # Import the function from bot.py
@@ -1313,7 +1313,7 @@ async def bot_command(interaction: discord.Interaction):
         logger.warning("Interaction timed out for bot command from %s", interaction.user)
 
 async def pet_bot_command(interaction: discord.Interaction):
-    """Pet JohnnyBot."""
+    """Pet the bot."""
     try:
         bot_name = interaction.client.user.display_name if interaction.client.user else "JohnnyBot"
         # Define bot response messages inline and select efficiently
@@ -1333,7 +1333,7 @@ async def pet_bot_command(interaction: discord.Interaction):
         logger.warning("Interaction timed out for pet_bot command from %s", interaction.user)
 
 async def bot_pick_fav_command(interaction: discord.Interaction, user1: discord.User, user2: discord.User):
-    """See who JohnnyBot prefers today."""
+    """See who the bot prefers today."""
     try:
         bot_name = interaction.client.user.display_name if interaction.client.user else "JohnnyBot"
         # More efficient user selection and message formatting
