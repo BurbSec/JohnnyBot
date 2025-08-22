@@ -26,6 +26,9 @@ from config import (
     logger
 )
 
+# Autoreply system file path
+AUTOREPLIES_FILE = os.path.join(os.path.dirname(__file__), 'autoreplies.json')
+
 
 def get_last_log_line():
     """Get the last line from the log file."""
@@ -296,6 +299,8 @@ reminders_lock: Optional[threading.Lock] = None
 reminder_threads: Dict[int, Any] = {}
 event_feed: Optional[EventFeed] = None
 message_dump_servers: Dict[str, Any] = {}  # Store active message dump servers
+autoreplies: Dict[str, Dict[str, Any]] = {}  # Store autoreply rules {rule_id: rule_data}
+autoreplies_lock: Optional[threading.Lock] = None
 
 class MessageDumpServer:  # pylint: disable=too-many-instance-attributes
     """Manages a temporary web server for hosting message dump files."""
@@ -700,13 +705,16 @@ def register_commands():  # pylint: disable=too-many-locals,too-many-statements
 
     # Register update checking command
     register_update_checking_command()
+    
+    # Register autoreply commands
+    register_autoreply_commands()
 
 
 def setup_commands(bot_param):
     """Initialize command module with bot instance and register commands."""
     # Using globals is necessary here to initialize module-level variables
     # pylint: disable=global-statement
-    global bot_instance, tree, reminders, reminders_lock, reminder_threads, event_feed, message_dump_servers  # pylint: disable=line-too-long
+    global bot_instance, tree, reminders, reminders_lock, reminder_threads, event_feed, message_dump_servers, autoreplies, autoreplies_lock  # pylint: disable=line-too-long
     bot_instance = bot_param
     if bot_instance:
         tree = bot_instance.tree
@@ -716,6 +724,11 @@ def setup_commands(bot_param):
     reminder_threads = {}
     event_feed = EventFeed(bot_instance)
     message_dump_servers = {}
+    autoreplies = {}
+    autoreplies_lock = threading.Lock()
+    
+    # Load existing autoreply rules
+    load_autoreplies()
 
     from apscheduler.schedulers.asyncio import AsyncIOScheduler
     # This attribute is defined outside __init__ because it depends on an import
@@ -3448,3 +3461,325 @@ def register_update_checking_command():
 
     # Add error handler for update_checking
     _update_checking.on_error = update_checking_error
+
+def load_autoreplies():
+    """Load autoreply rules from file."""
+    global autoreplies
+    if os.path.exists(AUTOREPLIES_FILE):
+        try:
+            with open(AUTOREPLIES_FILE, 'r', encoding='utf-8') as f:
+                autoreplies.update(json.load(f))
+                logger.info('Loaded %d autoreply rules', len(autoreplies))
+        except (OSError, IOError, json.JSONDecodeError) as e:
+            logger.error('Failed to read autoreplies file: %s', e)
+
+def save_autoreplies():
+    """Save autoreply rules to file."""
+    if autoreplies_lock:
+        with autoreplies_lock:
+            try:
+                with open(AUTOREPLIES_FILE, 'w', encoding='utf-8') as f:
+                    json.dump(autoreplies, f, indent=2)
+            except (OSError, IOError) as e:
+                logger.error('Failed to save autoreplies: %s', e)
+                return False
+    return True
+
+def generate_autoreply_id(guild_id: int) -> str:
+    """Generate a unique ID for an autoreply rule."""
+    import uuid
+    return f"{guild_id}_{uuid.uuid4().hex[:8]}"
+
+async def check_message_for_autoreplies(message):
+    """Check if a message should trigger any autoreply rules."""
+    if not message.guild or message.author.bot:
+        return
+    
+    guild_id = message.guild.id
+    message_content = message.content
+    
+    if not autoreplies_lock:
+        return
+        
+    with autoreplies_lock:
+        for rule_id, rule_data in autoreplies.items():
+            # Skip if rule is disabled or for different guild
+            if not rule_data.get('enabled', True) or rule_data.get('guild_id') != guild_id:
+                continue
+                
+            trigger_string = rule_data.get('trigger_string', '')
+            case_sensitive = rule_data.get('case_sensitive', False)
+            
+            # Check if message contains the trigger string
+            if case_sensitive:
+                contains_trigger = trigger_string in message_content
+            else:
+                contains_trigger = trigger_string.lower() in message_content.lower()
+            
+            if contains_trigger:
+                try:
+                    reply_string = rule_data.get('reply_string', '')
+                    await message.reply(reply_string, mention_author=False)
+                    logger.info('Autoreply triggered: rule %s in guild %s by user %s',
+                               rule_id, guild_id, message.author)
+                    break  # Only trigger the first matching rule
+                except discord.HTTPException as e:
+                    logger.error('Failed to send autoreply for rule %s: %s', rule_id, e)
+
+async def autoreply_add_command(interaction: discord.Interaction, trigger: str, reply: str, case_sensitive: bool = False):
+    """Add a new autoreply rule."""
+    try:
+        if not interaction.guild:
+            await interaction.response.send_message('This command can only be used in a server.', ephemeral=True)
+            return
+            
+        # Validate inputs
+        if not trigger.strip():
+            await interaction.response.send_message('Trigger string cannot be empty.', ephemeral=True)
+            return
+            
+        if not reply.strip():
+            await interaction.response.send_message('Reply string cannot be empty.', ephemeral=True)
+            return
+            
+        if len(trigger) > 500:
+            await interaction.response.send_message('Trigger string too long (max 500 characters).', ephemeral=True)
+            return
+            
+        if len(reply) > 2000:
+            await interaction.response.send_message('Reply string too long (max 2000 characters).', ephemeral=True)
+            return
+        
+        guild_id = interaction.guild.id
+        rule_id = generate_autoreply_id(guild_id)
+        
+        rule_data = {
+            'trigger_string': trigger.strip(),
+            'reply_string': reply.strip(),
+            'guild_id': guild_id,
+            'enabled': True,
+            'case_sensitive': case_sensitive,
+            'created_by': interaction.user.id,
+            'created_at': datetime.now().isoformat()
+        }
+        
+        if autoreplies_lock:
+            with autoreplies_lock:
+                autoreplies[rule_id] = rule_data
+                
+        if save_autoreplies():
+            await interaction.response.send_message(
+                f'✅ **Autoreply rule created successfully!**\n'
+                f'**ID:** `{rule_id}`\n'
+                f'**Trigger:** "{trigger}"\n'
+                f'**Reply:** "{reply}"\n'
+                f'**Case Sensitive:** {case_sensitive}',
+                ephemeral=True
+            )
+            logger.info('Autoreply rule %s created by user %s in guild %s', rule_id, interaction.user, guild_id)
+        else:
+            await interaction.response.send_message('Failed to save autoreply rule. Please try again.', ephemeral=True)
+            
+    except Exception as e:
+        logger.error('Error in autoreply_add_command: %s', e)
+        await interaction.response.send_message('An error occurred while creating the autoreply rule.', ephemeral=True)
+
+async def autoreply_list_command(interaction: discord.Interaction):
+    """List all autoreply rules for the current guild."""
+    try:
+        if not interaction.guild:
+            await interaction.response.send_message('This command can only be used in a server.', ephemeral=True)
+            return
+            
+        guild_id = interaction.guild.id
+        guild_rules = []
+        
+        if autoreplies_lock:
+            with autoreplies_lock:
+                for rule_id, rule_data in autoreplies.items():
+                    if rule_data.get('guild_id') == guild_id:
+                        guild_rules.append((rule_id, rule_data))
+        
+        if not guild_rules:
+            await interaction.response.send_message('No autoreply rules found for this server.', ephemeral=True)
+            return
+        
+        # Create embed with rule list
+        embed = discord.Embed(
+            title=f"Autoreply Rules ({len(guild_rules)})",
+            description=f"All autoreply rules for {interaction.guild.name}:",
+            color=0x00ff00
+        )
+        
+        for rule_id, rule_data in guild_rules[:10]:  # Limit to 10 rules to avoid embed limits
+            status = "✅ Enabled" if rule_data.get('enabled', True) else "❌ Disabled"
+            case_sensitive = "Yes" if rule_data.get('case_sensitive', False) else "No"
+            
+            trigger = rule_data.get('trigger_string', '')
+            reply = rule_data.get('reply_string', '')
+            
+            # Truncate long strings for display
+            if len(trigger) > 100:
+                trigger = trigger[:97] + "..."
+            if len(reply) > 100:
+                reply = reply[:97] + "..."
+                
+            embed.add_field(
+                name=f"Rule: {rule_id}",
+                value=f"**Status:** {status}\n**Trigger:** \"{trigger}\"\n**Reply:** \"{reply}\"\n**Case Sensitive:** {case_sensitive}",
+                inline=False
+            )
+        
+        if len(guild_rules) > 10:
+            embed.set_footer(text=f"Showing first 10 of {len(guild_rules)} rules. Use /autoreply remove to manage specific rules.")
+        
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        
+    except Exception as e:
+        logger.error('Error in autoreply_list_command: %s', e)
+        await interaction.response.send_message('An error occurred while listing autoreply rules.', ephemeral=True)
+
+async def autoreply_remove_command(interaction: discord.Interaction, rule_id: str):
+    """Remove an autoreply rule."""
+    try:
+        if not interaction.guild:
+            await interaction.response.send_message('This command can only be used in a server.', ephemeral=True)
+            return
+            
+        guild_id = interaction.guild.id
+        
+        if autoreplies_lock:
+            with autoreplies_lock:
+                if rule_id not in autoreplies:
+                    await interaction.response.send_message(f'Autoreply rule `{rule_id}` not found.', ephemeral=True)
+                    return
+                    
+                rule_data = autoreplies[rule_id]
+                if rule_data.get('guild_id') != guild_id:
+                    await interaction.response.send_message(f'Autoreply rule `{rule_id}` not found in this server.', ephemeral=True)
+                    return
+                    
+                trigger = rule_data.get('trigger_string', '')
+                del autoreplies[rule_id]
+                
+        if save_autoreplies():
+            await interaction.response.send_message(
+                f'✅ **Autoreply rule removed successfully!**\n'
+                f'**ID:** `{rule_id}`\n'
+                f'**Trigger:** "{trigger}"',
+                ephemeral=True
+            )
+            logger.info('Autoreply rule %s removed by user %s in guild %s', rule_id, interaction.user, guild_id)
+        else:
+            await interaction.response.send_message('Failed to save changes. Please try again.', ephemeral=True)
+            
+    except Exception as e:
+        logger.error('Error in autoreply_remove_command: %s', e)
+        await interaction.response.send_message('An error occurred while removing the autoreply rule.', ephemeral=True)
+
+async def autoreply_toggle_command(interaction: discord.Interaction, rule_id: str):
+    """Toggle an autoreply rule on/off."""
+    try:
+        if not interaction.guild:
+            await interaction.response.send_message('This command can only be used in a server.', ephemeral=True)
+            return
+            
+        guild_id = interaction.guild.id
+        
+        if autoreplies_lock:
+            with autoreplies_lock:
+                if rule_id not in autoreplies:
+                    await interaction.response.send_message(f'Autoreply rule `{rule_id}` not found.', ephemeral=True)
+                    return
+                    
+                rule_data = autoreplies[rule_id]
+                if rule_data.get('guild_id') != guild_id:
+                    await interaction.response.send_message(f'Autoreply rule `{rule_id}` not found in this server.', ephemeral=True)
+                    return
+                    
+                # Toggle the enabled status
+                current_status = rule_data.get('enabled', True)
+                new_status = not current_status
+                rule_data['enabled'] = new_status
+                
+                trigger = rule_data.get('trigger_string', '')
+                status_text = "enabled" if new_status else "disabled"
+                
+        if save_autoreplies():
+            await interaction.response.send_message(
+                f'✅ **Autoreply rule {status_text}!**\n'
+                f'**ID:** `{rule_id}`\n'
+                f'**Trigger:** "{trigger}"\n'
+                f'**Status:** {"✅ Enabled" if new_status else "❌ Disabled"}',
+                ephemeral=True
+            )
+            logger.info('Autoreply rule %s %s by user %s in guild %s', rule_id, status_text, interaction.user, guild_id)
+        else:
+            await interaction.response.send_message('Failed to save changes. Please try again.', ephemeral=True)
+            
+    except Exception as e:
+        logger.error('Error in autoreply_toggle_command: %s', e)
+        await interaction.response.send_message('An error occurred while toggling the autoreply rule.', ephemeral=True)
+
+def register_autoreply_commands():
+    """Register all autoreply commands."""
+    if tree is None:
+        return
+
+    # Create autoreply command group
+    autoreply_group = app_commands.Group(name='autoreply', description='Manage automatic reply rules')
+
+    @autoreply_group.command(name='add', description='Add a new autoreply rule')
+    @app_commands.describe(
+        trigger='The string to watch for in messages',
+        reply='The message to send when the trigger is found',
+        case_sensitive='Whether the trigger matching should be case sensitive (default: False)'
+    )
+    @app_commands.checks.has_role(MODERATOR_ROLE_NAME)
+    async def _autoreply_add(interaction: discord.Interaction, trigger: str, reply: str, case_sensitive: bool = False):
+        await autoreply_add_command(interaction, trigger, reply, case_sensitive)
+
+    @autoreply_group.command(name='list', description='List all autoreply rules for this server')
+    async def _autoreply_list(interaction: discord.Interaction):
+        await autoreply_list_command(interaction)
+
+    @autoreply_group.command(name='remove', description='Remove an autoreply rule')
+    @app_commands.describe(rule_id='The ID of the autoreply rule to remove')
+    @app_commands.checks.has_role(MODERATOR_ROLE_NAME)
+    async def _autoreply_remove(interaction: discord.Interaction, rule_id: str):
+        await autoreply_remove_command(interaction, rule_id)
+
+    @autoreply_group.command(name='toggle', description='Enable or disable an autoreply rule')
+    @app_commands.describe(rule_id='The ID of the autoreply rule to toggle')
+    @app_commands.checks.has_role(MODERATOR_ROLE_NAME)
+    async def _autoreply_toggle(interaction: discord.Interaction, rule_id: str):
+        await autoreply_toggle_command(interaction, rule_id)
+
+    # Add error handlers
+    _autoreply_add.on_error = autoreply_command_error
+    _autoreply_remove.on_error = autoreply_command_error
+    _autoreply_toggle.on_error = autoreply_command_error
+
+    # Add the group to the tree
+    tree.add_command(autoreply_group)
+
+async def autoreply_command_error(interaction: discord.Interaction, error):
+    """Handles errors for autoreply commands."""
+    last_log = get_last_log_line()
+    if isinstance(error, app_commands.errors.MissingRole):
+        await interaction.response.send_message(
+            f'You do not have the required role to use this command.\n\nLast log: {last_log}',
+            ephemeral=True
+        )
+    elif isinstance(error, discord.HTTPException):
+        logger.error('Discord API error: %s', error)
+        await interaction.response.send_message(
+            f'Discord API error occurred.\n\nLast log: {last_log}',
+            ephemeral=True
+        )
+    else:
+        logger.error('Error in autoreply command: %s', error)
+        await interaction.response.send_message(
+            f'Error: {error}\n\nLast log: {last_log}',
+            ephemeral=True
+        )

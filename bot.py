@@ -431,9 +431,19 @@ async def on_ready():  # pylint: disable=too-many-statements
 
 @bot.event
 async def on_message(message):
-    """Monitor messages in protected channels and delete non-moderator messages."""
+    """Monitor messages in protected channels and delete non-moderator messages. Also check for autoreply rules."""
     if message.author.bot:
         return
+    
+    # Check for autoreply rules first
+    try:
+        from commands import check_message_for_autoreplies  # pylint: disable=import-outside-toplevel
+        await check_message_for_autoreplies(message)
+    except (ImportError, AttributeError):
+        # Commands module may not be fully initialized yet
+        pass
+    except Exception as e:
+        logger.error('Error checking autoreply rules: %s', e)
     
     if message.channel.name in PROTECTED_CHANNELS:
         has_moderator_role = False
