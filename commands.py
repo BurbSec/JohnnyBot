@@ -1356,15 +1356,29 @@ async def pet_bot_command(interaction: discord.Interaction):
 async def bot_pick_fav_command(interaction: discord.Interaction, user1: discord.User, user2: discord.User):
     """See who the bot prefers today."""
     try:
-        # Check if either user is @everyone (which has the same ID as the guild)
-        if interaction.guild:
-            everyone_id = interaction.guild.id
-            if user1.id == everyone_id or user2.id == everyone_id:
-                await interaction.response.send_message(
-                    "Sorry, I can't pick favorites with @everyone! Please choose specific users.",
-                    ephemeral=True
-                )
-                return
+        # Defensive check against special mentions (though Discord's type system should prevent this)
+        if interaction.guild and (user1.id == interaction.guild.id or user2.id == interaction.guild.id):
+            await interaction.response.send_message(
+                "Sorry, I can't pick favorites with @everyone! Please choose specific users.",
+                ephemeral=True
+            )
+            return
+        
+        # Prevent the bot from mentioning itself
+        if interaction.client.user and (user1.id == interaction.client.user.id or user2.id == interaction.client.user.id):
+            await interaction.response.send_message(
+                "I can't pick myself as a favorite! Please choose other users.",
+                ephemeral=True
+            )
+            return
+        
+        # Prevent same user being used twice
+        if user1.id == user2.id:
+            await interaction.response.send_message(
+                "Please choose two different users!",
+                ephemeral=True
+            )
+            return
         
         bot_name = interaction.client.user.display_name if interaction.client.user else "the bot"
         # More efficient user selection and message formatting
