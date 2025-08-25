@@ -3488,7 +3488,6 @@ def register_update_checking_command():
 
 def load_autoreplies():
     """Load autoreply rules from file."""
-    global autoreplies
     if os.path.exists(AUTOREPLIES_FILE):
         try:
             with open(AUTOREPLIES_FILE, 'r', encoding='utf-8') as f:
@@ -3672,19 +3671,24 @@ async def autoreply_remove_command(interaction: discord.Interaction, rule_id: st
             
         guild_id = interaction.guild.id
         
-        if autoreplies_lock:
-            with autoreplies_lock:
-                if rule_id not in autoreplies:
-                    await interaction.response.send_message(f'Autoreply rule `{rule_id}` not found.', ephemeral=True)
-                    return
-                    
-                rule_data = autoreplies[rule_id]
-                if rule_data.get('guild_id') != guild_id:
-                    await interaction.response.send_message(f'Autoreply rule `{rule_id}` not found in this server.', ephemeral=True)
-                    return
-                    
-                trigger = rule_data.get('trigger_string', '')
-                del autoreplies[rule_id]
+        # Check if autoreplies system is available
+        if not autoreplies_lock:
+            await interaction.response.send_message('Autoreply system is not available. Please try again later.', ephemeral=True)
+            return
+        
+        trigger = ''
+        with autoreplies_lock:
+            if rule_id not in autoreplies:
+                await interaction.response.send_message(f'Autoreply rule `{rule_id}` not found.', ephemeral=True)
+                return
+                
+            rule_data = autoreplies[rule_id]
+            if rule_data.get('guild_id') != guild_id:
+                await interaction.response.send_message(f'Autoreply rule `{rule_id}` not found in this server.', ephemeral=True)
+                return
+                
+            trigger = rule_data.get('trigger_string', '')
+            del autoreplies[rule_id]
                 
         if save_autoreplies():
             await interaction.response.send_message(
@@ -3710,24 +3714,32 @@ async def autoreply_toggle_command(interaction: discord.Interaction, rule_id: st
             
         guild_id = interaction.guild.id
         
-        if autoreplies_lock:
-            with autoreplies_lock:
-                if rule_id not in autoreplies:
-                    await interaction.response.send_message(f'Autoreply rule `{rule_id}` not found.', ephemeral=True)
-                    return
-                    
-                rule_data = autoreplies[rule_id]
-                if rule_data.get('guild_id') != guild_id:
-                    await interaction.response.send_message(f'Autoreply rule `{rule_id}` not found in this server.', ephemeral=True)
-                    return
-                    
-                # Toggle the enabled status
-                current_status = rule_data.get('enabled', True)
-                new_status = not current_status
-                rule_data['enabled'] = new_status
+        # Check if autoreplies system is available
+        if not autoreplies_lock:
+            await interaction.response.send_message('Autoreply system is not available. Please try again later.', ephemeral=True)
+            return
+        
+        trigger = ''
+        status_text = 'unknown'
+        new_status = False
+        
+        with autoreplies_lock:
+            if rule_id not in autoreplies:
+                await interaction.response.send_message(f'Autoreply rule `{rule_id}` not found.', ephemeral=True)
+                return
                 
-                trigger = rule_data.get('trigger_string', '')
-                status_text = "enabled" if new_status else "disabled"
+            rule_data = autoreplies[rule_id]
+            if rule_data.get('guild_id') != guild_id:
+                await interaction.response.send_message(f'Autoreply rule `{rule_id}` not found in this server.', ephemeral=True)
+                return
+                
+            # Toggle the enabled status
+            current_status = rule_data.get('enabled', True)
+            new_status = not current_status
+            rule_data['enabled'] = new_status
+            
+            trigger = rule_data.get('trigger_string', '')
+            status_text = "enabled" if new_status else "disabled"
                 
         if save_autoreplies():
             await interaction.response.send_message(
