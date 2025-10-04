@@ -706,6 +706,13 @@ def register_commands():  # pylint: disable=too-many-locals,too-many-statements
     # Register update checking command
     register_update_checking_command()
     
+    # Register dashboard command
+    @tree.command(name='dashboard', description='Display a dashboard of all available commands grouped by category')
+    async def _dashboard(interaction: discord.Interaction):
+        await dashboard_command(interaction)
+    
+    _dashboard.on_error = dashboard_command_error
+    
     # Register autoreply commands
     register_autoreply_commands()
 
@@ -3756,6 +3763,187 @@ async def autoreply_toggle_command(interaction: discord.Interaction, rule_id: st
     except Exception as e:
         logger.error('Error in autoreply_toggle_command: %s', e)
         await interaction.response.send_message('An error occurred while toggling the autoreply rule.', ephemeral=True)
+
+# Dashboard state tracking for double confirmation
+dashboard_confirmations: Dict[int, int] = {}  # {user_id: confirmation_count}
+
+def get_command_categories():
+    """Get all commands organized by category."""
+    return {
+        "🔔 Reminder Management": [
+            "/set_reminder - Sets a reminder message to be sent at regular intervals",
+            "/list_reminders - Lists all current reminders",
+            "/delete_reminder - Deletes a reminder by title",
+            "/delete_all_reminders - Deletes all active reminders"
+        ],
+        "⚖️ Moderation": [
+            "/purge_last_messages - Purges a specified number of messages from a channel",
+            "/purge_string - Purges all messages containing a specific string",
+            "/purge_webhooks - Purges all messages sent by webhooks or apps",
+            "/kick - Kicks one or more members from the server",
+            "/kick_role - Kicks all members with a specified role",
+            "/timeout - Timeouts a member for a specified duration",
+            "/message_dump - Dump a user's messages into a downloadable file"
+        ],
+        "🔐 Permissions Management": [
+            "/clone_category_permissions - Clone permissions from source to destination category",
+            "/clone_channel_permissions - Clone permissions from source to destination channel",
+            "/clone_role_permissions - Clone permissions from source to destination role",
+            "/clear_category_permissions - Clear all permission overwrites from a category",
+            "/clear_channel_permissions - Clear all permission overwrites from a channel",
+            "/clear_role_permissions - Clear all permissions from a role",
+            "/sync_channel_perms - Sync all channels in a category with category permissions"
+        ],
+        "👥 Role Management": [
+            "/list_users_without_roles - Lists all users without any server role",
+            "/assign_role - Assigns a role to multiple users at once",
+            "/remove_role - Removes a role from multiple users at once"
+        ],
+        "🤖 Bot Interaction": [
+            "/bot_mood - Check on the bot's current mood",
+            "/pet_bot - Pet the bot",
+            "/bot_pick_fav - See who the bot prefers today",
+            "/botsay - Makes the bot send a message to a specified channel"
+        ],
+        "📅 Event Management": [
+            "/add_event_feed - Adds a calendar feed URL to check for events",
+            "/list_event_feeds - Lists all registered calendar feeds",
+            "/remove_event_feed - Removes a calendar feed"
+        ],
+        "⚙️ System & Utilities": [
+            "/log_tail - DM the last specified number of lines of the bot log",
+            "/voice_chaperone - Enable or disable voice channel chaperone functionality",
+            "/update_checking - Enable or disable automatic update checking",
+            "/dashboard - Display this command dashboard"
+        ],
+        "💬 Autoreply System": [
+            "/autoreply add - Add a new autoreply rule",
+            "/autoreply list - List all autoreply rules for this server",
+            "/autoreply remove - Remove an autoreply rule",
+            "/autoreply toggle - Enable or disable an autoreply rule"
+        ]
+    }
+
+def format_dashboard_message():
+    """Format the dashboard message with all commands grouped by category."""
+    categories = get_command_categories()
+    
+    message_parts = [
+        "# 📊 JohnnyBot Command Dashboard\n",
+        "*All available slash commands organized by category*\n",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    ]
+    
+    for category, commands in categories.items():
+        message_parts.append(f"## {category}\n")
+        for command in commands:
+            message_parts.append(f"• {command}\n")
+        message_parts.append("\n")
+    
+    message_parts.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
+    message_parts.append("*Use `/help <command>` for more details on any command*")
+    
+    return ''.join(message_parts)
+
+async def dashboard_command(interaction: discord.Interaction):
+    """Display the command dashboard with double confirmation."""
+    try:
+        user_id = interaction.user.id
+        
+        # Check current confirmation state
+        current_confirmations = dashboard_confirmations.get(user_id, 0)
+        
+        if current_confirmations == 0:
+            # First confirmation request
+            dashboard_confirmations[user_id] = 1
+            await interaction.response.send_message(
+                "⚠️ **WARNING: Large Dashboard Alert!** ⚠️\n\n"
+                "This will post a **massive dashboard** with all available commands to the current channel.\n\n"
+                "**Are you sure you want to continue?**\n"
+                "Type `/dashboard` again to confirm (1st confirmation)",
+                ephemeral=True
+            )
+            logger.info('Dashboard command - first confirmation requested by %s', interaction.user)
+            
+        elif current_confirmations == 1:
+            # Second confirmation request
+            dashboard_confirmations[user_id] = 2
+            await interaction.response.send_message(
+                "⚠️ **SECOND CONFIRMATION REQUIRED** ⚠️\n\n"
+                "You're about to post a large dashboard to this channel.\n"
+                "This action cannot be undone.\n\n"
+                "**Type `/dashboard` one more time to confirm and post** (2nd confirmation)\n"
+                "or wait 60 seconds to cancel automatically.",
+                ephemeral=True
+            )
+            logger.info('Dashboard command - second confirmation requested by %s', interaction.user)
+            
+            # Reset confirmation after 60 seconds
+            async def reset_confirmation():
+                await asyncio.sleep(60)
+                if dashboard_confirmations.get(user_id) == 2:
+                    dashboard_confirmations[user_id] = 0
+                    logger.info('Dashboard confirmation auto-reset for user %s', user_id)
+            
+            # Start the reset task
+            asyncio.create_task(reset_confirmation())
+            
+        elif current_confirmations == 2:
+            # Final confirmation - post the dashboard
+            dashboard_confirmations[user_id] = 0  # Reset
+            
+            # Defer the response since formatting might take a moment
+            await interaction.response.defer()
+            
+            # Format and send the dashboard
+            dashboard_message = format_dashboard_message()
+            
+            # Post to the channel (not ephemeral)
+            await interaction.channel.send(dashboard_message)
+            
+            # Send confirmation to user
+            await interaction.followup.send(
+                "✅ **Dashboard posted successfully!**\n"
+                "The command dashboard has been posted to this channel.",
+                ephemeral=True
+            )
+            
+            logger.info('Dashboard posted by %s in channel %s',
+                       interaction.user, interaction.channel.name if hasattr(interaction.channel, 'name') else 'DM')
+            
+    except discord.Forbidden:
+        await interaction.response.send_message(
+            "I don't have permission to post messages in this channel.",
+            ephemeral=True
+        )
+    except discord.HTTPException as e:
+        logger.error('Discord API error in dashboard_command: %s', e)
+        await interaction.response.send_message(
+            "A Discord API error occurred while posting the dashboard.",
+            ephemeral=True
+        )
+    except Exception as e:
+        logger.error('Unexpected error in dashboard_command: %s', e)
+        await interaction.response.send_message(
+            "An unexpected error occurred while posting the dashboard.",
+            ephemeral=True
+        )
+
+async def dashboard_command_error(interaction: discord.Interaction, error):
+    """Handles errors for the dashboard command."""
+    last_log = get_last_log_line()
+    if isinstance(error, discord.HTTPException):
+        logger.error('Discord API error: %s', error)
+        await interaction.response.send_message(
+            f'Discord API error occurred.\n\nLast log: {last_log}',
+            ephemeral=True
+        )
+    else:
+        logger.error('Error in dashboard command: %s', error)
+        await interaction.response.send_message(
+            f'Error: {error}\n\nLast log: {last_log}',
+            ephemeral=True
+        )
 
 def register_autoreply_commands():
     """Register all autoreply commands."""
