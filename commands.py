@@ -3846,7 +3846,7 @@ def format_dashboard_message():
     return ''.join(message_parts)
 
 async def dashboard_command(interaction: discord.Interaction):
-    """Display the command dashboard with double confirmation."""
+    """Display the command dashboard with confirmation."""
     try:
         user_id = interaction.user.id
         
@@ -3860,53 +3860,37 @@ async def dashboard_command(interaction: discord.Interaction):
                 "⚠️ **WARNING: Large Dashboard Alert!** ⚠️\n\n"
                 "This will post a **massive dashboard** with all available commands to the current channel.\n\n"
                 "**Are you sure you want to continue?**\n"
-                "Type `/dashboard` again to confirm (1st confirmation)",
+                "Type `/dashboard` again to confirm and post.",
                 ephemeral=True
             )
-            logger.info('Dashboard command - first confirmation requested by %s', interaction.user)
-            
-        elif current_confirmations == 1:
-            # Second confirmation request
-            dashboard_confirmations[user_id] = 2
-            await interaction.response.send_message(
-                "⚠️ **SECOND CONFIRMATION REQUIRED** ⚠️\n\n"
-                "You're about to post a large dashboard to this channel.\n"
-                "This action cannot be undone.\n\n"
-                "**Type `/dashboard` one more time to confirm and post** (2nd confirmation)\n"
-                "or wait 60 seconds to cancel automatically.",
-                ephemeral=True
-            )
-            logger.info('Dashboard command - second confirmation requested by %s', interaction.user)
+            logger.info('Dashboard command - confirmation requested by %s', interaction.user)
             
             # Reset confirmation after 60 seconds
             async def reset_confirmation():
                 await asyncio.sleep(60)
-                if dashboard_confirmations.get(user_id) == 2:
+                if dashboard_confirmations.get(user_id) == 1:
                     dashboard_confirmations[user_id] = 0
                     logger.info('Dashboard confirmation auto-reset for user %s', user_id)
             
             # Start the reset task
             asyncio.create_task(reset_confirmation())
             
-        elif current_confirmations == 2:
-            # Final confirmation - post the dashboard
+        elif current_confirmations == 1:
+            # Confirmed - post the dashboard
             dashboard_confirmations[user_id] = 0  # Reset
             
-            # Defer the response since formatting might take a moment
-            await interaction.response.defer()
+            # Respond to the interaction first
+            await interaction.response.send_message(
+                "✅ **Posting dashboard...**\n"
+                "The command dashboard is being posted to this channel.",
+                ephemeral=True
+            )
             
             # Format and send the dashboard
             dashboard_message = format_dashboard_message()
             
             # Post to the channel (not ephemeral)
             await interaction.channel.send(dashboard_message)
-            
-            # Send confirmation to user
-            await interaction.followup.send(
-                "✅ **Dashboard posted successfully!**\n"
-                "The command dashboard has been posted to this channel.",
-                ephemeral=True
-            )
             
             logger.info('Dashboard posted by %s in channel %s',
                        interaction.user, interaction.channel.name if hasattr(interaction.channel, 'name') else 'DM')
