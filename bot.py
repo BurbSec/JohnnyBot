@@ -399,7 +399,7 @@ async def on_ready():  # pylint: disable=too-many-statements
 
     try:
         from commands import event_feed  # pylint: disable=import-outside-toplevel
-        
+
         if event_feed:
             scheduler = getattr(event_feed, 'scheduler', None)
             if scheduler and not scheduler.running:
@@ -407,23 +407,30 @@ async def on_ready():  # pylint: disable=too-many-statements
                 if hasattr(event_feed, 'check_feeds'):
                     scheduler.add_job(
                         event_feed.check_feeds,
-                        trigger=IntervalTrigger(hours=1),
+                        trigger=IntervalTrigger(hours=24),
                         next_run_time=datetime.now()
                     )
-                    logger.info('Event feed scheduler started successfully')
+                    logger.info('Event feed scheduler started (24h interval)')
                 else:
                     logger.warning('Event feed check_feeds method not available')
-                
+
                 # Add daily update checking job
                 if UPDATE_CHECKING_ENABLED:
                     scheduler.add_job(
                         check_for_updates,
                         trigger=IntervalTrigger(hours=24),
-                        next_run_time=datetime.now() + timedelta(minutes=5)  # Start 5 minutes after bot startup
+                        next_run_time=datetime.now() + timedelta(minutes=5)
                     )
                     logger.info('Update checking scheduler started successfully')
             else:
                 logger.info('Event feed scheduler already running')
+
+            # Re-scan feeds on startup to reschedule pending announcements
+            try:
+                await event_feed.reschedule_announcements()
+                logger.info('Startup announcement re-scan complete')
+            except Exception as e:  # pylint: disable=broad-exception-caught
+                logger.error('Error rescheduling announcements on startup: %s', e)
         else:
             logger.warning('Event feed not available')
     except (AttributeError, ImportError, ValueError) as e:

@@ -5,3 +5,5 @@ requests>=2.32.0
 aiohttp>=3.8.0
 flask>=2.0.0
 waitress>=2.1.2
+feedparser>=6.0.0
+pytz>=2023.3
