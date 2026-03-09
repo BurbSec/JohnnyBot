@@ -2,10 +2,10 @@
 
 JohnnyBot does all of the stuff Discord bizarrely won't let you do!
 Designed to automate tons of server management and enforce some rules while
-you're at it. It provides features such as automatic role assignment, message
-deletion, and user management to ensure a smooth server experience. Most
-commands are limited to users with the MODERATOR_ROLE_NAME, however the
-PetBot commands can be leveraged by all users.
+you're at it. It provides features such as mass role management, message
+moderation, permissions cloning, and event feed integration to ensure a smooth
+server experience. Most commands are limited to users with the
+MODERATOR_ROLE_NAME, however the PetBot commands can be leveraged by all users.
 
 ## Documentation
 
@@ -18,13 +18,18 @@ PetBot commands can be leveraged by all users.
 
 ## Key Features
 
-- **Command-based Moderation** - Slash commands for member and message management
-- **Voice Channel Chaperone** - Automatic safety monitoring for voice channels
+- **Command-based Moderation** - Slash commands for kicking, timing out, purging messages (by count, string match, or webhook), and archiving user messages
+- **Permissions Management** - Clone, clear, and sync permissions across categories, channels, and roles
+- **Role Management** - Mass assign/remove roles, list users without roles
+- **Voice Channel Chaperone** - Automatic safety monitoring for voice channels with configurable adult/child role detection
 - **Reminder System** - Recurring reminders with persistent scheduling
-- **Event Feed Integration** - Calendar feed notifications and Discord events
-- **Message Archive** - User message dumps with temporary download links
-- **Channel Write Protection** - Enforce read-only channels
-- **PetBot Interactions** - Fun bot interactions for all users
+- **Event Feed Integration** - Subscribe to iCal and RSS feeds (including Meetup.com); auto-detect feed type; configurable display options for description, location, and link; optional Mon/Thu 10 AM Central announcements; automatic Discord Event creation
+- **Autoreply System** - Automatic message replies based on configurable trigger strings with case sensitivity options
+- **Message Archive** - User message dumps with temporary download links hosted via built-in web server
+- **Channel Write Protection** - Enforce read-only channels for non-moderators
+- **Update Checking** - Automatic daily check for new commits on GitHub with moderator notifications
+- **Dashboard** - Display all available commands grouped by category with double-confirmation
+- **PetBot Interactions** - Fun bot interactions (mood check, petting, favorites) for all users
 
 ## Quick Start
 
@@ -48,9 +53,9 @@ PetBot commands can be leveraged by all users.
 
 ## Requirements
 
-- **Python 3.7+** (tested up to 3.13)
+- **Python 3.8+** (tested up to 3.13)
 - **Dependencies:** Listed in [`requirements.txt`](requirements.txt)
-- **Network:** TCP port 80 access for message archive hosting
+- **Network:** TCP port access for message archive hosting (auto-selects a free port)
 
 ## Contributing
 
