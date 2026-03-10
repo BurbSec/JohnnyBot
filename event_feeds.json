@@ -1,0 +1,22 @@
+{
+  "713431283056771084": {
+    "https://www.meetup.com/burbsec/events/ical/": {
+      "name": "Burbsec",
+      "last_checked": "2026-03-10T15:55:44.564649",
+      "channel": "\ud83d\udc6f\u30fblocal_event_notices",
+      "posted_events": [
+        "event_312453481@meetup.com",
+        "event_313711311@meetup.com",
+        "event_311413714@meetup.com",
+        "event_313303429@meetup.com",
+        "event_312736165@meetup.com",
+        "event_312784589@meetup.com"
+      ],
+      "feed_type": "ical",
+      "show_description": false,
+      "show_location": true,
+      "show_link": true,
+      "announce": true
+    }
+  }
+}

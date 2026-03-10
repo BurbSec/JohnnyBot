@@ -11,6 +11,7 @@ from datetime import datetime, time, timedelta
 from typing import TypeVar
 
 from apscheduler.triggers.interval import IntervalTrigger
+from apscheduler.triggers.cron import CronTrigger
 
 import aiohttp
 import discord
@@ -404,33 +405,47 @@ async def on_ready():  # pylint: disable=too-many-statements
             scheduler = getattr(event_feed, 'scheduler', None)
             if scheduler and not scheduler.running:
                 scheduler.start()
-                if hasattr(event_feed, 'check_feeds'):
-                    scheduler.add_job(
-                        event_feed.check_feeds,
-                        trigger=IntervalTrigger(hours=24),
-                        next_run_time=datetime.now()
-                    )
-                    logger.info('Event feed scheduler started (24h interval)')
-                else:
-                    logger.warning('Event feed check_feeds method not available')
 
-                # Add daily update checking job
+                # Feed check: weekly Monday 10am Central
+                if hasattr(event_feed, 'check_feeds_job'):
+                    scheduler.add_job(
+                        event_feed.check_feeds_job,
+                        trigger=CronTrigger(
+                            day_of_week='mon', hour=10,
+                            minute=0,
+                            timezone='America/Chicago'),
+                        id='weekly_feed_check',
+                        replace_existing=True
+                    )
+                    logger.info(
+                        'Feed check scheduled: Monday 10am CT')
+
+                # Announce: Mon + Thu 10am Central
+                if hasattr(event_feed, 'announce_weekly_events'):
+                    scheduler.add_job(
+                        event_feed.announce_weekly_events,
+                        trigger=CronTrigger(
+                            day_of_week='mon,thu', hour=10,
+                            minute=0,
+                            timezone='America/Chicago'),
+                        id='weekly_announce',
+                        replace_existing=True
+                    )
+                    logger.info(
+                        'Announce scheduled: Mon+Thu 10am CT')
+
+                # Daily update checking
                 if UPDATE_CHECKING_ENABLED:
                     scheduler.add_job(
                         check_for_updates,
                         trigger=IntervalTrigger(hours=24),
-                        next_run_time=datetime.now() + timedelta(minutes=5)
+                        next_run_time=(
+                            datetime.now() + timedelta(minutes=5))
                     )
-                    logger.info('Update checking scheduler started successfully')
+                    logger.info(
+                        'Update checking scheduler started')
             else:
                 logger.info('Event feed scheduler already running')
-
-            # Re-scan feeds on startup to reschedule pending announcements
-            try:
-                await event_feed.reschedule_announcements()
-                logger.info('Startup announcement re-scan complete')
-            except Exception as e:  # pylint: disable=broad-exception-caught
-                logger.error('Error rescheduling announcements on startup: %s', e)
         else:
             logger.warning('Event feed not available')
     except (AttributeError, ImportError, ValueError) as e:

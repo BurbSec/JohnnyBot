@@ -23,7 +23,8 @@ MODERATOR_ROLE_NAME, however the PetBot commands can be leveraged by all users.
 - **Role Management** - Mass assign/remove roles, list users without roles
 - **Voice Channel Chaperone** - Automatic safety monitoring for voice channels with configurable adult/child role detection
 - **Reminder System** - Recurring reminders with persistent scheduling
-- **Event Feed Integration** - Subscribe to iCal and RSS feeds (including Meetup.com); auto-detect feed type; configurable display options for description, location, and link; optional Mon/Thu 10 AM Central announcements; automatic Discord Event creation
+- **Event Feed Integration** - Subscribe to iCal and RSS feeds (including Meetup.com); auto-detect feed type; configurable display of description, location, and link; automatic Discord Event creation with duplicate detection; weekly Monday 10am CT feed checks; feeds persist across restarts
+- **Event Announcements** - Independent `/event_announce` command posts this week's Discord Events to a channel every Mon & Thu at 10am CT; works with or without feeds
 - **Autoreply System** - Automatic message replies based on configurable trigger strings with case sensitivity options
 - **Message Archive** - User message dumps with temporary download links hosted via built-in web server
 - **Channel Write Protection** - Enforce read-only channels for non-moderators
