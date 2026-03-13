@@ -28,6 +28,7 @@ from config import (
     VOICE_CHAPERONE_ENABLED,
     UPDATE_CHECKING_ENABLED,
     UPDATE_CHECK_REPO_URL,
+    BOT_TIMEZONE,
     logger
 )
 
@@ -180,15 +181,9 @@ async def check_for_updates():
 async def send_update_notification(local_commit, remote_commit):
     """Send update notification to the moderators channel."""
     try:
-        # Find the moderators channel
-        moderators_channel = None
-        for guild in bot.guilds:
-            for channel in guild.text_channels:
-                if channel.name == MODERATORS_CHANNEL_NAME:
-                    moderators_channel = channel
-                    break
-            if moderators_channel:
-                break
+        moderators_channel = next(
+            (ch for g in bot.guilds for ch in g.text_channels
+             if ch.name == MODERATORS_CHANNEL_NAME), None)
         
         if not moderators_channel:
             logger.error("Moderators channel '%s' not found", MODERATORS_CHANNEL_NAME)
@@ -283,31 +278,38 @@ if os.path.exists(REMINDERS_FILE):
 def check_reminders() -> None:
     """Background task to check and send due reminders."""
     while True:
-        now = time_module.time()
-        with reminders_lock:
-            for channel_id, reminder_data in reminders.items():
-                if now >= reminder_data['next_trigger']:
-                    try:
-                        channel = cache.get_channel(channel_id)
-                        if channel:
-                            asyncio.run_coroutine_threadsafe(
-                                channel.send(f"**{reminder_data['title']}**\n{reminder_data['message']}"),
-                                bot.loop
-                            )
-                        reminder_data['next_trigger'] = now + reminder_data['interval']
-                    except discord.HTTPException as e:
-                        logger.error("Failed to send reminder %s due to Discord API "
-                                   "error: %s", reminder_data['title'], e)
-                    except (OSError, IOError) as e:
-                        logger.error("Failed to send reminder %s due to file access "
-                                   "error: %s", reminder_data['title'], e)
+        try:
+            dirty = False
+            now = time_module.time()
+            with reminders_lock:
+                for channel_id, reminder_data in reminders.items():
+                    if now >= reminder_data['next_trigger']:
+                        try:
+                            channel = cache.get_channel(channel_id)
+                            if channel:
+                                asyncio.run_coroutine_threadsafe(
+                                    channel.send(f"**{reminder_data['title']}**\n{reminder_data['message']}"),
+                                    bot.loop
+                                )
+                            reminder_data['next_trigger'] = now + reminder_data['interval']
+                            dirty = True
+                        except discord.HTTPException as e:
+                            logger.error("Failed to send reminder %s due to Discord API "
+                                       "error: %s", reminder_data['title'], e)
+                        except (OSError, IOError) as e:
+                            logger.error("Failed to send reminder %s due to file access "
+                                       "error: %s", reminder_data['title'], e)
 
-        with reminders_lock:
-            try:
-                with open(REMINDERS_FILE, 'w', encoding='utf-8') as reminder_file:
-                    json.dump(reminders, reminder_file)
-            except (OSError, IOError) as e:
-                logger.error("Failed to save reminders: %s", e)
+            if dirty and reminders:
+                with reminders_lock:
+                    try:
+                        with open(REMINDERS_FILE, 'w', encoding='utf-8') as reminder_file:
+                            json.dump(reminders, reminder_file)
+                    except (OSError, IOError) as e:
+                        logger.error("Failed to save reminders: %s", e)
+
+        except Exception as e:  # pylint: disable=broad-exception-caught
+            logger.error("Unexpected error in reminder checker: %s", e)
 
         time_module.sleep(60)
 
@@ -335,7 +337,7 @@ async def on_ready():  # pylint: disable=too-many-statements
     """
     # Using protected member _ready_ran is necessary to track initialization state
     # This prevents duplicate initialization when the on_ready event fires multiple times
-    if hasattr(bot, '_ready_ran') and getattr(bot, '_ready_ran', False):
+    if getattr(bot, '_ready_ran', False):
         return
     setattr(bot, '_ready_ran', True)
 
@@ -413,7 +415,7 @@ async def on_ready():  # pylint: disable=too-many-statements
                         trigger=CronTrigger(
                             day_of_week='mon', hour=10,
                             minute=0,
-                            timezone='America/Chicago'),
+                            timezone=BOT_TIMEZONE),
                         id='weekly_feed_check',
                         replace_existing=True
                     )
@@ -427,7 +429,7 @@ async def on_ready():  # pylint: disable=too-many-statements
                         trigger=CronTrigger(
                             day_of_week='mon,thu', hour=10,
                             minute=0,
-                            timezone='America/Chicago'),
+                            timezone=BOT_TIMEZONE),
                         id='weekly_announce',
                         replace_existing=True
                     )
@@ -468,13 +470,9 @@ async def on_message(message):
         logger.error('Error checking autoreply rules: %s', e)
     
     if message.channel.name in PROTECTED_CHANNELS:
-        has_moderator_role = False
-        if hasattr(message.author, 'roles'):
-            for role in message.author.roles:
-                if role.name == MODERATOR_ROLE_NAME:
-                    has_moderator_role = True
-                    break
-        
+        has_moderator_role = any(
+            role.name == MODERATOR_ROLE_NAME
+            for role in getattr(message.author, 'roles', []))
         if not has_moderator_role:
             try:
                 await message.delete()
@@ -495,27 +493,12 @@ async def on_message(message):
     await bot.process_commands(message)
 
 def get_user_role_type(member):
-    """Determine if a user is an adult, child, or neither based on their roles.
-    
-    Args:
-        member: Discord member object
-        
-    Returns:
-        str: 'adult', 'child', or 'neither'
-    """
-    if not hasattr(member, 'roles'):
-        return 'neither'
-    
-    user_role_names = [role.name for role in member.roles]
-    
-    for adult_role in ADULT_ROLE_NAMES:
-        if adult_role in user_role_names:
-            return 'adult'
-    
-    for child_role in CHILD_ROLE_NAMES:
-        if child_role in user_role_names:
-            return 'child'
-    
+    """Determine if a user is an adult, child, or neither based on their roles."""
+    role_names = {role.name for role in getattr(member, 'roles', [])}
+    if role_names & set(ADULT_ROLE_NAMES):
+        return 'adult'
+    if role_names & set(CHILD_ROLE_NAMES):
+        return 'child'
     return 'neither'
 
 async def check_voice_channel_safety(channel):  # pylint: disable=too-many-branches
@@ -557,11 +540,9 @@ async def check_voice_channel_safety(channel):  # pylint: disable=too-many-branc
                     logger.error('Failed to mute %s: %s', member.display_name, e)
         
         try:
-            moderators_channel = None
-            for guild_channel in channel.guild.channels:
-                if guild_channel.name == MODERATORS_CHANNEL_NAME:
-                    moderators_channel = guild_channel
-                    break
+            moderators_channel = discord.utils.get(
+                channel.guild.text_channels,
+                name=MODERATORS_CHANNEL_NAME)
             
             if moderators_channel:
                 alert_message = (

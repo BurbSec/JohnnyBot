@@ -20,6 +20,9 @@ CHILD_ROLE_NAMES = ['Kids', 'Bambinos', 'Girls']
 UPDATE_CHECKING_ENABLED = True  # Set to False to disable automatic update checking
 UPDATE_CHECK_REPO_URL = "https://github.com/BurbSec/JohnnyBot"
 
+# Timezone for scheduled jobs and event announcements
+BOT_TIMEZONE = 'America/Chicago'
+
 # The IP of the interface which will host downloadable archives
 HOST_IP = "0.0.0.0"
 
