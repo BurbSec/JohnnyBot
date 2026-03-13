@@ -849,15 +849,13 @@ class EventFeed:  # pylint: disable=too-few-public-methods,too-many-public-metho
                 location[:100] if location
                 else "See event details")
 
-            # entity_type is auto-inferred as external when location
-            # is provided (discord.py 2.5+); privacy_level removed
-            # as guild_only is the only option and default in 2.7+
             discord_event = await guild.create_scheduled_event(
                 name=name,
                 description=description,
                 start_time=start_time,
                 end_time=end_time,
                 location=event_location,
+                entity_type=discord.EntityType.external,
             )
 
             logger.info(

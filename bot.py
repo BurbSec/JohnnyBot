@@ -129,81 +129,119 @@ def get_time_based_message(bot_name: str = "BOTNAME"):
     selected_message = random.choice(message_list)
     return selected_message.replace("BOTNAME", bot_name)
 
+_last_notified_commit = None
+
+def _parse_repo_from_url(url):
+    """Extract 'owner/repo' from a GitHub URL."""
+    url = url.rstrip('/')
+    parts = url.split('github.com/')
+    if len(parts) == 2:
+        return parts[1].removesuffix('.git')
+    return None
+
 async def check_for_updates():
     """Check for updates from the GitHub repository by comparing commit hashes."""
+    global _last_notified_commit
     if not UPDATE_CHECKING_ENABLED:
         return
-    
-    try:
-        # Get the current local commit hash
-        try:
-            result = subprocess.run(
-                ['git', 'rev-parse', 'HEAD'],
-                capture_output=True,
-                text=True,
-                cwd=os.path.dirname(__file__),
-                check=False
-            )
-            if result.returncode != 0:
-                logger.error("Failed to get local git commit hash: %s", result.stderr)
-                return
-            local_commit = result.stdout.strip()
-        except (subprocess.SubprocessError, OSError) as e:
-            logger.error("Error getting local git commit: %s", e)
-            return
-        
-        # Get the latest commit hash from GitHub API
-        try:
-            api_url = UPDATE_CHECK_REPO_URL.replace("github.com", "api.github.com/repos") + "/commits/main"
-            
-            async with aiohttp.ClientSession() as session:
-                async with session.get(api_url, timeout=aiohttp.ClientTimeout(total=30)) as response:
-                    if response.status != 200:
-                        logger.error("Failed to fetch remote commit info: HTTP %s", response.status)
-                        return
-                    
-                    data = await response.json()
-                    remote_commit = data['sha']
-        except (aiohttp.ClientError, KeyError, ValueError) as e:
-            logger.error("Error fetching remote git commit: %s", e)
-            return
-        
-        # Compare commits
-        if local_commit != remote_commit:
-            logger.info("Update available: local=%s, remote=%s", local_commit[:8], remote_commit[:8])
-            await send_update_notification(local_commit, remote_commit)
-        else:
-            logger.info("Bot is up to date: %s", local_commit[:8])
-            
-    except (subprocess.SubprocessError, aiohttp.ClientError, OSError) as e:
-        logger.error("Error in check_for_updates: %s", e)
 
-async def send_update_notification(local_commit, remote_commit):
+    # Get the current local commit hash
+    try:
+        result = subprocess.run(
+            ['git', 'rev-parse', 'HEAD'],
+            capture_output=True,
+            text=True,
+            cwd=os.path.dirname(__file__),
+            check=False
+        )
+        if result.returncode != 0:
+            logger.error("Failed to get local git commit hash: %s", result.stderr)
+            return
+        local_commit = result.stdout.strip()
+    except (subprocess.SubprocessError, OSError) as e:
+        logger.error("Error getting local git commit: %s", e)
+        return
+
+    # Build API URL from repo URL
+    repo_path = _parse_repo_from_url(UPDATE_CHECK_REPO_URL)
+    if not repo_path:
+        logger.error("Could not parse repo from URL: %s", UPDATE_CHECK_REPO_URL)
+        return
+
+    # Get the latest commit hash and check if config.py changed
+    try:
+        timeout = aiohttp.ClientTimeout(total=30)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            # Fetch latest commit
+            api_url = f"https://api.github.com/repos/{repo_path}/commits/main"
+            async with session.get(api_url) as response:
+                if response.status != 200:
+                    logger.error("Failed to fetch remote commit info: HTTP %s", response.status)
+                    return
+                data = await response.json()
+                remote_commit = data['sha']
+
+            # Skip if up to date or already notified for this commit
+            if local_commit == remote_commit:
+                logger.info("Bot is up to date: %s", local_commit[:8])
+                return
+            if remote_commit == _last_notified_commit:
+                logger.info("Already notified for commit %s, skipping", remote_commit[:8])
+                return
+
+            # Check if config.py was changed between local and remote
+            compare_url = f"https://api.github.com/repos/{repo_path}/compare/{local_commit}...{remote_commit}"
+            async with session.get(compare_url) as response:
+                config_changed = False
+                if response.status == 200:
+                    compare_data = await response.json()
+                    changed_files = [f['filename'] for f in compare_data.get('files', [])]
+                    config_changed = 'config.py' in changed_files
+                else:
+                    logger.warning("Failed to fetch commit comparison: HTTP %s", response.status)
+    except (aiohttp.ClientError, KeyError, ValueError) as e:
+        logger.error("Error fetching remote git info: %s", e)
+        return
+
+    logger.info("Update available: local=%s, remote=%s", local_commit[:8], remote_commit[:8])
+    _last_notified_commit = remote_commit
+    await send_update_notification(local_commit, remote_commit, config_changed)
+
+async def send_update_notification(local_commit, remote_commit, config_changed=False):
     """Send update notification to the moderators channel."""
     try:
         moderators_channel = next(
             (ch for g in bot.guilds for ch in g.text_channels
              if ch.name == MODERATORS_CHANNEL_NAME), None)
-        
+
         if not moderators_channel:
             logger.error("Moderators channel '%s' not found", MODERATORS_CHANNEL_NAME)
             return
-        
-        # Create update message
-        message = (
-            "🤖 **Bot Update Available!**\n\n"
-            f"A new version of JohnnyBot is available on GitHub.\n"
-            f"Current version: `{local_commit[:8]}`\n"
-            f"Latest version: `{remote_commit[:8]}`\n\n"
-            f"**To update:**\n"
-            f"1. Run `git pull` from the bot directory on the server\n"
-            f"2. Restart the bot service\n\n"
-            f"Repository: {UPDATE_CHECK_REPO_URL}"
-        )
-        
+
+        if config_changed:
+            message = (
+                "⚠️ **Breaking Changes in New Version**\n\n"
+                f"`config.py` has been modified in the latest update.\n"
+                f"Current version: `{local_commit[:8]}`\n"
+                f"Latest version: `{remote_commit[:8]}`\n\n"
+                f"**Please update manually** — review the config changes before pulling.\n\n"
+                f"Repository: {UPDATE_CHECK_REPO_URL}"
+            )
+        else:
+            message = (
+                "🤖 **Bot Update Available!**\n\n"
+                f"A new version of JohnnyBot is available on GitHub.\n"
+                f"Current version: `{local_commit[:8]}`\n"
+                f"Latest version: `{remote_commit[:8]}`\n\n"
+                f"**To update:**\n"
+                f"1. Run `git pull` from the bot directory on the server\n"
+                f"2. Restart the bot service\n\n"
+                f"Repository: {UPDATE_CHECK_REPO_URL}"
+            )
+
         await moderators_channel.send(message)
         logger.info("Update notification sent to %s", moderators_channel.name)
-        
+
     except (discord.HTTPException, discord.Forbidden) as e:
         logger.error("Error sending update notification: %s", e)
 
