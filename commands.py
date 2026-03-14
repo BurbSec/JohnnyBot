@@ -437,11 +437,19 @@ class EventFeed:  # pylint: disable=too-few-public-methods,too-many-public-metho
 
         return new_events
 
+    @staticmethod
+    def _strip_urls(text: str) -> str:
+        """Remove URLs from a string and clean up extra whitespace."""
+        cleaned = re.sub(r'https?://\S+', '', text)
+        cleaned = re.sub(r'\s{2,}', ' ', cleaned)
+        return cleaned.strip().rstrip(',').strip()
+
     def _extract_ical_event(self, component) -> Optional[Dict[str, Any]]:
         """Extract event details from an iCal VEVENT component."""
         summary = str(component.get('summary', 'No Title'))
         description = str(component.get('description', ''))
-        location = str(component.get('location', ''))
+        location = self._strip_urls(
+            str(component.get('location', '')))
         url = str(component.get('url', ''))
         uid = str(component.get('uid', ''))
 
@@ -616,6 +624,8 @@ class EventFeed:  # pylint: disable=too-few-public-methods,too-many-public-metho
                 location = loc_name
         elif isinstance(location_data, str):
             location = location_data
+
+        location = self._strip_urls(location)
 
         # Parse dates
         start_str = data.get('startDate', '')
