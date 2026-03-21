@@ -1777,7 +1777,7 @@ async def set_reminder_callback(interaction: discord.Interaction,
         'title': title,
         'message': message,
         'interval': interval,
-        'next_trigger': time_module.time() + interval
+        'next_trigger': time_module.time()  # Fire immediately, then repeat on interval
     }
     reminders[channel.id] = reminder_data
     await asyncio.to_thread(_atomic_json_write, REMINDERS_FILE, dict(reminders))
