@@ -18,7 +18,7 @@ from config import (
     MODERATORS_CHANNEL_NAME,
     ADULT_ROLE_NAMES,
     CHILD_ROLE_NAMES,
-    VOICE_CHAPERONE_ENABLED,
+
     UPDATE_CHECKING_ENABLED,
     UPDATE_CHECK_REPO_URL,
     BOT_TIMEZONE,
@@ -373,12 +373,6 @@ async def check_voice_channel_safety(channel):  # pylint: disable=too-many-branc
                 
         except discord.HTTPException as e:
             logger.error('Failed to send alert to moderators channel: %s', e)
-
-@bot.event
-async def on_guild_channel_create(channel):
-    """Handle when a new channel is created - join voice channels automatically."""
-    if isinstance(channel, discord.VoiceChannel):
-        logger.info('New voice channel created: %s', channel.name)
 
 @bot.event
 async def on_voice_state_update(member, before, after):
