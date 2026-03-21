@@ -2,8 +2,8 @@
 CLAUDE.md
 .claude/
 
-# Local config (copy from config_example.py)
-config.py
+# Local config (copy from config_example.txt)
+config.txt
 
 # Runtime data files
 reminders.json
