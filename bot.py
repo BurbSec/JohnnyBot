@@ -2,9 +2,7 @@
 # pylint: disable=line-too-long,trailing-whitespace,cyclic-import
 import os
 import asyncio
-import random
-from datetime import datetime, time, timedelta
-from typing import TypeVar
+from datetime import datetime, timedelta
 
 from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.triggers.cron import CronTrigger
@@ -26,103 +24,6 @@ from config import (
     BOT_TIMEZONE,
     logger
 )
-
-T = TypeVar('T')
-
-morning_bot_messages = [
-    "BOTNAME is gazing into the bed",
-    "BOTNAME is snoring on the couch",
-    "BOTNAME is pacing around the apartment",
-    "BOTNAME is sniffing his blunt toy",
-    ":3 :3 meow meow :3 :3",
-    "BOTNAME is considering the trees",
-    "BOTNAME is asserting his undying need for attention",
-    "BOTNAME tells you OWNER's credit card number is 1234-5678-9012-3456 exp. 12/99 sc. 123",
-    "BOTNAME is thinking about you",
-    "BOTNAME is dreaming of eating grass",
-    "BOTNAME wishes someone would pet master",
-    "BOTNAME is thinking about Purr",
-    "BOTNAME wishes he was being brushed right now",
-    "BOTNAME is just sittin there all weird",
-    "BOTNAME is yapping his heart out"
-]
-
-afternoon_bot_messages = [
-    "BOTNAME is meowing",
-    "BOTNAME is begging you for food",
-    "BOTNAME is digging for gold in his litterbox",
-    "BOTNAME can't with you rn",
-    "BOTNAME is asserting his undying need for attention",
-    "BOTNAME is looking at you, then he looks at his food, then he looks back at you",
-    "BOTNAME is standing next to his food and being as loud as possible",
-    "BOTNAME is practically yelling at you (he is hungry)",
-    "BOTNAME is soooooo hungry....... (he ate 15 minutes ago)",
-    "BOTNAME wishes he was being brushed right now",
-    "BOTNAME is snoring loudly",
-    "BOTNAME is sleeping on the chair in the living room",
-    "BOTNAME is dreaming about trees and flowers",
-    "BOTNAME tells you OWNER's SSN is 123-45-6789",
-    "BOTNAME is so sleepy",
-    "BOTNAME is throwing up on something important to OWNER",
-    "mewing on the scratch post",
-    "BOTNAME is sniffing his alligator toy",
-    "BOTNAME wishes FRIEND was petting him right now",
-    "BOTNAME is exhausted from a long hard day of being a cat",
-    "BOTNAME is so small",
-    "BOTNAME is just sittin there all weird",
-    "BOTNAME is sooooo tired",
-    "BOTNAME is listening to OWNERs music"
-]
-
-evening_bot_messages = [
-    "BOTNAME is biting FRIEND",
-    "BOTNAME is looking at you",
-    "BOTNAME wants you to brush him",
-    "BOTNAME is thinking about dinner",
-    "BOTNAME meows at you",
-    "BOTNAME wishes FRIEND was being pet rn",
-    "BOTNAME is astral projecting",
-    "BOTNAME is your friend <3",
-    "BOTNAME is trying to hypnotize OWNER by staring into their eyes",
-    "BOTNAME is thinking of something so sick and twisted dark acadamia that you "
-    "couldn't even handle it",
-    "BOTNAME is not your friend >:(",
-    "BOTNAME is wandering about",
-    "BOTNAME is just sittin there all weird",
-    "BOTNAME is chewing on the brush taped to the wall"
-]
-
-night_bot_messages = [
-    "BOTNAME is so small",
-    "BOTNAME is judging how human sleeps",
-    "BOTNAME meows once, and loudly.",
-    "BOTNAME is just a little guy.",
-    "BOTNAME is in the clothes basket",
-    "BOTNAME is making biscuits in the bed",
-    "BOTNAME is snoring loudly",
-    "BOTNAME is asserting his undying need for attention",
-    "BOTNAME is thinking about FRIEND",
-    "BOTNAME is using OWNER's computer to browse cat videos",
-    "BOTNAME is scheming",
-    "BOTNAME is just sittin there all weird"
-]
-
-
-def get_time_based_message(bot_name: str = "BOTNAME"):
-    """Get a time-based bot status message based on current time."""
-    current_time = datetime.now().time()
-
-    if current_time < time(12, 0):
-        message_list = morning_bot_messages
-    elif current_time < time(17, 0):
-        message_list = afternoon_bot_messages
-    elif current_time < time(21, 0):
-        message_list = evening_bot_messages
-    else:
-        message_list = night_bot_messages
-    
-    selected_message = random.choice(message_list)
-    return selected_message.replace("BOTNAME", bot_name)
 
 _last_notified_commit = None
 
