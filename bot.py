@@ -2,11 +2,7 @@
 # pylint: disable=line-too-long,trailing-whitespace,cyclic-import
 import os
 import asyncio
-import json
 import random
-import subprocess
-import threading
-import time as time_module
 from datetime import datetime, time, timedelta
 from typing import TypeVar
 
@@ -19,7 +15,6 @@ from discord.ext import commands
 
 from config import (
     TOKEN,
-    REMINDERS_FILE,
     PROTECTED_CHANNELS,
     MODERATOR_ROLE_NAME,
     MODERATORS_CHANNEL_NAME,
@@ -145,20 +140,20 @@ async def check_for_updates():
     if not UPDATE_CHECKING_ENABLED:
         return
 
-    # Get the current local commit hash
+    # Get the current local commit hash (async to avoid blocking event loop)
     try:
-        result = subprocess.run(
-            ['git', 'rev-parse', 'HEAD'],
-            capture_output=True,
-            text=True,
-            cwd=os.path.dirname(__file__),
-            check=False
+        proc = await asyncio.create_subprocess_exec(
+            'git', 'rev-parse', 'HEAD',
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=os.path.dirname(__file__)
         )
-        if result.returncode != 0:
-            logger.error("Failed to get local git commit hash: %s", result.stderr)
+        stdout, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            logger.error("Failed to get local git commit hash: %s", stderr.decode())
             return
-        local_commit = result.stdout.strip()
-    except (subprocess.SubprocessError, OSError) as e:
+        local_commit = stdout.decode().strip()
+    except OSError as e:
         logger.error("Error getting local git commit: %s", e)
         return
 
@@ -245,51 +240,6 @@ async def send_update_notification(local_commit, remote_commit, config_changed=F
     except (discord.HTTPException, discord.Forbidden) as e:
         logger.error("Error sending update notification: %s", e)
 
-class DiscordCache:
-    """Simple in-memory cache for Discord objects."""
-    def __init__(self):
-        self._channels = {}
-        self._roles = {}
-        self._members = {}
-        self._lock = threading.Lock()
-
-    def get_channel(self, channel_id):
-        """Get a Discord channel by ID, caching the result."""
-        with self._lock:
-            if channel_id not in self._channels:
-                if bot is not None:
-                    self._channels[channel_id] = bot.get_channel(channel_id)
-                else:
-                    logger.error("Bot not initialized when trying to get channel %s", channel_id)
-                    return None
-            return self._channels[channel_id]
-
-    def get_role(self, guild, role_id):
-        """Get a Discord role by ID, caching the result."""
-        with self._lock:
-            if role_id not in self._roles:
-                self._roles[role_id] = guild.get_role(role_id)
-            return self._roles[role_id]
-
-    def get_member(self, guild, member_id):
-        """Get a Discord member by ID, caching the result."""
-        with self._lock:
-            if member_id not in self._members:
-                self._members[member_id] = guild.get_member(member_id)
-            return self._members[member_id]
-
-    def clear(self):
-        """Clear all cached objects."""
-        with self._lock:
-            self._channels.clear()
-            self._roles.clear()
-            self._members.clear()
-
-cache = DiscordCache()
-reminders = {}
-reminders_lock = threading.Lock()
-
-
 intents = discord.Intents.default()
 intents.message_content = True
 intents.guilds = True
@@ -298,73 +248,7 @@ intents.voice_states = True
 
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-setattr(bot, 'reminder_thread', None)
 setattr(bot, '_ready_ran', False)
-setattr(bot, 'reminder_check_task', None)
-
-if os.path.exists(REMINDERS_FILE):
-    try:
-        with open(REMINDERS_FILE, 'r', encoding='utf-8') as f:
-            reminders.update(json.load(f))
-            for reminder in reminders.values():
-                if 'next_trigger' not in reminder:
-                    reminder['next_trigger'] = time_module.time() + reminder['interval']
-    except (OSError, IOError) as e:
-        logger.error('Failed to read reminders file: %s', e)
-
-
-def check_reminders() -> None:
-    """Background task to check and send due reminders."""
-    while True:
-        try:
-            dirty = False
-            now = time_module.time()
-            with reminders_lock:
-                for channel_id, reminder_data in reminders.items():
-                    if now >= reminder_data['next_trigger']:
-                        try:
-                            channel = cache.get_channel(channel_id)
-                            if channel:
-                                asyncio.run_coroutine_threadsafe(
-                                    channel.send(f"**{reminder_data['title']}**\n{reminder_data['message']}"),
-                                    bot.loop
-                                )
-                            reminder_data['next_trigger'] = now + reminder_data['interval']
-                            dirty = True
-                        except discord.HTTPException as e:
-                            logger.error("Failed to send reminder %s due to Discord API "
-                                       "error: %s", reminder_data['title'], e)
-                        except (OSError, IOError) as e:
-                            logger.error("Failed to send reminder %s due to file access "
-                                       "error: %s", reminder_data['title'], e)
-
-            if dirty and reminders:
-                with reminders_lock:
-                    try:
-                        with open(REMINDERS_FILE, 'w', encoding='utf-8') as reminder_file:
-                            json.dump(reminders, reminder_file)
-                    except (OSError, IOError) as e:
-                        logger.error("Failed to save reminders: %s", e)
-
-        except Exception as e:  # pylint: disable=broad-exception-caught
-            logger.error("Unexpected error in reminder checker: %s", e)
-
-        time_module.sleep(60)
-
-def start_reminder_checker() -> None:
-    """Start the background reminder checker thread.
-    
-    Creates and starts a daemon thread that periodically checks for due reminders.
-    """
-    reminder_thread = getattr(bot, 'reminder_thread', None)
-    if not hasattr(bot, "reminder_thread") or reminder_thread is None or not reminder_thread.is_alive():
-        new_thread = threading.Thread(
-            target=check_reminders,
-            daemon=True,
-            name="ReminderChecker"
-        )
-        setattr(bot, 'reminder_thread', new_thread)
-        new_thread.start()
 
 @bot.event
 async def on_ready():  # pylint: disable=too-many-statements
@@ -386,8 +270,6 @@ async def on_ready():  # pylint: disable=too-many-statements
     registered_commands = bot.tree.get_commands()
     logger.info('Pre-sync commands: %s', [cmd.name for cmd in registered_commands])
 
-    start_reminder_checker()
-
     async def sync_commands():
         """Synchronize application commands with Discord.
         
@@ -407,14 +289,6 @@ async def on_ready():  # pylint: disable=too-many-statements
 
                 synced = await bot.tree.sync()
                 logger.info('Synced %d global commands', len(synced))
-
-                for guild in bot.guilds:
-                    try:
-                        synced = await bot.tree.sync(guild=guild)
-                        logger.info('Synced %d commands to guild %s',
-                                   len(synced), guild.id)
-                    except discord.HTTPException as e:
-                        logger.error('Failed to sync guild %s: %s', guild.id, e)
 
                 registered = await bot.tree.fetch_commands()
                 if not registered:
@@ -439,16 +313,16 @@ async def on_ready():  # pylint: disable=too-many-statements
         logger.error('Final command sync failure: %s', e)
 
     try:
-        from commands import event_feed  # pylint: disable=import-outside-toplevel
+        from commands import event_feed, register_all_reminder_jobs  # pylint: disable=import-outside-toplevel
 
         if event_feed:
-            scheduler = getattr(event_feed, 'scheduler', None)
-            if scheduler and not scheduler.running:
-                scheduler.start()
+            sched = getattr(event_feed, 'scheduler', None)
+            if sched and not sched.running:
+                sched.start()
 
                 # Feed check: weekly Monday 10am Central
                 if hasattr(event_feed, 'check_feeds_job'):
-                    scheduler.add_job(
+                    sched.add_job(
                         event_feed.check_feeds_job,
                         trigger=CronTrigger(
                             day_of_week='mon', hour=10,
@@ -462,7 +336,7 @@ async def on_ready():  # pylint: disable=too-many-statements
 
                 # Announce: Mon + Thu 10am Central
                 if hasattr(event_feed, 'announce_weekly_events'):
-                    scheduler.add_job(
+                    sched.add_job(
                         event_feed.announce_weekly_events,
                         trigger=CronTrigger(
                             day_of_week='mon,thu', hour=10,
@@ -476,7 +350,7 @@ async def on_ready():  # pylint: disable=too-many-statements
 
                 # Daily update checking
                 if UPDATE_CHECKING_ENABLED:
-                    scheduler.add_job(
+                    sched.add_job(
                         check_for_updates,
                         trigger=IntervalTrigger(hours=24),
                         next_run_time=(
@@ -484,6 +358,9 @@ async def on_ready():  # pylint: disable=too-many-statements
                     )
                     logger.info(
                         'Update checking scheduler started')
+
+                # Register all persisted reminders as scheduler jobs
+                register_all_reminder_jobs()
             else:
                 logger.info('Event feed scheduler already running')
         else:
@@ -533,9 +410,9 @@ async def on_message(message):
 def get_user_role_type(member):
     """Determine if a user is an adult, child, or neither based on their roles."""
     role_names = {role.name for role in getattr(member, 'roles', [])}
-    if role_names & set(ADULT_ROLE_NAMES):
+    if role_names & ADULT_ROLE_NAMES:
         return 'adult'
-    if role_names & set(CHILD_ROLE_NAMES):
+    if role_names & CHILD_ROLE_NAMES:
         return 'child'
     return 'neither'
 
@@ -623,13 +500,6 @@ async def on_voice_state_update(member, before, after):
     
     for channel in channels_to_check:
         await check_voice_channel_safety(channel)
-
-@bot.event
-async def on_disconnect():
-    """Clean up resources when bot disconnects."""
-    reminder_check_task = getattr(bot, "reminder_check_task", None)
-    if hasattr(bot, "reminder_check_task") and reminder_check_task is not None and not reminder_check_task.done():
-        reminder_check_task.cancel()
 
 from commands import setup_commands  # pylint: disable=wrong-import-position
 setup_commands(bot)

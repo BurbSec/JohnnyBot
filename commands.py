@@ -5,6 +5,7 @@ import re
 import html
 import random
 import time as time_module
+import tempfile
 import threading
 import asyncio
 import json
@@ -13,6 +14,7 @@ import socket
 import shutil
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any
+from apscheduler.triggers.interval import IntervalTrigger
 import discord
 from discord import app_commands
 import aiohttp
@@ -21,6 +23,10 @@ import pytz
 from icalendar import Calendar
 from flask import Flask, send_file
 from waitress import serve
+try:
+    from dateutil import parser as dateparser
+except ImportError:
+    dateparser = None
 from config import (
     MODERATOR_ROLE_NAME,
     LOG_FILE,
@@ -31,6 +37,22 @@ from config import (
     logger
 )
 
+def _atomic_json_write(filepath, data):
+    """Write JSON data atomically via temp file + os.replace to prevent corruption."""
+    dir_name = os.path.dirname(filepath) or '.'
+    fd, tmp_path = tempfile.mkstemp(dir=dir_name, suffix='.tmp')
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp_path, filepath)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
 # Autoreply system file path
 AUTOREPLIES_FILE = os.path.join(os.path.dirname(__file__), 'autoreplies.json')
 # Event feeds file path
@@ -38,14 +60,18 @@ FEEDS_FILE = os.path.join(os.path.dirname(__file__), 'event_feeds.json')
 # Event announce config file path
 ANNOUNCE_FILE = os.path.join(os.path.dirname(__file__), 'event_announce.json')
 
+# Cached timezone object — avoid recreating on every use
+CENTRAL_TZ = pytz.timezone(BOT_TIMEZONE)
+
 
 def get_last_log_line():
     """Get the last line from the log file."""
     try:
+        from collections import deque
         with open(LOG_FILE, 'r', encoding='utf-8') as log_file:
-            lines = log_file.readlines()
-            if lines:
-                return lines[-1].strip()
+            last = deque(log_file, maxlen=1)
+            if last:
+                return last[0].strip()
             return "No log entries found"
     except (OSError, IOError) as e:
         logger.error('Failed to read log file for last line: %s', e)
@@ -129,6 +155,7 @@ class EventFeed:  # pylint: disable=too-few-public-methods,too-many-public-metho
         self.running = True
         self.scheduler: Optional[Any] = None  # Will be set in setup_commands
         self.announce_configs: Dict[int, str] = {}  # {guild_id: channel_name}
+        self._feeds_lock = threading.Lock()
         self._load_feeds()
         self._load_announce_config()
 
@@ -181,30 +208,29 @@ class EventFeed:  # pylint: disable=too-few-public-methods,too-many-public-metho
             serializable = {
                 str(gid): ch
                 for gid, ch in self.announce_configs.items()}
-            with open(ANNOUNCE_FILE, 'w', encoding='utf-8') as f:
-                json.dump(serializable, f, indent=2)
+            _atomic_json_write(ANNOUNCE_FILE, serializable)
         except (OSError, IOError) as e:
             logger.error("Failed to save announce config: %s", e)
 
     def save_feeds(self):
         """Save feed subscriptions to disk."""
-        try:
-            # Convert sets to lists, datetimes to ISO strings
-            serializable = {}
-            for gid, feeds in self.feeds.items():
-                serializable[str(gid)] = {}
-                for url, data in feeds.items():
-                    d = dict(data)
-                    d['posted_events'] = list(
-                        d.get('posted_events', set()))
-                    if isinstance(d.get('last_checked'), datetime):
-                        d['last_checked'] = (
-                            d['last_checked'].isoformat())
-                    serializable[str(gid)][url] = d
-            with open(FEEDS_FILE, 'w', encoding='utf-8') as f:
-                json.dump(serializable, f, indent=2)
-        except (OSError, IOError) as e:
-            logger.error("Failed to save feeds file: %s", e)
+        with self._feeds_lock:
+            try:
+                # Convert sets to lists, datetimes to ISO strings
+                serializable = {}
+                for gid, feeds in self.feeds.items():
+                    serializable[str(gid)] = {}
+                    for url, data in feeds.items():
+                        d = dict(data)
+                        d['posted_events'] = list(
+                            d.get('posted_events', set()))
+                        if isinstance(d.get('last_checked'), datetime):
+                            d['last_checked'] = (
+                                d['last_checked'].isoformat())
+                        serializable[str(gid)][url] = d
+                _atomic_json_write(FEEDS_FILE, serializable)
+            except (OSError, IOError) as e:
+                logger.error("Failed to save feeds file: %s", e)
 
     # ── Feed type detection ──────────────────────────────────────────
 
@@ -313,25 +339,37 @@ class EventFeed:  # pylint: disable=too-few-public-methods,too-many-public-metho
             logger.info("No feeds registered, nothing to check")
             return results
 
+        # Build list of feed check tasks and run them concurrently
+        async def _check_one(guild, url, feed_data):
+            fname = feed_data.get('name', url)
+            try:
+                count = await self._check_single_feed(
+                    guild, url, feed_data)
+                return ('ok', fname, count)
+            except Exception as e:
+                logger.error("Error checking feed %s: %s",
+                             url, e)
+                return ('error', fname, str(e))
+
+        tasks = []
         for guild_id, feeds in self.feeds.items():
             guild = self.bot.get_guild(guild_id)
             if not guild:
                 results['errors'].append(
                     f"Guild {guild_id} not found")
                 continue
-
             for url, feed_data in feeds.items():
-                fname = feed_data.get('name', url)
-                try:
-                    count = await self._check_single_feed(
-                        guild, url, feed_data)
-                    results['feeds_checked'] += 1
-                    results['events_posted'] += count
-                except Exception as e:
-                    logger.error("Error checking feed %s: %s",
-                                 url, e)
-                    results['errors'].append(
-                        f"{fname}: {str(e)}")
+                tasks.append(_check_one(guild, url, feed_data))
+
+        for result in await asyncio.gather(*tasks, return_exceptions=True):
+            if isinstance(result, Exception):
+                results['errors'].append(str(result))
+            elif result[0] == 'ok':
+                results['feeds_checked'] += 1
+                results['events_posted'] += result[2]
+            else:
+                results['errors'].append(
+                    f"{result[1]}: {result[2]}")
 
         logger.info(
             "Feed check complete: %d feeds, %d events posted, "
@@ -339,6 +377,9 @@ class EventFeed:  # pylint: disable=too-few-public-methods,too-many-public-metho
             results['feeds_checked'],
             results['events_posted'],
             len(results['errors']))
+
+        # Persist all feed state changes in one write
+        self.save_feeds()
 
         return results
 
@@ -498,6 +539,16 @@ class EventFeed:  # pylint: disable=too-few-public-methods,too-many-public-metho
         new_events = []
 
         # Single shared session for feed + all page scrapes
+        # Use semaphore to limit concurrent scrapes and avoid rate limiting
+        scrape_sem = asyncio.Semaphore(3)
+
+        async def _scrape_with_limit(session, link, rss_uid):
+            async with scrape_sem:
+                result = await self._scrape_event_page(
+                    session, link, rss_uid)
+                await asyncio.sleep(0.3)  # Brief pause per scrape
+                return rss_uid, result
+
         async with aiohttp.ClientSession(
             headers={'User-Agent': 'Mozilla/5.0'},
             timeout=aiohttp.ClientTimeout(total=30)
@@ -509,20 +560,32 @@ class EventFeed:  # pylint: disable=too-few-public-methods,too-many-public-metho
 
             parsed_feed = feedparser.parse(text)
 
+            # Collect entries to scrape, skipping already-posted
+            entries_to_scrape = []
             for entry in parsed_feed.get('entries', []):
                 link = getattr(entry, 'link', '')
                 rss_uid = getattr(entry, 'id', '') or link
                 if not rss_uid:
                     continue
+                entries_to_scrape.append((link, rss_uid))
 
-                # Scrape event page using shared session
-                event = await self._scrape_event_page(
-                    session, link, rss_uid)
+            # Scrape all pages concurrently with semaphore
+            scrape_tasks = [
+                _scrape_with_limit(session, link, rss_uid)
+                for link, rss_uid in entries_to_scrape
+            ]
+            scrape_results = await asyncio.gather(
+                *scrape_tasks, return_exceptions=True)
+
+            for result in scrape_results:
+                if isinstance(result, Exception):
+                    logger.error("Error scraping RSS entry: %s", result)
+                    continue
+                rss_uid, event = result
                 if not event:
                     continue
 
                 # Build a composite uid from the RSS id + start date
-                # so recurring events with updated dates get re-posted
                 sd = event['start_date']
                 sd_str = sd.strftime('%Y-%m-%d')
                 composite_uid = f"{rss_uid}|{sd_str}"
@@ -542,9 +605,6 @@ class EventFeed:  # pylint: disable=too-few-public-methods,too-many-public-metho
                     continue
 
                 new_events.append(event)
-
-                # Rate limit: 1 second between page scrapes
-                await asyncio.sleep(1.0)
 
         return new_events
 
@@ -597,11 +657,6 @@ class EventFeed:  # pylint: disable=too-few-public-methods,too-many-public-metho
     def _parse_jsonld_event(self, data: dict, url: str,
                             uid: str) -> Optional[Dict[str, Any]]:
         """Parse a JSON-LD Event object into our event dict."""
-        try:
-            from dateutil import parser as dateparser  # pylint: disable=import-outside-toplevel
-        except ImportError:
-            dateparser = None
-
         summary = data.get('name', 'No Title')
         description = self._strip_html_tags(
             data.get('description', ''))
@@ -699,7 +754,7 @@ class EventFeed:  # pylint: disable=too-few-public-methods,too-many-public-metho
 
         feed_data['last_checked'] = datetime.now()
         feed_data['posted_events'] = posted_events
-        self.save_feeds()
+        # save_feeds() is called once per check_feeds_job run, not per feed
 
         # Immediately announce this-week events if enabled
         if (guild.id in self.announce_configs
@@ -718,7 +773,7 @@ class EventFeed:  # pylint: disable=too-few-public-methods,too-many-public-metho
         # Delay to let Discord register new events
         await asyncio.sleep(3)
 
-        central_tz = pytz.timezone(BOT_TIMEZONE)
+        central_tz = CENTRAL_TZ
         now = datetime.now(central_tz)
         ws_naive = (
             now - timedelta(days=now.weekday())
@@ -893,7 +948,7 @@ class EventFeed:  # pylint: disable=too-few-public-methods,too-many-public-metho
         Runs every Monday and Thursday at 10am Central.
         Uses independent announce_configs (not feed-dependent).
         """
-        central_tz = pytz.timezone(BOT_TIMEZONE)
+        central_tz = CENTRAL_TZ
         now = datetime.now(central_tz)
 
         ws_naive = (
@@ -950,7 +1005,7 @@ class EventFeed:  # pylint: disable=too-few-public-methods,too-many-public-metho
         """Post a single Discord Event announcement with URL preview."""
         try:
             start = scheduled_event.start_time
-            central_tz = pytz.timezone(BOT_TIMEZONE)
+            central_tz = CENTRAL_TZ
             if start.tzinfo:
                 start = start.astimezone(central_tz)
 
@@ -997,13 +1052,71 @@ class EventFeed:  # pylint: disable=too-few-public-methods,too-many-public-metho
 
 bot_instance: Optional[Any] = None  # Renamed to avoid redefining name from outer scope
 tree: Optional[Any] = None
+scheduler: Optional[Any] = None  # APScheduler instance, set in setup_commands
 reminders: Dict[int, Dict[str, Any]] = {}
-reminders_lock: Optional[threading.Lock] = None
-reminder_threads: Dict[int, Any] = {}
 event_feed: Optional[EventFeed] = None
 message_dump_servers: Dict[str, Any] = {}  # Store active message dump servers
 autoreplies: Dict[str, Dict[str, Any]] = {}  # Store autoreply rules {rule_id: rule_data}
 autoreplies_lock: Optional[threading.Lock] = None
+
+
+def _load_reminders():
+    """Load reminders from disk into the module-level reminders dict."""
+    if not os.path.exists(REMINDERS_FILE):
+        return
+    try:
+        with open(REMINDERS_FILE, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        import time as _time
+        for key, reminder in data.items():
+            if 'next_trigger' not in reminder:
+                reminder['next_trigger'] = _time.time() + reminder['interval']
+            reminders[int(key) if key.isdigit() else key] = reminder
+        logger.info("Loaded %d reminders from disk", len(reminders))
+    except (OSError, IOError, json.JSONDecodeError) as e:
+        logger.error('Failed to read reminders file: %s', e)
+
+
+async def _fire_reminder(channel_id: int, title: str, message: str, interval: int):
+    """APScheduler callback: send a reminder message."""
+    channel = bot_instance.get_channel(channel_id) if bot_instance else None
+    if channel:
+        try:
+            await channel.send(f"**{title}**\n{message}")
+        except discord.HTTPException as e:
+            logger.error("Failed to send reminder '%s': %s", title, e)
+    else:
+        logger.warning("Reminder channel %s not found, skipping '%s'", channel_id, title)
+
+
+def _schedule_reminder(channel_id: int, reminder_data: dict):
+    """Register (or replace) an APScheduler job for one reminder."""
+    if not scheduler or not scheduler.running:
+        logger.warning("Scheduler not running, cannot schedule reminder for channel %s", channel_id)
+        return
+    job_id = f"reminder_{channel_id}"
+    next_trigger = reminder_data.get('next_trigger', time_module.time() + reminder_data['interval'])
+    next_run = datetime.fromtimestamp(next_trigger)
+    interval = reminder_data['interval']
+    scheduler.add_job(
+        _fire_reminder,
+        trigger=IntervalTrigger(seconds=interval),
+        args=[channel_id, reminder_data['title'], reminder_data['message'], interval],
+        id=job_id,
+        replace_existing=True,
+        next_run_time=next_run,
+        misfire_grace_time=min(interval, 3600),
+        coalesce=True,
+    )
+
+
+def register_all_reminder_jobs():
+    """Re-register all persisted reminders as APScheduler jobs. Called after scheduler.start()."""
+    for channel_id, reminder_data in reminders.items():
+        _schedule_reminder(channel_id, reminder_data)
+    if reminders:
+        logger.info("Registered %d reminder jobs with scheduler", len(reminders))
+
 
 class MessageDumpServer:  # pylint: disable=too-many-instance-attributes
     """Manages a temporary web server for hosting message dump files."""
@@ -1053,34 +1166,46 @@ class MessageDumpServer:  # pylint: disable=too-many-instance-attributes
     
     def start(self):
         """Start the web server in a separate thread."""
+        self._waitress_server = None
+
         def run_server():
-            serve(self.app, host=self.host_ip, port=self.port)
-        
+            # Use create_server + run so we can close it gracefully
+            from waitress import create_server
+            self._waitress_server = create_server(self.app, host=self.host_ip, port=self.port)
+            self._waitress_server.run()
+
         self.server_thread = threading.Thread(target=run_server, daemon=True)
         self.server_thread.start()
-        
+
         # Set up shutdown timer
         self.shutdown_timer = threading.Timer(self.duration, self.cleanup)
         self.shutdown_timer.start()
-        
+
         return f"http://{self.host_ip}:{self.port}"
-    
+
     def cleanup(self):
         """Clean up resources when the server is shut down."""
+        # Stop the waitress server gracefully
+        try:
+            if self._waitress_server is not None:
+                self._waitress_server.close()
+        except Exception:  # pylint: disable=broad-exception-caught
+            logger.warning("Could not gracefully stop waitress server on port %s", self.port)
+
         try:
             if os.path.exists(self.file_path):
                 os.remove(self.file_path)
             if os.path.exists(self.zip_path):
                 os.remove(self.zip_path)
-            
+
             parent_dir = os.path.dirname(self.file_path)
             if os.path.exists(parent_dir) and not os.listdir(parent_dir):
                 os.rmdir(parent_dir)
-                
+
             logger.info("Cleaned up message dump files: %s, %s", self.file_path, self.zip_path)
         except (OSError, IOError) as e:
             logger.error("Error cleaning up message dump files: %s", e)
-        
+
         # Use list() to avoid modifying dict during iteration
         for key, server in list(message_dump_servers.items()):
             if server is self:
@@ -1102,7 +1227,6 @@ def register_commands():  # pylint: disable=too-many-locals,too-many-statements
                 await interaction.response.send_message('There are no reminders set.',
                                                        ephemeral=True)
                 return
-
             reminder_list = '\n'.join(
                 f"**{reminder['title']}**: {reminder['message']} "
                 f"(every {reminder['interval']} seconds)"
@@ -1460,28 +1584,27 @@ def setup_commands(bot_param):
     """Initialize command module with bot instance and register commands."""
     # Using globals is necessary here to initialize module-level variables
     # pylint: disable=global-statement
-    global bot_instance, tree, reminders, reminders_lock, reminder_threads, event_feed, message_dump_servers, autoreplies, autoreplies_lock  # pylint: disable=line-too-long
+    global bot_instance, tree, scheduler, reminders, event_feed, message_dump_servers, autoreplies, autoreplies_lock  # pylint: disable=line-too-long
     bot_instance = bot_param
     if bot_instance:
         tree = bot_instance.tree
-    from bot import cache  # pylint: disable=import-outside-toplevel,unused-import
     reminders = {}
-    reminders_lock = threading.Lock()
-    reminder_threads = {}
     event_feed = EventFeed(bot_instance)
     message_dump_servers = {}
     autoreplies = {}
     autoreplies_lock = threading.Lock()
-    
+
+    # Load existing reminders from disk
+    _load_reminders()
+
     # Load existing autoreply rules
     load_autoreplies()
 
-    from apscheduler.schedulers.asyncio import AsyncIOScheduler
-    # This attribute is defined outside __init__ because it depends on an import
-    # that should happen at function level to avoid circular imports
-    # pylint: disable=attribute-defined-outside-init
+    from apscheduler.schedulers.asyncio import AsyncIOScheduler  # pylint: disable=import-outside-toplevel
+    # Shared scheduler for event feeds and reminders
     if event_feed:
         event_feed.scheduler = AsyncIOScheduler()
+        scheduler = event_feed.scheduler
 
     # Clear existing commands before registering new ones
     try:
@@ -1540,17 +1663,16 @@ async def set_reminder_callback(interaction: discord.Interaction,
                                message: str, interval: int):
     """Callback for the set_reminder command."""
     validate_reminder_interval(interval)
-    if reminders_lock:
-        with reminders_lock:
-            reminders[channel.id] = {
-                'channel_id': channel.id,
-                'title': title,
-                'message': message,
-                'interval': interval,
-                'next_trigger': time_module.time() + interval
-            }
-            with open(REMINDERS_FILE, 'w', encoding='utf-8') as reminder_file:
-                json.dump(reminders, reminder_file)
+    reminder_data = {
+        'channel_id': channel.id,
+        'title': title,
+        'message': message,
+        'interval': interval,
+        'next_trigger': time_module.time() + interval
+    }
+    reminders[channel.id] = reminder_data
+    await asyncio.to_thread(_atomic_json_write, REMINDERS_FILE, dict(reminders))
+    _schedule_reminder(channel.id, reminder_data)
 
     await interaction.response.send_message(
         f'Reminder set in {channel.mention} every {interval} seconds.', ephemeral=True)
@@ -1558,41 +1680,44 @@ async def set_reminder_callback(interaction: discord.Interaction,
 
 async def delete_all_reminders(interaction: discord.Interaction) -> None:
     """Delete all active reminders."""
-    if reminders_lock:
-        with reminders_lock:
-            reminders.clear()
-            for stop_event in reminder_threads.values():
-                stop_event.set()
-            reminder_threads.clear()
-            try:
-                with open(REMINDERS_FILE, 'w', encoding='utf-8') as reminder_file:
-                    json.dump(reminders, reminder_file)
-            except (OSError, IOError) as e:
-                logger.error('Failed to write reminders file: %s', e)
-                await interaction.response.send_message('Failed to delete reminders due to file access error.', ephemeral=True)
-                return
+    for channel_id in list(reminders.keys()):
+        try:
+            if scheduler:
+                scheduler.remove_job(f"reminder_{channel_id}")
+        except Exception:  # pylint: disable=broad-exception-caught
+            pass
+    reminders.clear()
+    try:
+        await asyncio.to_thread(_atomic_json_write, REMINDERS_FILE, dict(reminders))
+    except (OSError, IOError) as e:
+        logger.error('Failed to write reminders file: %s', e)
+        await interaction.response.send_message('Failed to delete reminders due to file access error.', ephemeral=True)
+        return
     await interaction.response.send_message('All reminders have been deleted.', ephemeral=True)
 
 async def delete_reminder(interaction: discord.Interaction, title: str) -> None:
     """Deletes a reminder by title."""
     try:
-        if reminders_lock:
-            with reminders_lock:
-                for channel_id, reminder_data in reminders.items():
-                    if reminder_data['title'] == title:
-                        del reminders[channel_id]
-                        if channel_id in reminder_threads:
-                            reminder_threads[channel_id].set()
-                            del reminder_threads[channel_id]
-                        try:
-                            with open(REMINDERS_FILE, 'w', encoding='utf-8') as reminder_file:
-                                json.dump(reminders, reminder_file)
-                        except (OSError, IOError) as e:
-                            logger.error('Failed to write reminders file: %s', e)
-                            await interaction.response.send_message('Failed to delete reminder due to file access error.', ephemeral=True)
-                            return
-                        await interaction.response.send_message(f'Reminder titled "{title}" has been deleted.', ephemeral=True)
-                        return
+        found_channel_id = None
+        for channel_id, reminder_data in list(reminders.items()):
+            if reminder_data['title'] == title:
+                found_channel_id = channel_id
+                break
+        if found_channel_id is not None:
+            del reminders[found_channel_id]
+            try:
+                if scheduler:
+                    scheduler.remove_job(f"reminder_{found_channel_id}")
+            except Exception:  # pylint: disable=broad-exception-caught
+                pass
+            try:
+                await asyncio.to_thread(_atomic_json_write, REMINDERS_FILE, dict(reminders))
+            except (OSError, IOError) as e:
+                logger.error('Failed to write reminders file: %s', e)
+                await interaction.response.send_message('Failed to delete reminder due to file access error.', ephemeral=True)
+                return
+            await interaction.response.send_message(f'Reminder titled "{title}" has been deleted.', ephemeral=True)
+        else:
             await interaction.response.send_message(f'No reminder found with the title "{title}".', ephemeral=True)
     except (discord.HTTPException, OSError, IOError) as e:
         logger.error('Error deleting reminder: %s', e)
@@ -1827,8 +1952,9 @@ timeout_error = _command_error_handler
 async def log_tail_command(interaction: discord.Interaction, lines: int):
     """DM the last specified number of lines of the bot log to the user."""
     try:
+        from collections import deque
         with open(LOG_FILE, 'r', encoding='utf-8') as log_file:
-            last_lines = ''.join(log_file.readlines()[-lines:])
+            last_lines = ''.join(deque(log_file, maxlen=lines))
         if last_lines:
             await interaction.user.send(f'```{last_lines}```')
             await interaction.response.send_message('Log lines sent to your DMs.', ephemeral=True)
@@ -3990,8 +4116,7 @@ def save_autoreplies():
     if autoreplies_lock:
         with autoreplies_lock:
             try:
-                with open(AUTOREPLIES_FILE, 'w', encoding='utf-8') as f:
-                    json.dump(autoreplies, f, indent=2)
+                _atomic_json_write(AUTOREPLIES_FILE, autoreplies)
             except (OSError, IOError) as e:
                 logger.error('Failed to save autoreplies: %s', e)
                 return False
