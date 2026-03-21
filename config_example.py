@@ -1,6 +1,9 @@
 """Configuration settings for the Discord bot.
 
-This module contains all configuration variables, constants, and setup for logging.
+Copy this file to config.py and edit the values for your deployment:
+    cp config_example.py config.py
+
+config.py is gitignored, so your customizations won't conflict with git pull.
 """
 # pylint: disable=cyclic-import
 import os

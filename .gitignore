@@ -2,6 +2,17 @@
 CLAUDE.md
 .claude/
 
+# Local config (copy from config_example.py)
+config.py
+
+# Runtime data files
+reminders.json
+event_feeds.json
+event_announce.json
+autoreplies.json
+johnnybot.log
+temp/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
