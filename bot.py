@@ -92,7 +92,7 @@ async def check_for_updates():
                 if response.status == 200:
                     compare_data = await response.json()
                     changed_files = [f['filename'] for f in compare_data.get('files', [])]
-                    config_changed = 'config_example.txt' in changed_files
+                    config_changed = 'config.py' in changed_files
                 else:
                     logger.warning("Failed to fetch commit comparison: HTTP %s", response.status)
     except (aiohttp.ClientError, KeyError, ValueError) as e:
@@ -117,8 +117,7 @@ async def send_update_notification(local_commit, remote_commit, config_changed=F
         if config_changed:
             message = (
                 "⚠️ **Breaking Changes in New Version**\n\n"
-                f"`config_example.txt` has been modified in the latest update.\n"
-                f"You may need to update your `config.txt` with the new settings.\n"
+                f"`config.py` has been modified in the latest update.\n"
                 f"Current version: `{local_commit[:8]}`\n"
                 f"Latest version: `{remote_commit[:8]}`\n\n"
                 f"**Please update manually** — review the config changes before pulling.\n\n"

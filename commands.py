@@ -1181,19 +1181,10 @@ async def _fire_reminder(channel_id: int, title: str, message: str, interval: in
     if channel:
         try:
             await channel.send(f"**{title}**\n{message}")
-            logger.info("Reminder '%s' sent to #%s", title, channel.name)
         except discord.HTTPException as e:
             logger.error("Failed to send reminder '%s': %s", title, e)
     else:
         logger.warning("Reminder channel %s not found, skipping '%s'", channel_id, title)
-
-    # Persist next_trigger so reminders survive restarts
-    if channel_id in reminders:
-        reminders[channel_id]['next_trigger'] = time_module.time() + interval
-        try:
-            await asyncio.to_thread(_atomic_json_write, REMINDERS_FILE, dict(reminders))
-        except (OSError, IOError) as e:
-            logger.error("Failed to persist reminder next_trigger: %s", e)
 
 
 def _schedule_reminder(channel_id: int, reminder_data: dict):
@@ -1215,8 +1206,6 @@ def _schedule_reminder(channel_id: int, reminder_data: dict):
         misfire_grace_time=min(interval, 3600),
         coalesce=True,
     )
-    logger.info("Scheduled reminder '%s' for channel %s (next run: %s, interval: %ds)",
-                reminder_data['title'], channel_id, next_run, interval)
 
 
 def register_all_reminder_jobs():
