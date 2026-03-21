@@ -4013,30 +4013,38 @@ async def check_message_for_autoreplies(message):
     if not autoreplies_lock:
         return
         
+    # Copy matching rule data under the lock, then await outside it.
+    # Awaiting inside a threading.Lock blocks the event loop and causes deadlocks.
+    matched_rule_id = None
+    matched_reply = None
+
     with autoreplies_lock:
         for rule_id, rule_data in autoreplies.items():
             # Skip if rule is disabled or for different guild
             if not rule_data.get('enabled', True) or rule_data.get('guild_id') != guild_id:
                 continue
-                
+
             trigger_string = rule_data.get('trigger_string', '')
             case_sensitive = rule_data.get('case_sensitive', False)
-            
+
             # Check if message contains the trigger string
             if case_sensitive:
                 contains_trigger = trigger_string in message_content
             else:
                 contains_trigger = trigger_string.lower() in message_content.lower()
-            
+
             if contains_trigger:
-                try:
-                    reply_string = rule_data.get('reply_string', '')
-                    await message.reply(reply_string, mention_author=False)
-                    logger.info('Autoreply triggered: rule %s in guild %s by user %s',
-                               rule_id, guild_id, message.author)
-                    break  # Only trigger the first matching rule
-                except discord.HTTPException as e:
-                    logger.error('Failed to send autoreply for rule %s: %s', rule_id, e)
+                matched_rule_id = rule_id
+                matched_reply = rule_data.get('reply_string', '')
+                break  # Only trigger the first matching rule
+
+    if matched_rule_id:
+        try:
+            await message.reply(matched_reply, mention_author=False)
+            logger.info('Autoreply triggered: rule %s in guild %s by user %s',
+                       matched_rule_id, guild_id, message.author)
+        except discord.HTTPException as e:
+            logger.error('Failed to send autoreply for rule %s: %s', matched_rule_id, e)
 
 async def autoreply_add_command(interaction: discord.Interaction, trigger: str, reply: str, case_sensitive: bool = False):
     """Add a new autoreply rule."""
@@ -4166,18 +4174,19 @@ async def autoreply_remove_command(interaction: discord.Interaction, rule_id: st
             return
         
         trigger = ''
+        error_msg = None
         with autoreplies_lock:
             if rule_id not in autoreplies:
-                await interaction.response.send_message(f'Autoreply rule `{rule_id}` not found.', ephemeral=True)
-                return
-                
-            rule_data = autoreplies[rule_id]
-            if rule_data.get('guild_id') != guild_id:
-                await interaction.response.send_message(f'Autoreply rule `{rule_id}` not found in this server.', ephemeral=True)
-                return
-                
-            trigger = rule_data.get('trigger_string', '')
-            del autoreplies[rule_id]
+                error_msg = f'Autoreply rule `{rule_id}` not found.'
+            elif autoreplies[rule_id].get('guild_id') != guild_id:
+                error_msg = f'Autoreply rule `{rule_id}` not found in this server.'
+            else:
+                trigger = autoreplies[rule_id].get('trigger_string', '')
+                del autoreplies[rule_id]
+
+        if error_msg:
+            await interaction.response.send_message(error_msg, ephemeral=True)
+            return
                 
         if save_autoreplies():
             await interaction.response.send_message(
@@ -4212,23 +4221,25 @@ async def autoreply_toggle_command(interaction: discord.Interaction, rule_id: st
         status_text = 'unknown'
         new_status = False
         
+        error_msg = None
         with autoreplies_lock:
             if rule_id not in autoreplies:
-                await interaction.response.send_message(f'Autoreply rule `{rule_id}` not found.', ephemeral=True)
-                return
-                
-            rule_data = autoreplies[rule_id]
-            if rule_data.get('guild_id') != guild_id:
-                await interaction.response.send_message(f'Autoreply rule `{rule_id}` not found in this server.', ephemeral=True)
-                return
-                
-            # Toggle the enabled status
-            current_status = rule_data.get('enabled', True)
-            new_status = not current_status
-            rule_data['enabled'] = new_status
-            
-            trigger = rule_data.get('trigger_string', '')
-            status_text = "enabled" if new_status else "disabled"
+                error_msg = f'Autoreply rule `{rule_id}` not found.'
+            elif autoreplies[rule_id].get('guild_id') != guild_id:
+                error_msg = f'Autoreply rule `{rule_id}` not found in this server.'
+            else:
+                rule_data = autoreplies[rule_id]
+                # Toggle the enabled status
+                current_status = rule_data.get('enabled', True)
+                new_status = not current_status
+                rule_data['enabled'] = new_status
+
+                trigger = rule_data.get('trigger_string', '')
+                status_text = "enabled" if new_status else "disabled"
+
+        if error_msg:
+            await interaction.response.send_message(error_msg, ephemeral=True)
+            return
                 
         if save_autoreplies():
             await interaction.response.send_message(
