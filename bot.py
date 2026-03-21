@@ -219,6 +219,14 @@ async def on_ready():  # pylint: disable=too-many-statements
         if event_feed:
             sched = getattr(event_feed, 'scheduler', None)
             if sched and not sched.running:
+                # Route APScheduler logs to the bot log file so job errors are visible
+                import logging as _logging
+                for _name in ('apscheduler', 'apscheduler.scheduler', 'apscheduler.executors.default'):
+                    _aplogger = _logging.getLogger(_name)
+                    _aplogger.setLevel(_logging.INFO)
+                    for _h in logger.handlers:
+                        _aplogger.addHandler(_h)
+
                 sched.start()
 
                 # Feed check: weekly Monday 10am Central
