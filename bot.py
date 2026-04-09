@@ -243,19 +243,33 @@ async def on_ready():  # pylint: disable=too-many-statements
                     logger.info(
                         'Feed check scheduled: Monday 10am CT')
 
-                # Announce: Mon + Thu 10am Central
+                # Weekly preview: Monday 10am Central
                 if hasattr(event_feed, 'announce_weekly_events'):
                     sched.add_job(
                         event_feed.announce_weekly_events,
                         trigger=CronTrigger(
-                            day_of_week='mon,thu', hour=10,
+                            day_of_week='mon', hour=10,
                             minute=0,
                             timezone=BOT_TIMEZONE),
                         id='weekly_announce',
                         replace_existing=True
                     )
                     logger.info(
-                        'Announce scheduled: Mon+Thu 10am CT')
+                        'Weekly announce scheduled: Monday 10am CT')
+
+                # Day-of reminder: daily 8am Central
+                if hasattr(event_feed, 'announce_todays_events'):
+                    sched.add_job(
+                        event_feed.announce_todays_events,
+                        trigger=CronTrigger(
+                            hour=8,
+                            minute=0,
+                            timezone=BOT_TIMEZONE),
+                        id='daily_event_reminder',
+                        replace_existing=True
+                    )
+                    logger.info(
+                        'Day-of reminder scheduled: daily 8am CT')
 
                 # Daily update checking
                 if UPDATE_CHECKING_ENABLED:

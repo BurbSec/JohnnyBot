@@ -1043,7 +1043,7 @@ class EventFeed:  # pylint: disable=too-few-public-methods,too-many-public-metho
     async def announce_weekly_events(self):
         """Announce this week's Discord Events to configured channels.
 
-        Runs every Monday and Thursday at 10am Central.
+        Runs Monday at 10am Central — one preview per week.
         Uses independent announce_configs (not feed-dependent).
         """
         central_tz = CENTRAL_TZ
@@ -1097,6 +1097,58 @@ class EventFeed:  # pylint: disable=too-few-public-methods,too-many-public-metho
             logger.info(
                 "Announced %d events for %s",
                 len(week_events), guild.name)
+
+    async def announce_todays_events(self):
+        """Announce Discord Events starting today at 8am Central.
+
+        Runs daily at 8am Central — day-of reminder for each event.
+        Uses independent announce_configs (not feed-dependent).
+        """
+        central_tz = CENTRAL_TZ
+        now = datetime.now(central_tz)
+        today = now.date()
+
+        for guild_id, ch_name in self.announce_configs.items():
+            guild = self.bot.get_guild(guild_id)
+            if not guild:
+                continue
+
+            channel = self._get_notification_channel(
+                guild, ch_name)
+            if not channel:
+                continue
+
+            try:
+                scheduled = (
+                    await guild.fetch_scheduled_events())
+            except discord.HTTPException as e:
+                logger.error(
+                    "Announce: error fetching events for %s: %s",
+                    guild.name, e)
+                continue
+
+            todays_events = []
+            for ev in scheduled:
+                ev_start = ev.start_time
+                if ev_start.tzinfo is None:
+                    ev_start = central_tz.localize(ev_start)
+                else:
+                    ev_start = ev_start.astimezone(central_tz)
+                if ev_start.date() == today:
+                    todays_events.append(ev)
+
+            if not todays_events:
+                logger.info(
+                    "No events today for %s", guild.name)
+                continue
+
+            for ev in todays_events:
+                await self._post_discord_event_announcement(
+                    channel, ev)
+
+            logger.info(
+                "Announced %d today's events for %s",
+                len(todays_events), guild.name)
 
     async def _post_discord_event_announcement(self, channel,
                                                scheduled_event):
