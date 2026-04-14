@@ -964,7 +964,10 @@ class EventFeed:  # pylint: disable=too-few-public-methods,too-many-public-metho
         to avoid redundant API calls.
         """
         try:
-            name = event['summary'][:100]
+            # Discord trims trailing whitespace server-side — strip
+            # before we compare against fetched events or we'll never
+            # dedup and will loop-recreate every run
+            name = event['summary'].strip()[:100]
             description = event.get('description', '')[:1000]
             start_time = event['start_date']
             end_time = event.get('end_date')
@@ -993,11 +996,20 @@ class EventFeed:  # pylint: disable=too-few-public-methods,too-many-public-metho
             if not end_time:
                 end_time = start_time + timedelta(hours=1)
 
-            # Check if event already exists (using pre-fetched list)
+            # Check if event already exists (using pre-fetched list).
+            # Compare UTC instants — Discord stores times in UTC, but
+            # our start_time may carry a Central tz from the iCal feed
+            start_utc = start_time.astimezone(timezone.utc)
             if existing_events:
                 for ev in existing_events:
-                    if (ev.name == name
-                            and ev.start_time == start_time):
+                    ev_name = (ev.name or '').strip()
+                    ev_start = ev.start_time
+                    if ev_start and ev_start.tzinfo is None:
+                        ev_start = ev_start.replace(
+                            tzinfo=timezone.utc)
+                    ev_utc = (ev_start.astimezone(timezone.utc)
+                              if ev_start else None)
+                    if ev_name == name and ev_utc == start_utc:
                         logger.info(
                             "Discord Event '%s' already exists, "
                             "skipping", name)
@@ -1007,6 +1019,9 @@ class EventFeed:  # pylint: disable=too-few-public-methods,too-many-public-metho
                 location[:100] if location
                 else "See event details")
 
+            # privacy_level is required by the Discord API; discord.py
+            # does not default it, so passing it explicitly avoids the
+            # misleading "entity_type required" 400 response
             discord_event = await guild.create_scheduled_event(
                 name=name,
                 description=description,
@@ -1014,6 +1029,7 @@ class EventFeed:  # pylint: disable=too-few-public-methods,too-many-public-metho
                 end_time=end_time,
                 location=event_location,
                 entity_type=discord.EntityType.external,
+                privacy_level=discord.PrivacyLevel.guild_only,
             )
 
             logger.info(
