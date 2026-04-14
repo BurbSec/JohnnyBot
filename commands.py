@@ -507,6 +507,10 @@ class EventFeed:  # pylint: disable=too-few-public-methods,too-many-public-metho
             calendar = await self._fetch_calendar(url)
             new_events = self._parse_calendar_events(
                 calendar, feed_data)
+            # Meetup (and many other iCal feeds) ship events with an
+            # empty LOCATION field — the venue lives on the event page.
+            # Scrape the URL to enrich the location.
+            new_events = await self._enrich_ical_events(new_events)
 
         logger.info("Feed '%s': found %d new events",
                      fname, len(new_events))
@@ -539,6 +543,38 @@ class EventFeed:  # pylint: disable=too-few-public-methods,too-many-public-metho
                 response.raise_for_status()
                 text = await response.text()
                 return Calendar.from_ical(text)
+
+    async def _enrich_ical_events(self, events: list) -> list:
+        """Scrape event URLs to fill in missing location data.
+
+        Meetup's iCal LOCATION field is empty, but its event pages
+        include JSON-LD with the venue name and street address.
+        """
+        to_scrape = [
+            e for e in events
+            if e.get('link') and not (e.get('location') or '').strip()
+        ]
+        if not to_scrape:
+            return events
+
+        sem = asyncio.Semaphore(3)
+
+        async def _scrape(ev):
+            async with sem:
+                scraped = await self._scrape_event_page(
+                    session, ev['link'], ev['uid'])
+                await asyncio.sleep(0.3)
+                if scraped and scraped.get('location'):
+                    ev['location'] = scraped['location']
+
+        async with aiohttp.ClientSession(
+            headers={'User-Agent': 'Mozilla/5.0'},
+            timeout=aiohttp.ClientTimeout(total=30)
+        ) as session:
+            await asyncio.gather(
+                *[_scrape(e) for e in to_scrape],
+                return_exceptions=True)
+        return events
 
     def _parse_calendar_events(self, calendar,
                                feed_data: Dict[str, Any]) -> list:
@@ -831,8 +867,8 @@ class EventFeed:  # pylint: disable=too-few-public-methods,too-many-public-metho
                                   display_options=None):
         """Process and post new events, create Discord Events.
 
-        Also immediately announces any events happening this week
-        if announce is enabled for this feed.
+        Announcements are handled by the scheduled Mon/Thu jobs —
+        this method only persists and publishes events.
         """
         posted_events = feed_data.get('posted_events', set())
 
@@ -853,47 +889,6 @@ class EventFeed:  # pylint: disable=too-few-public-methods,too-many-public-metho
         feed_data['last_checked'] = datetime.now()
         feed_data['posted_events'] = posted_events
         # save_feeds() is called once per check_feeds_job run, not per feed
-
-        # Immediately announce this-week events if enabled
-        if (guild.id in self.announce_configs
-                and new_events):
-            await self._announce_this_week_now(guild)
-
-    async def _announce_this_week_now(self, guild):
-        """Announce this-week events immediately after new events."""
-        ch_name = self.announce_configs.get(guild.id)
-        if not ch_name:
-            return
-        channel = self._get_notification_channel(guild, ch_name)
-        if not channel:
-            return
-
-        # Delay to let Discord register new events
-        await asyncio.sleep(3)
-
-        central_tz = CENTRAL_TZ
-        now = datetime.now(central_tz)
-        ws_naive = (
-            now - timedelta(days=now.weekday())
-        ).replace(hour=0, minute=0, second=0, microsecond=0)
-        ws_naive = ws_naive.replace(tzinfo=None)
-        ws = central_tz.localize(ws_naive)
-        we = ws + timedelta(days=7)
-
-        try:
-            scheduled = await guild.fetch_scheduled_events()
-        except discord.HTTPException:
-            return
-
-        for ev in scheduled:
-            ev_start = ev.start_time
-            if ev_start.tzinfo is None:
-                ev_start = central_tz.localize(ev_start)
-            else:
-                ev_start = ev_start.astimezone(central_tz)
-            if ws <= ev_start < we:
-                await self._post_discord_event_announcement(
-                    channel, ev)
 
     async def _post_event_to_discord(self, channel,
                                      event: Dict[str, Any],
@@ -1092,7 +1087,7 @@ class EventFeed:  # pylint: disable=too-few-public-methods,too-many-public-metho
 
             for ev in week_events:
                 await self._post_discord_event_announcement(
-                    channel, ev)
+                    channel, ev, title_prefix="This Week")
 
             logger.info(
                 "Announced %d events for %s",
@@ -1144,14 +1139,15 @@ class EventFeed:  # pylint: disable=too-few-public-methods,too-many-public-metho
 
             for ev in todays_events:
                 await self._post_discord_event_announcement(
-                    channel, ev)
+                    channel, ev, title_prefix="Today")
 
             logger.info(
                 "Announced %d today's events for %s",
                 len(todays_events), guild.name)
 
     async def _post_discord_event_announcement(self, channel,
-                                               scheduled_event):
+                                               scheduled_event,
+                                               title_prefix: str = "This Week"):
         """Post a single Discord Event announcement with URL preview."""
         try:
             start = scheduled_event.start_time
@@ -1163,7 +1159,7 @@ class EventFeed:  # pylint: disable=too-few-public-methods,too-many-public-metho
             time_str = start.strftime("%I:%M %p %Z")
 
             embed = discord.Embed(
-                title=f"📢 This Week: {scheduled_event.name}",
+                title=f"📢 {title_prefix}: {scheduled_event.name}",
                 color=0xFF6600,
                 description="Don't miss this event!"
             )

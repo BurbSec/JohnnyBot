@@ -229,19 +229,21 @@ async def on_ready():  # pylint: disable=too-many-statements
 
                 sched.start()
 
-                # Feed check: weekly Monday 10am Central
+                # Feed check: Monday 9am Central (pulls next 30 days,
+                # creates Discord Events) — runs one hour before the
+                # weekly announce so new events are visible when it fires
                 if hasattr(event_feed, 'check_feeds_job'):
                     sched.add_job(
                         event_feed.check_feeds_job,
                         trigger=CronTrigger(
-                            day_of_week='mon', hour=10,
+                            day_of_week='mon', hour=9,
                             minute=0,
                             timezone=BOT_TIMEZONE),
                         id='weekly_feed_check',
                         replace_existing=True
                     )
                     logger.info(
-                        'Feed check scheduled: Monday 10am CT')
+                        'Feed check scheduled: Monday 9am CT')
 
                 # Weekly preview: Monday 10am Central
                 if hasattr(event_feed, 'announce_weekly_events'):
@@ -257,19 +259,19 @@ async def on_ready():  # pylint: disable=too-many-statements
                     logger.info(
                         'Weekly announce scheduled: Monday 10am CT')
 
-                # Day-of reminder: daily 8am Central
+                # Day-of reminder: daily 10am Central
                 if hasattr(event_feed, 'announce_todays_events'):
                     sched.add_job(
                         event_feed.announce_todays_events,
                         trigger=CronTrigger(
-                            hour=8,
+                            hour=10,
                             minute=0,
                             timezone=BOT_TIMEZONE),
                         id='daily_event_reminder',
                         replace_existing=True
                     )
                     logger.info(
-                        'Day-of reminder scheduled: daily 8am CT')
+                        'Day-of reminder scheduled: daily 10am CT')
 
                 # Daily update checking
                 if UPDATE_CHECKING_ENABLED:
