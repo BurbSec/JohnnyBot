@@ -1035,6 +1035,7 @@ class EventFeed:  # pylint: disable=too-few-public-methods,too-many-public-metho
             logger.info(
                 "Created Discord Event '%s' (ID: %s) in guild %s",
                 name, discord_event.id, guild.name)
+            return discord_event
 
         except (discord.Forbidden, ValueError, TypeError) as e:
             logger.error(
@@ -1048,6 +1049,7 @@ class EventFeed:  # pylint: disable=too-few-public-methods,too-many-public-metho
             logger.error(
                 "Unexpected error creating Discord Event '%s': %s",
                 event['summary'], e)
+        return None
 
     # ── Announce system (recurring Mon/Thu job) ──────────────────────
 
@@ -1160,6 +1162,76 @@ class EventFeed:  # pylint: disable=too-few-public-methods,too-many-public-metho
             logger.info(
                 "Announced %d today's events for %s",
                 len(todays_events), guild.name)
+
+    async def reconcile_discord_events(self) -> Dict[str, Any]:
+        """Create Discord Events for any feed entries missing from the
+        guild's scheduled-events list.
+
+        The feed check marks events as 'posted' even when the Discord
+        API rejects creation, so failed events never retry via the
+        normal path. This method re-parses every feed ignoring the
+        posted_events set and fills any gaps.
+
+        Returns a summary dict for reporting.
+        """
+        results = {
+            'feeds_checked': 0,
+            'events_created': 0,
+            'errors': [],
+        }
+
+        for guild_id, feeds in self.feeds.items():
+            guild = self.bot.get_guild(guild_id)
+            if not guild:
+                results['errors'].append(
+                    f"Guild {guild_id} not found")
+                continue
+
+            try:
+                existing = list(
+                    await guild.fetch_scheduled_events())
+            except discord.HTTPException as e:
+                results['errors'].append(
+                    f"Fetch events for {guild.name}: {e}")
+                continue
+
+            for url, feed_data in feeds.items():
+                fname = feed_data.get('name', url)
+                results['feeds_checked'] += 1
+                try:
+                    # Parse with posted_events emptied so every
+                    # event in the 30-day window is returned
+                    probe = dict(feed_data)
+                    probe['posted_events'] = set()
+                    feed_type = feed_data.get('feed_type', 'ical')
+                    if feed_type == 'rss':
+                        events = await self._fetch_and_parse_rss(
+                            url, probe)
+                    else:
+                        cal = await self._fetch_calendar(url)
+                        events = self._parse_calendar_events(
+                            cal, probe)
+                        events = await self._enrich_ical_events(
+                            events)
+
+                    for ev in events:
+                        created = await self._create_discord_event(
+                            guild, ev, existing)
+                        if created:
+                            existing.append(created)
+                            results['events_created'] += 1
+                except Exception as e:  # pylint: disable=broad-exception-caught
+                    results['errors'].append(f"{fname}: {e}")
+                    logger.error(
+                        "Reconcile error for %s: %s", fname, e)
+
+        logger.info(
+            "Reconcile complete: %d feeds, %d events created, "
+            "%d errors",
+            results['feeds_checked'],
+            results['events_created'],
+            len(results['errors']))
+        return results
 
     async def _post_discord_event_announcement(self, channel,
                                                scheduled_event,
@@ -2291,23 +2363,29 @@ async def check_event_feeds_command(interaction: discord.Interaction):
             return
 
         results = await event_feed.check_feeds_job()
+        recon = await event_feed.reconcile_discord_events()
 
         # Build result message
         parts = [
             f"📊 **Feed Check Results**\n"
             f"Feeds checked: **{results['feeds_checked']}**\n"
-            f"New events posted: **{results['events_posted']}**"
+            f"New events posted: **{results['events_posted']}**\n"
+            f"Missing Discord events created: "
+            f"**{recon['events_created']}**"
         ]
 
-        if results['errors']:
+        all_errors = list(results['errors']) + list(recon['errors'])
+        if all_errors:
             error_list = '\n'.join(
-                f"• {e}" for e in results['errors'][:5])
+                f"• {e}" for e in all_errors[:5])
             parts.append(f"\n\n⚠️ **Errors:**\n{error_list}")
 
-        if results['events_posted'] == 0 and not results['errors']:
+        if (results['events_posted'] == 0
+                and recon['events_created'] == 0
+                and not all_errors):
             parts.append(
                 "\n\nNo new events found in the next 30 days "
-                "(or all events already posted).")
+                "and no missing Discord events to create.")
 
         await interaction.followup.send(
             '\n'.join(parts), ephemeral=True)
