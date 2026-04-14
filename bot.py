@@ -219,12 +219,15 @@ async def on_ready():  # pylint: disable=too-many-statements
         if event_feed:
             sched = getattr(event_feed, 'scheduler', None)
             if sched and not sched.running:
-                # Route APScheduler logs to the bot log file so job errors are visible
+                # Route APScheduler logs to the bot log file so job errors
+                # are visible. Attach handlers only to the parent logger;
+                # child loggers propagate up, so attaching to both would
+                # emit each message twice.
                 import logging as _logging
-                for _name in ('apscheduler', 'apscheduler.scheduler', 'apscheduler.executors.default'):
-                    _aplogger = _logging.getLogger(_name)
-                    _aplogger.setLevel(_logging.INFO)
-                    for _h in logger.handlers:
+                _aplogger = _logging.getLogger('apscheduler')
+                _aplogger.setLevel(_logging.INFO)
+                for _h in logger.handlers:
+                    if _h not in _aplogger.handlers:
                         _aplogger.addHandler(_h)
 
                 sched.start()
