@@ -485,20 +485,12 @@ class EventFeed:  # pylint: disable=too-few-public-methods,too-many-public-metho
                                  feed_data: Dict[str, Any]) -> int:
         """Check a single feed (iCal or RSS) for new events.
 
-        Returns the number of new events posted.
+        Returns the number of new events processed.
         """
         fname = feed_data.get('name', url)
-        channel_name = feed_data.get('channel', '')
-
-        channel = self._get_notification_channel(
-            guild, channel_name)
-        if not channel:
-            raise ValueError(
-                f"Channel '{channel_name}' not found")
-
         feed_type = feed_data.get('feed_type', 'ical')
         logger.info("Checking %s feed '%s': %s",
-                     feed_type, fname, url)
+                    feed_type, fname, url)
 
         if feed_type == 'rss':
             new_events = await self._fetch_and_parse_rss(
@@ -513,22 +505,13 @@ class EventFeed:  # pylint: disable=too-few-public-methods,too-many-public-metho
             new_events = await self._enrich_ical_events(new_events)
 
         logger.info("Feed '%s': found %d new events",
-                     fname, len(new_events))
+                    fname, len(new_events))
 
         if not new_events:
             return 0
 
-        display_options = {
-            'show_description': feed_data.get(
-                'show_description', True),
-            'show_location': feed_data.get(
-                'show_location', True),
-            'show_link': feed_data.get('show_link', True),
-        }
-
         await self._process_new_events(
-            guild, channel, new_events, feed_data,
-            display_options)
+            guild, new_events, feed_data)
 
         return len(new_events)
 
@@ -861,14 +844,13 @@ class EventFeed:  # pylint: disable=too-few-public-methods,too-many-public-metho
 
     # ── Event processing & posting ───────────────────────────────────
 
-    async def _process_new_events(self, guild, channel,
+    async def _process_new_events(self, guild,
                                   new_events: list,
-                                  feed_data: Dict[str, Any],
-                                  display_options=None):
-        """Process and post new events, create Discord Events.
+                                  feed_data: Dict[str, Any]):
+        """Register new events as Discord scheduled events.
 
-        Announcements are handled by the scheduled Mon/Thu jobs —
-        this method only persists and publishes events.
+        No channel posts are made here — announcements are handled
+        exclusively by the weekly/day-of scheduled jobs.
         """
         posted_events = feed_data.get('posted_events', set())
 
@@ -880,8 +862,6 @@ class EventFeed:  # pylint: disable=too-few-public-methods,too-many-public-metho
             pass
 
         for event in new_events:
-            await self._post_event_to_discord(
-                channel, event, display_options)
             await self._create_discord_event(
                 guild, event, existing_events)
             posted_events.add(event['uid'])
@@ -890,78 +870,24 @@ class EventFeed:  # pylint: disable=too-few-public-methods,too-many-public-metho
         feed_data['posted_events'] = posted_events
         # save_feeds() is called once per check_feeds_job run, not per feed
 
-    async def _post_event_to_discord(self, channel,
-                                     event: Dict[str, Any],
-                                     display_options=None):
-        """Post an event to a Discord channel."""
-        try:
-            if display_options is None:
-                display_options = {
-                    'show_description': True,
-                    'show_location': True,
-                    'show_link': True,
-                }
-
-            start_date = event['start_date']
-            end_date = event.get('end_date')
-
-            if isinstance(start_date, datetime):
-                date_str = start_date.strftime("%A, %B %d, %Y")
-                time_str = start_date.strftime("%I:%M %p")
-                if (end_date and isinstance(end_date, datetime)
-                        and end_date.date() == start_date.date()):
-                    time_str += (
-                        f" - {end_date.strftime('%I:%M %p')}")
-            else:
-                date_str = str(start_date)
-                time_str = "All Day"
-
-            embed = discord.Embed(
-                title=f"📅 {event['summary']}",
-                color=0x00ff00,
-                description="🎉 **Added to Discord Events!**"
-            )
-            embed.add_field(
-                name="📅 Date", value=date_str, inline=True)
-            embed.add_field(
-                name="⏰ Time", value=time_str, inline=True)
-
-            if (display_options.get('show_location', True)
-                    and event.get('location')):
-                embed.add_field(
-                    name="📍 Location",
-                    value=event['location'], inline=False)
-
-            if (display_options.get('show_description', True)
-                    and event.get('description')):
-                desc = event['description']
-                if len(desc) > 1000:
-                    desc = desc[:1000] + "..."
-                embed.add_field(
-                    name="📝 Description",
-                    value=desc, inline=False)
-
-            if (display_options.get('show_link', True)
-                    and event.get('link')):
-                embed.add_field(
-                    name="🔗 Event Link",
-                    value=event['link'], inline=False)
-
-            await channel.send(embed=embed)
-            logger.info("Posted event '%s' to #%s",
-                        event['summary'], channel.name)
-
-        except discord.HTTPException as e:
-            logger.error("Error posting event to Discord: %s", e)
-
     async def _create_discord_event(self, guild,
                                     event: Dict[str, Any],
                                     existing_events=None):
-        """Create a Discord Event in the guild's Events section.
+        """Create or update a Discord Event in the guild's Events section.
 
-        Skips creation if an event with the same name and start
-        time already exists. Uses pre-fetched existing_events list
-        to avoid redundant API calls.
+        Match logic:
+        - Same name + same start time  → already in sync, skip.
+        - Same name prefix + same start time but different full name
+          → title changed (e.g. sponsor update), edit in place.
+        - No match on prefix + start time → create new event.
+
+        "Name prefix" is everything before the first ' - ', so
+        "BurbSec West - Sponsored by TORQ!" and
+        "BurbSec West - Sponsors Wanted!" share the prefix
+        "BurbSec West" and will be treated as the same event.
+
+        Uses pre-fetched existing_events list to avoid redundant API
+        calls.
         """
         try:
             # Discord trims trailing whitespace server-side — strip
@@ -996,7 +922,17 @@ class EventFeed:  # pylint: disable=too-few-public-methods,too-many-public-metho
             if not end_time:
                 end_time = start_time + timedelta(hours=1)
 
-            # Check if event already exists (using pre-fetched list).
+            event_location = (
+                location[:100] if location
+                else "See event details")
+
+            # Stable prefix = everything before the first ' - '
+            # e.g. "BurbSec West - Sponsored by TORQ!" → "BurbSec West"
+            def _prefix(n):
+                return n.split(' - ')[0].strip()
+
+            name_prefix = _prefix(name)
+
             # Compare UTC instants — Discord stores times in UTC, but
             # our start_time may carry a Central tz from the iCal feed
             start_utc = start_time.astimezone(timezone.utc)
@@ -1009,16 +945,27 @@ class EventFeed:  # pylint: disable=too-few-public-methods,too-many-public-metho
                             tzinfo=timezone.utc)
                     ev_utc = (ev_start.astimezone(timezone.utc)
                               if ev_start else None)
-                    if ev_name == name and ev_utc == start_utc:
+
+                    if ev_utc != start_utc:
+                        continue
+                    if _prefix(ev_name) != name_prefix:
+                        continue
+
+                    # Same event (matched on prefix + time)
+                    if ev_name == name:
                         logger.info(
-                            "Discord Event '%s' already exists, "
+                            "Discord Event '%s' already up to date, "
                             "skipping", name)
-                        return
+                        return ev
 
-            event_location = (
-                location[:100] if location
-                else "See event details")
+                    # Title changed — update in place
+                    await ev.edit(name=name)
+                    logger.info(
+                        "Updated Discord Event title: '%s' → '%s'",
+                        ev_name, name)
+                    return ev
 
+            # No existing match — create new
             # privacy_level is required by the Discord API; discord.py
             # does not default it, so passing it explicitly avoids the
             # misleading "entity_type required" 400 response
@@ -1574,25 +1521,18 @@ def register_commands():  # pylint: disable=too-many-locals,too-many-statements
     _log_tail.on_error = log_tail_error
 
     @tree.command(name='add_event_feed',
-                  description='Adds a calendar or RSS feed URL to check for events')
+                  description='Adds a calendar or RSS feed and its announcement channel')
     @app_commands.describe(
         feed_name='A short name to identify this feed',
         calendar_url='URL of the calendar or RSS feed',
-        channel='Channel to post event notifications',
-        show_description='Show event description (default: Yes)',
-        show_location='Show event location (default: Yes)',
-        show_link='Show event URL link (default: Yes)'
+        channel='Channel to post weekly/day-of event announcements'
     )
     async def _add_event_feed(interaction: discord.Interaction,
                               feed_name: str,
                               calendar_url: str,
-                              channel: discord.TextChannel,
-                              show_description: bool = True,
-                              show_location: bool = True,
-                              show_link: bool = True):
+                              channel: discord.TextChannel):
         await add_event_feed_command(
-            interaction, feed_name, calendar_url, channel,
-            show_description, show_location, show_link)
+            interaction, feed_name, calendar_url, channel)
 
     _add_event_feed.on_error = add_event_feed_error
 
@@ -1615,20 +1555,6 @@ def register_commands():  # pylint: disable=too-many-locals,too-many-statements
         await check_event_feeds_command(interaction)
 
     _check_event_feeds.on_error = check_event_feeds_error
-
-    @tree.command(name='event_announce',
-                  description='Enable weekly event announcements (Mon/Thu 10am CT)')
-    @app_commands.describe(
-        channel='Channel to post event announcements in')
-    async def _event_announce(interaction: discord.Interaction,
-                              channel: discord.TextChannel):
-        await event_announce_command(interaction, channel)
-
-    @tree.command(name='disable_event_announce',
-                  description='Disable weekly event announcements')
-    async def _disable_event_announce(
-            interaction: discord.Interaction):
-        await disable_event_announce_command(interaction)
 
     @tree.command(name='bot_mood', description='Check on the bot\'s current mood')
     async def _bot_mood(interaction: discord.Interaction):
@@ -2213,14 +2139,11 @@ async def log_tail_command(interaction: discord.Interaction, lines: int):
         await interaction.response.send_message('A Discord API error occurred.', ephemeral=True)
 
 log_tail_error = _command_error_handler
-async def add_event_feed_command(interaction: discord.Interaction,  # pylint: disable=too-many-arguments,too-many-branches,too-many-statements
+async def add_event_feed_command(interaction: discord.Interaction,  # pylint: disable=too-many-branches,too-many-statements
                                  feed_name: str,
                                  calendar_url: str,
-                                 channel: discord.TextChannel,
-                                 show_description: bool = True,
-                                 show_location: bool = True,
-                                 show_link: bool = True):
-    """Adds a calendar or RSS feed URL to check for events."""
+                                 channel: discord.TextChannel):
+    """Adds a feed and sets it as the guild's announcement target."""
     try:
         await interaction.response.defer(ephemeral=True)
 
@@ -2284,27 +2207,23 @@ async def add_event_feed_command(interaction: discord.Interaction,  # pylint: di
                 'channel': resolved_channel_name,
                 'posted_events': set(),
                 'feed_type': detected_type,
-                'show_description': show_description,
-                'show_location': show_location,
-                'show_link': show_link,
             }
             event_feed.save_feeds()
 
+            # Auto-enable announcements for this channel so the user
+            # doesn't need a second setup command
+            event_feed.announce_configs[guild_id] = resolved_channel_name
+            event_feed._save_announce_config()  # pylint: disable=protected-access
+
         # Build confirmation message
         type_label = "RSS" if detected_type == 'rss' else "iCal"
-        opts = []
-        opts.append("Description ✅" if show_description
-                     else "Description ❌")
-        opts.append("Location ✅" if show_location
-                     else "Location ❌")
-        opts.append("Link ✅" if show_link else "Link ❌")
-
         await interaction.followup.send(
             f"✅ Added {type_label} feed "
             f"**\"{feed_name}\"**! "
             f"Checking for events now...\n"
-            f"**Channel:** #{resolved_channel_name}\n"
-            f"**Show:** {' | '.join(opts)}",
+            f"📢 Announcements will post to "
+            f"#{resolved_channel_name} (Mon 10am CT weekly, "
+            f"daily 10am CT day-of).",
             ephemeral=True
         )
 
@@ -2314,11 +2233,12 @@ async def add_event_feed_command(interaction: discord.Interaction,  # pylint: di
                 guild = interaction.guild
                 guild_id = guild.id
                 feed_data = event_feed.feeds[guild_id][calendar_url]
-                count = await event_feed._check_single_feed(
+                count = await event_feed._check_single_feed(  # pylint: disable=protected-access
                     guild, calendar_url, feed_data)
                 await interaction.followup.send(
                     f"✅ Initial check complete: "
-                    f"**{count}** new events found and posted.",
+                    f"**{count}** events registered on the "
+                    f"server calendar.",
                     ephemeral=True)
             except Exception as e:  # pylint: disable=broad-exception-caught
                 logger.error(
@@ -2417,25 +2337,13 @@ async def list_event_feeds_command(interaction: discord.Interaction):
         feed_type = data.get('feed_type', 'ical').upper()
         ch = data.get('channel', 'unknown')
 
-        show_parts = []
-        show_parts.append(
-            "Desc ✅" if data.get('show_description', True)
-            else "Desc ❌")
-        show_parts.append(
-            "Loc ✅" if data.get('show_location', True)
-            else "Loc ❌")
-        show_parts.append(
-            "Link ✅" if data.get('show_link', True)
-            else "Link ❌")
-
         # Truncate URL for display
         display_url = (
             url if len(url) <= 60 else url[:57] + "...")
 
         value = (
             f"**URL:** {display_url}\n"
-            f"**Type:** {feed_type} | **Channel:** #{ch}\n"
-            f"**Show:** {' | '.join(show_parts)}"
+            f"**Type:** {feed_type} | **Channel:** #{ch}"
         )
         embed.add_field(
             name=f"📌 {fname}", value=value, inline=False)
@@ -2470,55 +2378,16 @@ async def remove_event_feed_command(interaction: discord.Interaction,
 
     del guild_feeds[target_url]
     event_feed.save_feeds()
+
+    # If no feeds remain in the guild, drop the announce config
+    # so stale announcements don't keep firing
+    if not guild_feeds and interaction.guild.id in event_feed.announce_configs:
+        del event_feed.announce_configs[interaction.guild.id]
+        event_feed._save_announce_config()  # pylint: disable=protected-access
+
     await interaction.response.send_message(
         f'✅ Removed event feed **"{feed_name}"**',
         ephemeral=True)
-
-async def event_announce_command(
-        interaction: discord.Interaction,
-        channel: discord.TextChannel):
-    """Enable weekly event announcements for this server."""
-    if not event_feed or not interaction.guild:
-        await interaction.response.send_message(
-            'Event feed system not initialized.',
-            ephemeral=True)
-        return
-
-    guild_id = interaction.guild.id
-    event_feed.announce_configs[guild_id] = channel.name
-    event_feed._save_announce_config()
-
-    await interaction.response.send_message(
-        f"✅ **Event announcements enabled!**\n"
-        f"📢 This week's events will be posted to "
-        f"#{channel.name} every **Mon & Thu at 10am CT**.\n"
-        f"Use `/disable_event_announce` to turn off.",
-        ephemeral=True)
-
-    logger.info(
-        "Event announcements enabled for guild %s → #%s",
-        interaction.guild.name, channel.name)
-
-async def disable_event_announce_command(
-        interaction: discord.Interaction):
-    """Disable weekly event announcements for this server."""
-    if not event_feed or not interaction.guild:
-        await interaction.response.send_message(
-            'Event feed system not initialized.',
-            ephemeral=True)
-        return
-
-    guild_id = interaction.guild.id
-    if guild_id in event_feed.announce_configs:
-        del event_feed.announce_configs[guild_id]
-        event_feed._save_announce_config()
-        await interaction.response.send_message(
-            "✅ Event announcements **disabled**.",
-            ephemeral=True)
-    else:
-        await interaction.response.send_message(
-            "Event announcements were not enabled.",
-            ephemeral=True)
 
 async def bot_command(interaction: discord.Interaction):
     """Check on the bot."""
