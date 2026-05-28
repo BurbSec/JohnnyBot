@@ -2,6 +2,7 @@
 # pylint: disable=line-too-long,trailing-whitespace,cyclic-import
 import os
 import asyncio
+import logging
 from datetime import datetime, timedelta
 
 from apscheduler.triggers.interval import IntervalTrigger
@@ -11,6 +12,7 @@ import aiohttp
 import discord
 from discord.ext import commands
 
+import config
 from config import (
     TOKEN,
     PROTECTED_CHANNELS,
@@ -149,7 +151,7 @@ intents.voice_states = True
 
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-setattr(bot, '_ready_ran', False)
+_ready_ran = False
 
 @bot.event
 async def on_ready():  # pylint: disable=too-many-statements
@@ -158,11 +160,10 @@ async def on_ready():  # pylint: disable=too-many-statements
     - Starting background tasks
     - Initializing event feed scheduler
     """
-    # Using protected member _ready_ran is necessary to track initialization state
-    # This prevents duplicate initialization when the on_ready event fires multiple times
-    if getattr(bot, '_ready_ran', False):
+    global _ready_ran
+    if _ready_ran:
         return
-    setattr(bot, '_ready_ran', True)
+    _ready_ran = True
 
     if bot.user:
         logger.info('Logged in as %s (ID: %s)', bot.user, bot.user.id)
@@ -223,9 +224,8 @@ async def on_ready():  # pylint: disable=too-many-statements
                 # are visible. Attach handlers only to the parent logger;
                 # child loggers propagate up, so attaching to both would
                 # emit each message twice.
-                import logging as _logging
-                _aplogger = _logging.getLogger('apscheduler')
-                _aplogger.setLevel(_logging.INFO)
+                _aplogger = logging.getLogger('apscheduler')
+                _aplogger.setLevel(logging.INFO)
                 for _h in logger.handlers:
                     if _h not in _aplogger.handlers:
                         _aplogger.addHandler(_h)
@@ -301,11 +301,9 @@ async def on_message(message):
     """Monitor messages in protected channels and delete non-moderator messages. Also check for autoreply rules."""
     if message.author.bot:
         return
-    
-    # Check for autoreply rules first
+
     try:
-        from commands import check_message_for_autoreplies  # pylint: disable=import-outside-toplevel
-        await check_message_for_autoreplies(message)
+        await _check_autoreplies(message)
     except (ImportError, AttributeError):
         # Commands module may not be fully initialized yet
         pass
@@ -406,9 +404,9 @@ async def on_voice_state_update(member, before, after):
     """Handle voice state changes - monitor for adult/child combinations."""
     if member.bot:
         return
-    
-    # Check if voice chaperone functionality is enabled (check config module directly for runtime changes)
-    import config
+
+    # Read VOICE_CHAPERONE_ENABLED from the config module each call so
+    # runtime toggles via /voice_chaperone take effect immediately.
     if not config.VOICE_CHAPERONE_ENABLED:
         return
     
@@ -423,7 +421,10 @@ async def on_voice_state_update(member, before, after):
     for channel in channels_to_check:
         await check_voice_channel_safety(channel)
 
-from commands import setup_commands  # pylint: disable=wrong-import-position
+from commands import (  # pylint: disable=wrong-import-position
+    setup_commands,
+    check_message_for_autoreplies as _check_autoreplies,
+)
 setup_commands(bot)
 
 try:

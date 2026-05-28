@@ -9,12 +9,15 @@ import tempfile
 import threading
 import asyncio
 import json
+import uuid
 import zipfile
 import socket
 import shutil
-from datetime import datetime, timedelta, timezone
+from collections import deque
+from datetime import datetime, time as _dtime, timedelta, timezone
 from typing import Optional, Dict, Any
 from apscheduler.triggers.interval import IntervalTrigger
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import discord
 from discord import app_commands
 import aiohttp
@@ -27,6 +30,7 @@ try:
     from dateutil import parser as dateparser
 except ImportError:
     dateparser = None
+import config
 from config import (
     MODERATOR_ROLE_NAME,
     LOG_FILE,
@@ -67,7 +71,6 @@ CENTRAL_TZ = pytz.timezone(BOT_TIMEZONE)
 def get_last_log_line():
     """Get the last line from the log file."""
     try:
-        from collections import deque
         with open(LOG_FILE, 'r', encoding='utf-8') as log_file:
             last = deque(log_file, maxlen=1)
             if last:
@@ -143,6 +146,14 @@ _evening_bot_messages = [
     "BOTNAME is chewing on the brush taped to the wall"
 ]
 
+_pet_bot_responses = [
+    "BOTNAME purrs happily!",
+    "BOTNAME rubs against your leg!",
+    "BOTNAME gives you a slow blink of affection!",
+    "BOTNAME meows appreciatively!",
+    "BOTNAME headbutts your hand for more pets!",
+]
+
 _night_bot_messages = [
     "BOTNAME is so small",
     "BOTNAME is judging how human sleeps",
@@ -161,14 +172,13 @@ _night_bot_messages = [
 
 def get_time_based_message(bot_name: str = "BOTNAME"):
     """Get a time-based bot status message based on current time."""
-    from datetime import time as _time
     current_time = datetime.now().time()
 
-    if current_time < _time(12, 0):
+    if current_time < _dtime(12, 0):
         message_list = _morning_bot_messages
-    elif current_time < _time(17, 0):
+    elif current_time < _dtime(17, 0):
         message_list = _afternoon_bot_messages
-    elif current_time < _time(21, 0):
+    elif current_time < _dtime(21, 0):
         message_list = _evening_bot_messages
     else:
         message_list = _night_bot_messages
@@ -1020,115 +1030,72 @@ class EventFeed:  # pylint: disable=too-few-public-methods,too-many-public-metho
 
     # ── Announce system (recurring Mon/Thu job) ──────────────────────
 
-    async def announce_weekly_events(self):
-        """Announce this week's Discord Events to configured channels.
+    async def _announce_events(self, predicate, title_prefix, empty_log):
+        """Iterate guilds and announce events matching predicate.
 
-        Runs Monday at 10am Central — one preview per week.
-        Uses independent announce_configs (not feed-dependent).
+        predicate(ev_start_central) -> bool decides which events to post.
+        Shared by announce_weekly_events and announce_todays_events.
         """
-        central_tz = CENTRAL_TZ
-        now = datetime.now(central_tz)
+        for guild_id, ch_name in self.announce_configs.items():
+            guild = self.bot.get_guild(guild_id)
+            if not guild:
+                continue
 
+            channel = self._get_notification_channel(guild, ch_name)
+            if not channel:
+                continue
+
+            try:
+                scheduled = await guild.fetch_scheduled_events()
+            except discord.HTTPException as e:
+                logger.error(
+                    "Announce: error fetching events for %s: %s",
+                    guild.name, e)
+                continue
+
+            matching = []
+            for ev in scheduled:
+                ev_start = ev.start_time
+                if ev_start.tzinfo is None:
+                    ev_start = CENTRAL_TZ.localize(ev_start)
+                else:
+                    ev_start = ev_start.astimezone(CENTRAL_TZ)
+                if predicate(ev_start):
+                    matching.append(ev)
+
+            if not matching:
+                logger.info(empty_log, guild.name)
+                continue
+
+            for ev in matching:
+                await self._post_discord_event_announcement(
+                    channel, ev, title_prefix=title_prefix)
+
+            logger.info(
+                "Announced %d events (%s) for %s",
+                len(matching), title_prefix, guild.name)
+
+    async def announce_weekly_events(self):
+        """Announce this week's Discord Events. Runs Mon 10am CT."""
+        now = datetime.now(CENTRAL_TZ)
         ws_naive = (
             now - timedelta(days=now.weekday())
-        ).replace(hour=0, minute=0, second=0, microsecond=0)
-        ws_naive = ws_naive.replace(tzinfo=None)
-        ws = central_tz.localize(ws_naive)
+        ).replace(hour=0, minute=0, second=0, microsecond=0,
+                  tzinfo=None)
+        ws = CENTRAL_TZ.localize(ws_naive)
         we = ws + timedelta(days=7)
-
-        for guild_id, ch_name in self.announce_configs.items():
-            guild = self.bot.get_guild(guild_id)
-            if not guild:
-                continue
-
-            channel = self._get_notification_channel(
-                guild, ch_name)
-            if not channel:
-                continue
-
-            try:
-                scheduled = (
-                    await guild.fetch_scheduled_events())
-            except discord.HTTPException as e:
-                logger.error(
-                    "Announce: error fetching events for %s: %s",
-                    guild.name, e)
-                continue
-
-            week_events = []
-            for ev in scheduled:
-                ev_start = ev.start_time
-                if ev_start.tzinfo is None:
-                    ev_start = central_tz.localize(ev_start)
-                else:
-                    ev_start = ev_start.astimezone(central_tz)
-                if ws <= ev_start < we:
-                    week_events.append(ev)
-
-            if not week_events:
-                logger.info(
-                    "No events this week for %s", guild.name)
-                continue
-
-            for ev in week_events:
-                await self._post_discord_event_announcement(
-                    channel, ev, title_prefix="This Week")
-
-            logger.info(
-                "Announced %d events for %s",
-                len(week_events), guild.name)
+        await self._announce_events(
+            lambda s: ws <= s < we,
+            "This Week",
+            "No events this week for %s")
 
     async def announce_todays_events(self):
-        """Announce Discord Events starting today at 8am Central.
-
-        Runs daily at 8am Central — day-of reminder for each event.
-        Uses independent announce_configs (not feed-dependent).
-        """
-        central_tz = CENTRAL_TZ
-        now = datetime.now(central_tz)
-        today = now.date()
-
-        for guild_id, ch_name in self.announce_configs.items():
-            guild = self.bot.get_guild(guild_id)
-            if not guild:
-                continue
-
-            channel = self._get_notification_channel(
-                guild, ch_name)
-            if not channel:
-                continue
-
-            try:
-                scheduled = (
-                    await guild.fetch_scheduled_events())
-            except discord.HTTPException as e:
-                logger.error(
-                    "Announce: error fetching events for %s: %s",
-                    guild.name, e)
-                continue
-
-            todays_events = []
-            for ev in scheduled:
-                ev_start = ev.start_time
-                if ev_start.tzinfo is None:
-                    ev_start = central_tz.localize(ev_start)
-                else:
-                    ev_start = ev_start.astimezone(central_tz)
-                if ev_start.date() == today:
-                    todays_events.append(ev)
-
-            if not todays_events:
-                logger.info(
-                    "No events today for %s", guild.name)
-                continue
-
-            for ev in todays_events:
-                await self._post_discord_event_announcement(
-                    channel, ev, title_prefix="Today")
-
-            logger.info(
-                "Announced %d today's events for %s",
-                len(todays_events), guild.name)
+        """Announce today's Discord Events. Runs daily 10am CT."""
+        today = datetime.now(CENTRAL_TZ).date()
+        await self._announce_events(
+            lambda s: s.date() == today,
+            "Today",
+            "No events today for %s")
 
     async def reconcile_discord_events(self) -> Dict[str, Any]:
         """Create Discord Events for any feed entries missing from the
@@ -1206,9 +1173,8 @@ class EventFeed:  # pylint: disable=too-few-public-methods,too-many-public-metho
         """Post a single Discord Event announcement with URL preview."""
         try:
             start = scheduled_event.start_time
-            central_tz = CENTRAL_TZ
             if start.tzinfo:
-                start = start.astimezone(central_tz)
+                start = start.astimezone(CENTRAL_TZ)
 
             date_str = start.strftime("%A, %B %d, %Y")
             time_str = start.strftime("%I:%M %p %Z")
@@ -1268,10 +1234,10 @@ def _load_reminders():
     try:
         with open(REMINDERS_FILE, 'r', encoding='utf-8') as f:
             data = json.load(f)
-        import time as _time
+        now = time_module.time()
         for key, reminder in data.items():
             if 'next_trigger' not in reminder:
-                reminder['next_trigger'] = _time.time() + reminder['interval']
+                reminder['next_trigger'] = now + reminder['interval']
             reminders[int(key) if key.isdigit() else key] = reminder
         logger.info("Loaded %d reminders from disk", len(reminders))
     except (OSError, IOError, json.JSONDecodeError) as e:
@@ -1791,7 +1757,6 @@ def setup_commands(bot_param):
     # Load existing autoreply rules
     load_autoreplies()
 
-    from apscheduler.schedulers.asyncio import AsyncIOScheduler  # pylint: disable=import-outside-toplevel
     # Shared scheduler for event feeds and reminders
     if event_feed:
         event_feed.scheduler = AsyncIOScheduler()
@@ -2143,7 +2108,6 @@ timeout_error = _command_error_handler
 async def log_tail_command(interaction: discord.Interaction, lines: int):
     """DM the last specified number of lines of the bot log to the user."""
     try:
-        from collections import deque
         with open(LOG_FILE, 'r', encoding='utf-8') as log_file:
             last_lines = ''.join(deque(log_file, maxlen=lines))
         if last_lines:
@@ -2424,16 +2388,7 @@ async def pet_bot_command(interaction: discord.Interaction):
     """Pet the bot."""
     try:
         bot_name = interaction.client.user.display_name if interaction.client.user else "the bot"
-        # Define bot response messages inline and select efficiently
-        bot_responses = [
-            "BOTNAME purrs happily!",
-            "BOTNAME rubs against your leg!",
-            "BOTNAME gives you a slow blink of affection!",
-            "BOTNAME meows appreciatively!",
-            "BOTNAME headbutts your hand for more pets!"
-        ]
-        selected_response = random.choice(bot_responses)
-        message = selected_response.replace("BOTNAME", bot_name)
+        message = random.choice(_pet_bot_responses).replace("BOTNAME", bot_name)
         logger.info('[%s] - pet bot command: %s', interaction.user, message)
         await interaction.response.send_message(message)
     except discord.errors.NotFound:
@@ -4167,10 +4122,6 @@ list_users_without_roles_error = _command_error_handler
 async def voice_chaperone_command(interaction: discord.Interaction, enabled: bool):
     """Enable or disable the voice channel chaperone functionality."""
     try:
-        # Import config module to modify the setting
-        import config
-        
-        # Update the configuration in the config module
         config.VOICE_CHAPERONE_ENABLED = enabled
         
         status = "enabled" if enabled else "disabled"
@@ -4197,10 +4148,6 @@ voice_chaperone_error = _command_error_handler
 async def update_checking_command(interaction: discord.Interaction, enabled: bool):
     """Enable or disable the automatic update checking functionality."""
     try:
-        # Import config module to modify the setting
-        import config
-        
-        # Update the configuration in the config module
         config.UPDATE_CHECKING_ENABLED = enabled
         
         status = "enabled" if enabled else "disabled"
@@ -4262,7 +4209,6 @@ def save_autoreplies():
 
 def generate_autoreply_id(guild_id: int) -> str:
     """Generate a unique ID for an autoreply rule."""
-    import uuid
     return f"{guild_id}_{uuid.uuid4().hex[:8]}"
 
 async def check_message_for_autoreplies(message):
