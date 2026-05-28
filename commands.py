@@ -287,18 +287,38 @@ class EventFeed:  # pylint: disable=too-few-public-methods,too-many-public-metho
             logger.error("Failed to load feeds file: %s", e)
 
     def _load_announce_config(self):
-        """Load announce config from disk."""
-        if not os.path.exists(ANNOUNCE_FILE):
+        """Load announce config from disk.
+
+        If the file is missing, backfill from any feed that has
+        announce=True so guilds added before announce_configs existed
+        keep working.
+        """
+        if os.path.exists(ANNOUNCE_FILE):
+            try:
+                with open(ANNOUNCE_FILE, 'r', encoding='utf-8') as f:
+                    raw = json.load(f)
+                for gid_str, ch_name in raw.items():
+                    self.announce_configs[int(gid_str)] = ch_name
+                logger.info("Loaded announce config for %d guilds",
+                            len(self.announce_configs))
+            except (OSError, IOError, json.JSONDecodeError) as e:
+                logger.error("Failed to load announce config: %s", e)
             return
-        try:
-            with open(ANNOUNCE_FILE, 'r', encoding='utf-8') as f:
-                raw = json.load(f)
-            for gid_str, ch_name in raw.items():
-                self.announce_configs[int(gid_str)] = ch_name
-            logger.info("Loaded announce config for %d guilds",
-                        len(self.announce_configs))
-        except (OSError, IOError, json.JSONDecodeError) as e:
-            logger.error("Failed to load announce config: %s", e)
+
+        migrated = False
+        for gid, feeds in self.feeds.items():
+            if gid in self.announce_configs:
+                continue
+            for feed_data in feeds.values():
+                if feed_data.get('announce') and feed_data.get('channel'):
+                    self.announce_configs[gid] = feed_data['channel']
+                    migrated = True
+                    break
+        if migrated:
+            logger.info(
+                "Migrated announce config from feeds for %d guilds",
+                len(self.announce_configs))
+            self._save_announce_config()
 
     def _save_announce_config(self):
         """Save announce config to disk."""
