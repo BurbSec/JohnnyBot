@@ -11,7 +11,6 @@ import asyncio
 import json
 import uuid
 import zipfile
-import socket
 import shutil
 from collections import deque
 from datetime import datetime, time as _dtime, timedelta, timezone
@@ -24,8 +23,6 @@ import aiohttp
 import feedparser
 import pytz
 from icalendar import Calendar
-from flask import Flask, send_file
-from waitress import serve
 try:
     from dateutil import parser as dateparser
 except ImportError:
@@ -36,7 +33,6 @@ from config import (
     LOG_FILE,
     REMINDERS_FILE,
     TEMP_DIR,
-    HOST_IP,
     BOT_TIMEZONE,
     logger
 )
@@ -1222,7 +1218,6 @@ tree: Optional[Any] = None
 scheduler: Optional[Any] = None  # APScheduler instance, set in setup_commands
 reminders: Dict[int, Dict[str, Any]] = {}
 event_feed: Optional[EventFeed] = None
-message_dump_servers: Dict[str, Any] = {}  # Store active message dump servers
 autoreplies: Dict[str, Dict[str, Any]] = {}  # Store autoreply rules {rule_id: rule_data}
 autoreplies_lock: Optional[threading.Lock] = None
 
@@ -1296,458 +1291,201 @@ def register_all_reminder_jobs():
         logger.info("Registered %d reminder jobs with scheduler", len(reminders))
 
 
-class MessageDumpServer:  # pylint: disable=too-many-instance-attributes
-    """Manages a temporary web server for hosting message dump files."""
-    def __init__(self, file_path, zip_path, duration=1800):  # 30 minutes default
-        self.file_path = file_path
-        self.zip_path = zip_path
-        self.duration = duration
-        self.app = Flask(__name__)
-        self.server_thread = None
-        self.shutdown_timer = None
-        self.port = self._find_free_port()
-        self.host_ip = self._get_host_ip()
-        
-        # Set up Flask route
-        @self.app.route('/')
-        def download_file():
-            return send_file(self.zip_path, as_attachment=True)
-    
-    def _find_free_port(self):
-        """Find a free port to use for the server."""
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.bind(('', 0))
-            return s.getsockname()[1]
-    
-    def _get_host_ip(self):
-        """Get the IP address to bind the server to based on config."""
-        if HOST_IP != "0.0.0.0":
-            # Use the specific IP from config
-            return HOST_IP
-        
-        # If HOST_IP is 0.0.0.0, find the interface with route to internet
-        return self._get_internet_facing_ip()
-    
-    def _get_internet_facing_ip(self):
-        """Get the IP of the interface that has a route to the internet."""
-        try:
-            # Create a socket and connect to a remote address to determine which interface is used
-            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-                # Connect to Google's DNS server (doesn't actually send data)
-                s.connect(("8.8.8.8", 80))
-                local_ip = s.getsockname()[0]
-                return local_ip
-        except Exception:  # pylint: disable=broad-exception-caught
-            # Fallback to localhost if we can't determine the internet-facing interface
-            logger.warning("Could not determine internet-facing interface, falling back to localhost")
-            return "127.0.0.1"
-    
-    def start(self):
-        """Start the web server in a separate thread."""
-        self._waitress_server = None
 
-        def run_server():
-            # Use create_server + run so we can close it gracefully
-            from waitress import create_server
-            self._waitress_server = create_server(self.app, host=self.host_ip, port=self.port)
-            self._waitress_server.run()
+def _reg(name, description, handler, *,
+         describe=None, mod_only=False, error=None):
+    """Register `handler` as a slash command directly (no wrapper function).
 
-        self.server_thread = threading.Thread(target=run_server, daemon=True)
-        self.server_thread.start()
+    handler must be an `async def` whose first arg is the interaction.
+    """
+    cmd = handler
+    if describe:
+        cmd = app_commands.describe(**describe)(cmd)
+    if mod_only:
+        cmd = app_commands.checks.has_role(MODERATOR_ROLE_NAME)(cmd)
+    cmd = tree.command(name=name, description=description)(cmd)
+    if error is not None:
+        cmd.on_error = error
+    return cmd
 
-        # Set up shutdown timer
-        self.shutdown_timer = threading.Timer(self.duration, self.cleanup)
-        self.shutdown_timer.start()
 
-        return f"http://{self.host_ip}:{self.port}"
-
-    def cleanup(self):
-        """Clean up resources when the server is shut down."""
-        # Stop the waitress server gracefully
-        try:
-            if self._waitress_server is not None:
-                self._waitress_server.close()
-        except Exception:  # pylint: disable=broad-exception-caught
-            logger.warning("Could not gracefully stop waitress server on port %s", self.port)
-
-        try:
-            if os.path.exists(self.file_path):
-                os.remove(self.file_path)
-            if os.path.exists(self.zip_path):
-                os.remove(self.zip_path)
-
-            parent_dir = os.path.dirname(self.file_path)
-            if os.path.exists(parent_dir) and not os.listdir(parent_dir):
-                os.rmdir(parent_dir)
-
-            logger.info("Cleaned up message dump files: %s, %s", self.file_path, self.zip_path)
-        except (OSError, IOError) as e:
-            logger.error("Error cleaning up message dump files: %s", e)
-
-        # Use list() to avoid modifying dict during iteration
-        for key, server in list(message_dump_servers.items()):
-            if server is self:
-                del message_dump_servers[key]
-                break
-
-def register_commands():  # pylint: disable=too-many-locals,too-many-statements
+def register_commands():
     """Register all commands with the command tree."""
     if tree is None:
         return
 
     tree.add_command(create_set_reminder_command())
 
-    @tree.command(name='list_reminders', description='Lists all current reminders')
-    async def list_reminders(interaction: discord.Interaction):
+    async def _list_reminders(interaction: discord.Interaction):
         """Lists all current reminders."""
         try:
             if not reminders:
-                await interaction.response.send_message('There are no reminders set.',
-                                                       ephemeral=True)
+                await interaction.response.send_message(
+                    'There are no reminders set.', ephemeral=True)
                 return
             reminder_list = '\n'.join(
-                f"**{reminder['title']}**: {reminder['message']} "
-                f"(every {reminder['interval']} seconds)"
-                for reminder in reminders.values()
-            )
-            await interaction.response.send_message(f'Current reminders:\n{reminder_list}',
-                                                   ephemeral=True)
+                f"**{r['title']}**: {r['message']} "
+                f"(every {r['interval']} seconds)"
+                for r in reminders.values())
+            await interaction.response.send_message(
+                f'Current reminders:\n{reminder_list}', ephemeral=True)
         except (discord.HTTPException, OSError, IOError) as e:
             logger.error('Error listing reminders: %s', e)
-            await interaction.response.send_message('Failed to list reminders due to an error.',
-                                                   ephemeral=True)
+            await interaction.response.send_message(
+                'Failed to list reminders due to an error.', ephemeral=True)
 
-    @tree.command(name='delete_all_reminders', description='Deletes all active reminders')
-    @app_commands.checks.has_role(MODERATOR_ROLE_NAME)
-    async def _delete_all_reminders(interaction: discord.Interaction) -> None:
-        await delete_all_reminders(interaction)
+    _reg('list_reminders', 'Lists all current reminders', _list_reminders)
+    _reg('delete_all_reminders', 'Deletes all active reminders',
+         delete_all_reminders, mod_only=True)
+    _reg('delete_reminder', 'Deletes a reminder by title',
+         delete_reminder, mod_only=True,
+         describe={'title': 'Title of the reminder to delete'})
+    _reg('purge_last_messages',
+         'Purges a specified number of messages from a channel',
+         purge_last_messages, mod_only=True,
+         describe={'channel': 'Channel to purge messages from',
+                   'limit': 'Number of messages to delete'},
+         error=purge_last_messages_error)
+    _reg('purge_string',
+         'Purges all messages containing a specific string from a channel',
+         purge_string, mod_only=True,
+         describe={'channel': 'Channel to purge messages from',
+                   'search_string': 'String to search for in messages'},
+         error=purge_string_error)
+    _reg('purge_webhooks',
+         'Purges all messages sent by webhooks or apps from a channel',
+         purge_webhooks, mod_only=True,
+         describe={'channel': 'Channel to purge messages from'},
+         error=purge_webhooks_error)
+    _reg('kick', 'Kicks one or more members from the server',
+         kick_members, mod_only=True,
+         describe={'members': 'Members to kick (separate multiple users with spaces)',
+                   'reason': 'Reason for kick'},
+         error=kick_error)
+    _reg('kick_role', 'Kicks all members with a specified role from the server',
+         kick_role, mod_only=True,
+         describe={'role': 'Role whose members to kick',
+                   'reason': 'Reason for kick'},
+         error=kick_role_error)
+    _reg('botsay', 'Makes the bot send a message to a specified channel',
+         botsay_message, mod_only=True,
+         describe={'channel': 'Channel to send the message to',
+                   'message': 'Message to send'},
+         error=botsay_error)
+    _reg('timeout', 'Timeouts a member for a specified duration',
+         timeout_member, mod_only=True,
+         describe={'member': 'Member to timeout',
+                   'duration': 'Timeout duration in seconds',
+                   'reason': 'Reason for timeout'},
+         error=timeout_error)
+    _reg('log_tail',
+         'DM the last specified number of lines of the bot log to the user',
+         log_tail_command,
+         describe={'lines': 'Number of lines to retrieve from the log'},
+         error=log_tail_error)
+    _reg('add_event_feed',
+         'Adds a calendar or RSS feed and its announcement channel',
+         add_event_feed_command,
+         describe={'feed_name': 'A short name to identify this feed',
+                   'calendar_url': 'URL of the calendar or RSS feed',
+                   'channel': 'Channel to post weekly/day-of event announcements'},
+         error=add_event_feed_error)
+    _reg('list_event_feeds', 'Lists all registered event feeds',
+         list_event_feeds_command)
+    _reg('remove_event_feed', 'Removes an event feed by name',
+         remove_event_feed_command,
+         describe={'feed_name': 'Name of the feed to remove'})
+    _reg('check_event_feeds',
+         'Manually check all event feeds for new events now',
+         check_event_feeds_command, error=check_event_feeds_error)
+    _reg('bot_mood', "Check on the bot's current mood", bot_command)
+    _reg('pet_bot', 'Pet the bot', pet_bot_command)
+    _reg('bot_pick_fav', 'See who the bot prefers today',
+         bot_pick_fav_command,
+         describe={'user1': 'First potential favorite',
+                   'user2': 'Second potential favorite'})
+    _reg('message_dump',
+         "Dump a user's messages from a channel into a downloadable file",
+         message_dump_command, mod_only=True,
+         describe={'user': "User whose messages to dump",
+                   'channel': "Channel to dump messages from",
+                   'start_date': "Start date in YYYY-MM-DD format (e.g., 2025-01-01)",
+                   'limit': "Maximum number of messages to fetch (default: 1000)"},
+         error=message_dump_error)
+    _reg('clone_category_permissions',
+         'Clone permissions from source category to destination category',
+         clone_category_permissions, mod_only=True,
+         describe={'source_category': 'Source category to copy permissions from',
+                   'destination_category': 'Destination category to copy permissions to'},
+         error=clone_category_permissions_error)
+    _reg('clone_channel_permissions',
+         'Clone permissions from source channel to destination channel',
+         clone_channel_permissions, mod_only=True,
+         describe={'source_channel': 'Source channel to copy permissions from',
+                   'destination_channel': 'Destination channel to copy permissions to'},
+         error=clone_channel_permissions_error)
+    _reg('clone_role_permissions',
+         'Clone permissions from source role to destination role',
+         clone_role_permissions, mod_only=True,
+         describe={'source_role': 'Source role to copy permissions from',
+                   'destination_role': 'Destination role to copy permissions to'},
+         error=clone_role_permissions_error)
+    _reg('clear_category_permissions',
+         'Clear all permission overwrites from a category',
+         clear_category_permissions, mod_only=True,
+         describe={'category': 'Category to clear all permission overwrites from'},
+         error=clear_category_permissions_error)
+    _reg('clear_channel_permissions',
+         'Clear all permission overwrites from a channel',
+         clear_channel_permissions, mod_only=True,
+         describe={'channel': 'Channel to clear all permission overwrites from'},
+         error=clear_channel_permissions_error)
+    _reg('clear_role_permissions',
+         'Clear all permissions from a role (reset to default)',
+         clear_role_permissions, mod_only=True,
+         describe={'role': 'Role to clear all permissions from'},
+         error=clear_role_permissions_error)
+    _reg('sync_channel_perms',
+         'Sync permissions for all channels in a category with the category permissions',
+         sync_channel_perms, mod_only=True,
+         describe={'source_category':
+                   'Category whose permissions will be synced to all its channels'},
+         error=sync_channel_perms_error)
+    _reg('list_users_without_roles',
+         'Lists all users that do not have any server role assigned',
+         list_users_without_roles, error=list_users_without_roles_error)
+    _reg('assign_role', 'Assigns a role to multiple users at once',
+         assign_role, mod_only=True,
+         describe={'role': 'Role to assign to the users',
+                   'members': 'Members to assign the role to (separate multiple users with spaces or newlines)'},
+         error=assign_role_error)
+    _reg('remove_role', 'Removes a role from multiple users at once',
+         remove_role, mod_only=True,
+         describe={'role': 'Role to remove from the users',
+                   'members': 'Members to remove the role from (separate multiple users with spaces or newlines)'},
+         error=remove_role_error)
+    _reg('voice_chaperone',
+         'Enable or disable the voice channel chaperone functionality',
+         voice_chaperone_command, mod_only=True,
+         describe={'enabled': 'True to enable, False to disable voice chaperone'},
+         error=voice_chaperone_error)
+    _reg('dashboard',
+         'Display a dashboard of all available commands grouped by category',
+         dashboard_command, error=dashboard_command_error)
 
-    @tree.command(name='delete_reminder', description='Deletes a reminder by title')
-    @app_commands.describe(title='Title of the reminder to delete')
-    @app_commands.checks.has_role(MODERATOR_ROLE_NAME)
-    async def _delete_reminder(interaction: discord.Interaction, title: str) -> None:
-        await delete_reminder(interaction, title)
-
-    @tree.command(name='purge_last_messages',
-                  description='Purges a specified number of messages from a channel')
-    @app_commands.describe(channel='Channel to purge messages from',
-                          limit='Number of messages to delete')
-    @app_commands.checks.has_role(MODERATOR_ROLE_NAME)
-    async def _purge_last_messages(interaction: discord.Interaction,
-                                  channel: discord.TextChannel, limit: int):
-        await purge_last_messages(interaction, channel, limit)
-
-    _purge_last_messages.on_error = purge_last_messages_error
-
-    @tree.command(name='purge_string',
-                  description='Purges all messages containing a specific string from a channel')
-    @app_commands.describe(channel='Channel to purge messages from',
-                          search_string='String to search for in messages')
-    @app_commands.checks.has_role(MODERATOR_ROLE_NAME)
-    async def _purge_string(interaction: discord.Interaction,
-                           channel: discord.TextChannel, search_string: str):
-        await purge_string(interaction, channel, search_string)
-
-    _purge_string.on_error = purge_string_error
-
-    @tree.command(name='purge_webhooks',
-                  description='Purges all messages sent by webhooks or apps from a channel')
-    @app_commands.describe(channel='Channel to purge messages from')
-    @app_commands.checks.has_role(MODERATOR_ROLE_NAME)
-    async def _purge_webhooks(interaction: discord.Interaction, channel: discord.TextChannel):
-        await purge_webhooks(interaction, channel)
-
-    _purge_webhooks.on_error = purge_webhooks_error
-
-    @tree.command(name='kick', description='Kicks one or more members from the server')
-    @app_commands.describe(
-        members='Members to kick (separate multiple users with spaces)',
-        reason='Reason for kick'
-    )
-    @app_commands.checks.has_role(MODERATOR_ROLE_NAME)
-    async def _kick(interaction: discord.Interaction, members: str,
-                   reason: Optional[str] = None):
-        await kick_members(interaction, members, reason)
-
-    _kick.on_error = kick_error
-
-    @tree.command(name='kick_role', description='Kicks all members with a specified role from the server')
-    @app_commands.describe(role='Role whose members to kick', reason='Reason for kick')
-    @app_commands.checks.has_role(MODERATOR_ROLE_NAME)
-    async def _kick_role(interaction: discord.Interaction, role: discord.Role,
-                        reason: Optional[str] = None):
-        await kick_role(interaction, role, reason)
-
-    _kick_role.on_error = kick_role_error
-
-    @tree.command(name='botsay', description='Makes the bot send a message to a specified channel')
-    @app_commands.describe(channel='Channel to send the message to', message='Message to send')
-    @app_commands.checks.has_role(MODERATOR_ROLE_NAME)
-    async def _botsay(interaction: discord.Interaction, channel: discord.TextChannel, message: str):
-        await botsay_message(interaction, channel, message)
-
-    _botsay.on_error = botsay_error
-
-    @tree.command(name='timeout', description='Timeouts a member for a specified duration')
-    @app_commands.describe(member='Member to timeout', duration='Timeout duration in seconds',
-                          reason='Reason for timeout')
-    @app_commands.checks.has_role(MODERATOR_ROLE_NAME)
-    async def _timeout(interaction: discord.Interaction, member: discord.Member,
-                      duration: int, reason: Optional[str] = None):
-        await timeout_member(interaction, member, duration, reason)
-
-    _timeout.on_error = timeout_error
-
-    @tree.command(name='log_tail',
-                  description='DM the last specified number of lines of the bot log to the user')
-    @app_commands.describe(lines='Number of lines to retrieve from the log')
-    async def _log_tail(interaction: discord.Interaction, lines: int):
-        await log_tail_command(interaction, lines)
-    
-    _log_tail.on_error = log_tail_error
-
-    @tree.command(name='add_event_feed',
-                  description='Adds a calendar or RSS feed and its announcement channel')
-    @app_commands.describe(
-        feed_name='A short name to identify this feed',
-        calendar_url='URL of the calendar or RSS feed',
-        channel='Channel to post weekly/day-of event announcements'
-    )
-    async def _add_event_feed(interaction: discord.Interaction,
-                              feed_name: str,
-                              calendar_url: str,
-                              channel: discord.TextChannel):
-        await add_event_feed_command(
-            interaction, feed_name, calendar_url, channel)
-
-    _add_event_feed.on_error = add_event_feed_error
-
-    @tree.command(name='list_event_feeds',
-                  description='Lists all registered event feeds')
-    async def _list_event_feeds(interaction: discord.Interaction):
-        await list_event_feeds_command(interaction)
-
-    @tree.command(name='remove_event_feed',
-                  description='Removes an event feed by name')
-    @app_commands.describe(
-        feed_name='Name of the feed to remove')
-    async def _remove_event_feed(interaction: discord.Interaction,
-                                 feed_name: str):
-        await remove_event_feed_command(interaction, feed_name)
-
-    @tree.command(name='check_event_feeds',
-                  description='Manually check all event feeds for new events now')
-    async def _check_event_feeds(interaction: discord.Interaction):
-        await check_event_feeds_command(interaction)
-
-    _check_event_feeds.on_error = check_event_feeds_error
-
-    @tree.command(name='bot_mood', description='Check on the bot\'s current mood')
-    async def _bot_mood(interaction: discord.Interaction):
-        await bot_command(interaction)
-
-    @tree.command(name='pet_bot', description='Pet the bot')
-    async def _pet_bot(interaction: discord.Interaction):
-        await pet_bot_command(interaction)
-
-    @tree.command(name='bot_pick_fav',
-                  description='See who the bot prefers today')
-    @app_commands.describe(
-        user1="First potential favorite",
-        user2="Second potential favorite"
-    )
-    async def _bot_pick_fav(interaction: discord.Interaction, user1: discord.User, user2: discord.User):
-        await bot_pick_fav_command(interaction, user1, user2)
-        
-    @tree.command(name='message_dump',
-                  description='Dump a user\'s messages from a channel into a downloadable file')
-    @app_commands.describe(
-        user="User whose messages to dump",
-        channel="Channel to dump messages from",
-        start_date="Start date in YYYY-MM-DD format (e.g., 2025-01-01)",
-        limit="Maximum number of messages to fetch (default: 1000)"
-    )
-    @app_commands.checks.has_role(MODERATOR_ROLE_NAME)
-    async def _message_dump(interaction: discord.Interaction, user: discord.User,
-                           channel: discord.TextChannel, start_date: str, limit: int = 1000):
-        await message_dump_command(interaction, user, channel, start_date, limit)
-    
-    _message_dump.on_error = message_dump_error
-
-    @tree.command(name='clone_category_permissions',
-                  description='Clone permissions from source category to destination category')
-    @app_commands.describe(
-        source_category='Source category to copy permissions from',
-        destination_category='Destination category to copy permissions to'
-    )
-    @app_commands.checks.has_role(MODERATOR_ROLE_NAME)
-    async def _clone_category_permissions(interaction: discord.Interaction,
-                                        source_category: discord.CategoryChannel,
-                                        destination_category: discord.CategoryChannel):
-        await clone_category_permissions(interaction, source_category, destination_category)
-
-    _clone_category_permissions.on_error = clone_category_permissions_error
-
-    @tree.command(name='clone_channel_permissions',
-                  description='Clone permissions from source channel to destination channel')
-    @app_commands.describe(
-        source_channel='Source channel to copy permissions from',
-        destination_channel='Destination channel to copy permissions to'
-    )
-    @app_commands.checks.has_role(MODERATOR_ROLE_NAME)
-    async def _clone_channel_permissions(interaction: discord.Interaction,
-                                       source_channel: discord.abc.GuildChannel,
-                                       destination_channel: discord.abc.GuildChannel):
-        await clone_channel_permissions(interaction, source_channel, destination_channel)
-
-    _clone_channel_permissions.on_error = clone_channel_permissions_error
-
-    @tree.command(name='clone_role_permissions',
-                  description='Clone permissions from source role to destination role')
-    @app_commands.describe(
-        source_role='Source role to copy permissions from',
-        destination_role='Destination role to copy permissions to'
-    )
-    @app_commands.checks.has_role(MODERATOR_ROLE_NAME)
-    async def _clone_role_permissions(interaction: discord.Interaction,
-                                    source_role: discord.Role,
-                                    destination_role: discord.Role):
-        await clone_role_permissions(interaction, source_role, destination_role)
-
-    # Add error handler for clone_role_permissions
-    _clone_role_permissions.on_error = clone_role_permissions_error
-
-    # Register clear_category_permissions command
-    @tree.command(name='clear_category_permissions',
-                  description='Clear all permission overwrites from a category')
-    @app_commands.describe(
-        category='Category to clear all permission overwrites from'
-    )
-    @app_commands.checks.has_role(MODERATOR_ROLE_NAME)
-    async def _clear_category_permissions(interaction: discord.Interaction,
-                                        category: discord.CategoryChannel):
-        await clear_category_permissions(interaction, category)
-
-    # Add error handler for clear_category_permissions
-    _clear_category_permissions.on_error = clear_category_permissions_error
-
-    # Register clear_channel_permissions command
-    @tree.command(name='clear_channel_permissions',
-                  description='Clear all permission overwrites from a channel')
-    @app_commands.describe(
-        channel='Channel to clear all permission overwrites from'
-    )
-    @app_commands.checks.has_role(MODERATOR_ROLE_NAME)
-    async def _clear_channel_permissions(interaction: discord.Interaction,
-                                       channel: discord.abc.GuildChannel):
-        await clear_channel_permissions(interaction, channel)
-
-    # Add error handler for clear_channel_permissions
-    _clear_channel_permissions.on_error = clear_channel_permissions_error
-
-    # Register clear_role_permissions command
-    @tree.command(name='clear_role_permissions',
-                  description='Clear all permissions from a role (reset to default)')
-    @app_commands.describe(
-        role='Role to clear all permissions from'
-    )
-    @app_commands.checks.has_role(MODERATOR_ROLE_NAME)
-    async def _clear_role_permissions(interaction: discord.Interaction,
-                                    role: discord.Role):
-        await clear_role_permissions(interaction, role)
-
-    # Add error handler for clear_role_permissions
-    _clear_role_permissions.on_error = clear_role_permissions_error
-
-    # Register sync_channel_perms command
-    @tree.command(name='sync_channel_perms',
-                  description='Sync permissions for all channels in a category with the category permissions')
-    @app_commands.describe(
-        source_category='Category whose permissions will be synced to all its channels'
-    )
-    @app_commands.checks.has_role(MODERATOR_ROLE_NAME)
-    async def _sync_channel_perms(interaction: discord.Interaction,
-                                source_category: discord.CategoryChannel):
-        await sync_channel_perms(interaction, source_category)
-
-    # Add error handler for sync_channel_perms
-    _sync_channel_perms.on_error = sync_channel_perms_error
-
-    # Register list_users_without_roles command
-    @tree.command(name='list_users_without_roles',
-                  description='Lists all users that do not have any server role assigned')
-    async def _list_users_without_roles(interaction: discord.Interaction):
-        await list_users_without_roles(interaction)
-
-    # Add error handler for list_users_without_roles
-    _list_users_without_roles.on_error = list_users_without_roles_error
-
-    # Register assign_role command
-    @tree.command(name='assign_role',
-                  description='Assigns a role to multiple users at once')
-    @app_commands.describe(
-        role='Role to assign to the users',
-        members='Members to assign the role to (separate multiple users with spaces or newlines)'
-    )
-    @app_commands.checks.has_role(MODERATOR_ROLE_NAME)
-    async def _assign_role(interaction: discord.Interaction, role: discord.Role,
-                          members: str):
-        await assign_role(interaction, role, members)
-
-    # Add error handler for assign_role
-    _assign_role.on_error = assign_role_error
-
-    # Register remove_role command
-    @tree.command(name='remove_role',
-                  description='Removes a role from multiple users at once')
-    @app_commands.describe(
-        role='Role to remove from the users',
-        members='Members to remove the role from (separate multiple users with spaces or newlines)'
-    )
-    @app_commands.checks.has_role(MODERATOR_ROLE_NAME)
-    async def _remove_role(interaction: discord.Interaction, role: discord.Role,
-                          members: str):
-        await remove_role(interaction, role, members)
-
-    # Add error handler for remove_role
-    _remove_role.on_error = remove_role_error
-
-    # Register voice_chaperone command
-    @tree.command(name='voice_chaperone',
-                  description='Enable or disable the voice channel chaperone functionality')
-    @app_commands.describe(enabled='True to enable, False to disable voice chaperone')
-    @app_commands.checks.has_role(MODERATOR_ROLE_NAME)
-    async def _voice_chaperone(interaction: discord.Interaction, enabled: bool):
-        await voice_chaperone_command(interaction, enabled)
-
-    # Add error handler for voice_chaperone
-    _voice_chaperone.on_error = voice_chaperone_error
-
-    # Register update checking command
     register_update_checking_command()
-    
-    # Register dashboard command
-    @tree.command(name='dashboard', description='Display a dashboard of all available commands grouped by category')
-    async def _dashboard(interaction: discord.Interaction):
-        await dashboard_command(interaction)
-    
-    _dashboard.on_error = dashboard_command_error
-    
-    # Register autoreply commands
     register_autoreply_commands()
-
 
 def setup_commands(bot_param):
     """Initialize command module with bot instance and register commands."""
     # Using globals is necessary here to initialize module-level variables
     # pylint: disable=global-statement
-    global bot_instance, tree, scheduler, reminders, event_feed, message_dump_servers, autoreplies, autoreplies_lock  # pylint: disable=line-too-long
+    global bot_instance, tree, scheduler, reminders, event_feed, autoreplies, autoreplies_lock  # pylint: disable=line-too-long
     bot_instance = bot_param
     if bot_instance:
         tree = bot_instance.tree
     reminders = {}
     event_feed = EventFeed(bot_instance)
-    message_dump_servers = {}
     autoreplies = {}
     autoreplies_lock = threading.Lock()
 
@@ -2690,38 +2428,34 @@ async def message_dump_command(interaction: discord.Interaction, user: discord.U
         # Compress the file
         with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
             zipf.write(file_path, os.path.basename(file_path))
-        
-        # Start the web server
-        server = MessageDumpServer(file_path, zip_path)
-        download_url = server.start()
-        
-        # Store the server in the active servers dictionary
-        server_key = f"{interaction.user.id}_{timestamp}"
-        message_dump_servers[server_key] = server
-        
-        # Send DM to the user with the download link
-        expiry_time = (datetime.now() + timedelta(seconds=1800)).strftime("%Y-%m-%d %H:%M:%S")
-        # Build DM message more efficiently
-        dm_parts = [
-            f"Here's the message dump you requested from {channel.mention}:\n\n",
-            f"**Download Link:** {download_url}\n",
-            f"**User:** {user.mention}\n",
-            f"**Start Date:** {start_date}\n",
-            f"**Messages found:** {len(messages)}\n",
-            f"**Messages processed:** {total_processed}\n",
-            f"**Link expires:** {expiry_time} (30 minutes from now)\n\n",
-            "The file will be automatically deleted after the link expires."
-        ]
-        dm_message = ''.join(dm_parts)
-        
-        await interaction.user.send(dm_message)
-        
-        # Send a confirmation in the channel where the command was used
+
+        # Discord DM file-size cap is 25 MB without Nitro.
+        # If we're over, fall back to telling the user we can't send it.
+        zip_size = os.path.getsize(zip_path)
+        max_size = 25 * 1024 * 1024
+        if zip_size > max_size:
+            await interaction.followup.send(
+                f"Message dump is too large to DM via Discord "
+                f"({zip_size / 1024 / 1024:.1f} MB, limit is 25 MB). "
+                f"Try a smaller `limit` or a more recent `start_date`.",
+                ephemeral=True)
+            shutil.rmtree(dump_dir, ignore_errors=True)
+            return
+
+        dm_message = (
+            f"Here's the message dump you requested from {channel.mention}:\n\n"
+            f"**User:** {user.mention}\n"
+            f"**Start Date:** {start_date}\n"
+            f"**Messages found:** {len(messages)}\n"
+            f"**Messages processed:** {total_processed}")
+
+        await interaction.user.send(
+            dm_message, file=discord.File(zip_path))
+
         await interaction.followup.send(
-            f"Message dump for {user.mention} from {channel.mention} has been created. "
-            f"Check your DMs for the download link. The link will expire in 30 minutes.",
-            ephemeral=True
-        )
+            f"Message dump for {user.mention} from {channel.mention} sent "
+            f"to your DMs.", ephemeral=True)
+        shutil.rmtree(dump_dir, ignore_errors=True)
         
     except discord.Forbidden:
         await interaction.followup.send("I don't have permission to access that channel or send you DMs.", ephemeral=True)

@@ -26,7 +26,6 @@ def _install_config_stub():
     cfg.UPDATE_CHECKING_ENABLED = False
     cfg.UPDATE_CHECK_REPO_URL = 'https://github.com/example/repo'
     cfg.BOT_TIMEZONE = 'America/Chicago'
-    cfg.HOST_IP = '127.0.0.1'
     cfg.TOKEN = 'test-token'
 
     tmp = tempfile.mkdtemp(prefix='johnnybot-test-')

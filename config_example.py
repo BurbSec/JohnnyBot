@@ -26,9 +26,6 @@ UPDATE_CHECK_REPO_URL = "https://github.com/BurbSec/JohnnyBot"
 # Timezone for scheduled jobs and event announcements
 BOT_TIMEZONE = 'America/Chicago'
 
-# The IP of the interface which will host downloadable archives
-HOST_IP = "0.0.0.0"
-
 TOKEN = os.environ.get('DISCORD_BOT_TOKEN')
 if not TOKEN:
     raise ValueError("DISCORD_BOT_TOKEN environment variable is not set")

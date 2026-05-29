@@ -119,9 +119,8 @@ MODERATOR_ROLE_NAME, however the PetBot commands can be leveraged by all users.
 
 ## Requirements
 
-- **Python 3.8+** (tested up to 3.13)
+- **Python 3.11+** (tested on 3.11 and 3.12 in CI)
 - **Dependencies:** Listed in [`requirements.txt`](requirements.txt)
-- **Network:** TCP port access for message archive hosting (auto-selects a free port)
 
 ## Contributing
 
