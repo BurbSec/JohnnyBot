@@ -2736,430 +2736,220 @@ async def message_dump_command(interaction: discord.Interaction, user: discord.U
         await interaction.followup.send("An unexpected error occurred.", ephemeral=True)
 
 message_dump_error = _command_error_handler
-async def clone_category_permissions(interaction: discord.Interaction,  # pylint: disable=too-many-branches,too-many-locals,too-many-statements,too-many-nested-blocks
-                                   source_category: discord.CategoryChannel,
-                                   destination_category: discord.CategoryChannel):
-    """Clone permissions from source category to destination category."""
+_DANGEROUS_PERM_ATTRS = (
+    'administrator', 'ban_members', 'kick_members', 'manage_roles',
+    'manage_guild', 'manage_channels', 'manage_messages', 'moderate_members',
+)
+
+
+def _has_dangerous_perms(role):
+    """True if Discord blocks bots from managing this role."""
+    perms = role.permissions
+    return any(getattr(perms, a) for a in _DANGEROUS_PERM_ATTRS)
+
+
+def _classify_perm_target(target, bot_top_role):
+    """Decide how a permission target should be handled.
+
+    Returns one of: 'process', 'skip_other', 'skip_admin', 'skip_managed',
+    'skip_hierarchy', 'skip_dangerous'.
+    """
+    if not isinstance(target, (discord.Member, discord.Role)):
+        return 'skip_other'
+    if isinstance(target, discord.Role):
+        if target.permissions.administrator:
+            return 'skip_admin'
+        if target.managed:
+            return 'skip_managed'
+        if bot_top_role and target >= bot_top_role:
+            return 'skip_hierarchy'
+        if _has_dangerous_perms(target):
+            return 'skip_dangerous'
+    return 'process'
+
+
+def _empty_counts():
+    return {'processed': 0, 'skipped_admin': 0, 'skipped_managed': 0,
+            'skipped_hierarchy': 0, 'skipped_dangerous': 0}
+
+
+async def _apply_to_overwrites(obj, action_label, items, apply_fn):
+    """Iterate (target, overwrite_or_None) pairs and apply apply_fn(target, ow).
+
+    Filters out admin/managed/hierarchy/dangerous targets. Returns counts.
+    """
+    bot_member = obj.guild.me
+    bot_top_role = bot_member.top_role if bot_member else None
+    counts = _empty_counts()
+
+    for target, overwrite in items:
+        verdict = _classify_perm_target(target, bot_top_role)
+        if verdict == 'skip_other':
+            continue
+        if verdict != 'process':
+            counts[verdict] += 1
+            logger.info('Skipped %s for %s on %s (%s)',
+                        action_label, target, obj.name, verdict)
+            continue
+        try:
+            await apply_fn(target, overwrite)
+            counts['processed'] += 1
+            logger.info('%s permissions for %s on %s',
+                        action_label.capitalize(), target, obj.name)
+        except discord.Forbidden as e:
+            counts['skipped_hierarchy'] += 1
+            logger.error('Failed to %s permissions for %s: %s',
+                         action_label, target, e)
+        except discord.HTTPException as e:
+            logger.error('Failed to %s permissions for %s: %s',
+                         action_label, target, e)
+    return counts
+
+
+async def _clear_overwrites_on(obj):
+    """Clear permission overwrites on a channel or category."""
+    items = [(t, None) for t in list(obj.overwrites.keys())]
+    return await _apply_to_overwrites(
+        obj, 'clear', items,
+        lambda t, _ow: obj.set_permissions(t, overwrite=None))
+
+
+async def _copy_overwrites(src, dst):
+    """Copy permission overwrites from src to dst."""
+    items = list(src.overwrites.items())
+    return await _apply_to_overwrites(
+        dst, 'copy', items,
+        lambda t, ow: dst.set_permissions(t, overwrite=ow))
+
+
+def _format_skip_notes(counts):
+    notes = []
+    if counts['skipped_admin']:
+        notes.append(
+            f'Skipped {counts["skipped_admin"]} Administrator role(s) '
+            f'for security reasons')
+    if counts['skipped_managed']:
+        notes.append(
+            f'Skipped {counts["skipped_managed"]} managed role(s) '
+            f'(bot roles, booster roles, etc.)')
+    if counts['skipped_hierarchy']:
+        notes.append(
+            f'Skipped {counts["skipped_hierarchy"]} role(s) due to '
+            f'hierarchy')
+    if counts['skipped_dangerous']:
+        notes.append(
+            f"Skipped {counts['skipped_dangerous']} role(s) due to "
+            f"Discord's restrictions on bots managing roles with "
+            f"moderation permissions")
+    return notes
+
+
+_PERM_FORBIDDEN_HELP = (
+    'I don\'t have permission to manage permissions on one or both '
+    'targets.\n\n'
+    '**Possible causes:**\n'
+    '• I lack "Manage Channels" permission\n'
+    '• I lack "Manage Roles" permission\n'
+    '• My role is not high enough in the hierarchy\n'
+    '• Discord restricts bots from managing roles with moderation '
+    'permissions (ban_members, kick_members, etc.)\n\n'
+    '**Solutions:**\n'
+    '• Ensure I have "Manage Channels" and "Manage Roles" permissions\n'
+    '• Move my role higher in Server Settings > Roles\n'
+    '• For roles with moderation permissions, copy them manually'
+)
+
+
+async def _clone_permissions_command(interaction, src, dst, kind):
+    """Shared implementation for clone_category/clone_channel."""
     try:
         await interaction.response.defer(ephemeral=True)
-        
-        # Verify both categories are in the same guild
-        if source_category.guild.id != destination_category.guild.id:
+
+        if src.guild.id != dst.guild.id:
             await interaction.followup.send(
-                'Source and destination categories must be in the same server.',
-                ephemeral=True
-            )
+                f'Source and destination {kind}s must be in the same '
+                f'server.', ephemeral=True)
             return
-        
-        # Clear existing permissions on destination category
+
         await interaction.followup.send(
-            f'Clearing existing permissions on {destination_category.name}...',
-            ephemeral=True
-        )
-        
-        # Get the bot's highest role for hierarchy checking
-        bot_member = destination_category.guild.me
-        bot_top_role = bot_member.top_role if bot_member else None
-        
-        # Get all current overwrites and clear them (except Administrator, managed, and hierarchy-protected roles)
-        for target in list(destination_category.overwrites.keys()):
-            try:
-                # Only process Member and Role objects, skip others
-                if isinstance(target, (discord.Member, discord.Role)):
-                    # Skip roles with Administrator permission to preserve Server Owner permissions
-                    if isinstance(target, discord.Role) and target.permissions.administrator:
-                        logger.info('Skipped clearing Administrator role %s on category %s', target, destination_category.name)
-                        continue
-                    # Skip managed roles (bot roles, booster roles, etc.) that can't be modified
-                    if isinstance(target, discord.Role) and target.managed:
-                        logger.info('Skipped clearing managed role %s on category %s', target, destination_category.name)
-                        continue
-                    # Skip roles that are higher than or equal to the bot's highest role
-                    if isinstance(target, discord.Role) and bot_top_role and target >= bot_top_role:
-                        logger.info('Skipped clearing role %s (hierarchy: role position %d >= bot position %d)',
-                                   target.name, target.position, bot_top_role.position)
-                        continue
-                    # Additional check for privileged roles that might cause issues
-                    if isinstance(target, discord.Role):
-                        if target.permissions.manage_roles or target.permissions.manage_guild or target.permissions.manage_channels:
-                            if bot_top_role and target >= bot_top_role:
-                                logger.info('Skipped clearing privileged role %s (has management permissions and position %d >= bot position %d)',
-                                           target.name, target.position, bot_top_role.position)
-                                continue
-                    await destination_category.set_permissions(target, overwrite=None)
-                    logger.info('Cleared permissions for %s on category %s', target, destination_category.name)
-            except discord.Forbidden as e:
-                # Log as hierarchy issue if it's a role
-                if isinstance(target, discord.Role):
-                    logger.error('Failed to clear permissions for role %s (likely hierarchy issue or Discord\'s limitation on bots not being allowed go manage Moderator-style roles. You must manage these manually): %s', target.name, e)
-                else:
-                    logger.error('Failed to clear permissions for %s: %s', target, e)
-                # Continue without spamming user with individual errors
-                continue
-            except discord.HTTPException as e:
-                logger.error('Failed to clear permissions for %s: %s', target, e)
-        
-        # Copy permissions from source to destination
+            f'Clearing existing permissions on {dst.name}...',
+            ephemeral=True)
+        await _clear_overwrites_on(dst)
+
         await interaction.followup.send(
-            f'Copying permissions from {source_category.name} to {destination_category.name}...',
-            ephemeral=True
-        )
-        
-        copied_count = 0
-        skipped_admin_count = 0
-        skipped_managed_count = 0
-        skipped_hierarchy_count = 0
-        failed_hierarchy_roles = []  # Track specific roles that failed due to hierarchy
-        
-        # Get the bot's highest role for hierarchy checking
-        bot_member = destination_category.guild.me
-        bot_top_role = bot_member.top_role if bot_member else None
-        
-        # Log bot's role information for debugging
-        if bot_top_role:
-            logger.info('Bot\'s highest role: %s (position: %d)', bot_top_role.name, bot_top_role.position)
-        else:
-            logger.warning('Could not determine bot\'s highest role')
-        
-        for target, overwrite in source_category.overwrites.items():
-            try:
-                # Only process Member and Role objects, skip others
-                if isinstance(target, (discord.Member, discord.Role)):
-                    # Skip roles with Administrator permission to preserve Server Owner permissions
-                    if isinstance(target, discord.Role) and target.permissions.administrator:
-                        skipped_admin_count += 1
-                        logger.info('Skipped copying Administrator role %s from %s to %s',
-                                   target, source_category.name, destination_category.name)
-                        continue
-                    
-                    # Skip managed roles (bot roles, booster roles, etc.) that can't be modified
-                    if isinstance(target, discord.Role) and target.managed:
-                        skipped_managed_count += 1
-                        logger.info('Skipped copying managed role %s from %s to %s',
-                                   target, source_category.name, destination_category.name)
-                        continue
-                    
-                    # Skip roles that are higher than or equal to the bot's highest role
-                    if isinstance(target, discord.Role) and bot_top_role:
-                        # Log role comparison for debugging
-                        logger.info('Checking role %s (position: %d) vs bot role %s (position: %d)',
-                                   target.name, target.position, bot_top_role.name, bot_top_role.position)
-                        if target >= bot_top_role:
-                            skipped_hierarchy_count += 1
-                            failed_hierarchy_roles.append(target.name)
-                            logger.info('Skipped copying role %s (hierarchy: role position %d >= bot position %d)',
-                                       target.name, target.position, bot_top_role.position)
-                            continue
-                    
-                    # Test if we can actually modify this role by checking Discord's restrictions
-                    if isinstance(target, discord.Role):
-                        # Check if the bot can manage this role
-                        if not bot_member.guild_permissions.manage_roles:
-                            logger.info('Skipped copying role %s (bot lacks manage_roles permission)', target.name)
-                            continue
-                        
-                        # Check for Discord's restricted permissions that bots cannot manage
-                        # Discord prevents bots from managing roles with these dangerous permissions
-                        dangerous_perms = [
-                            target.permissions.ban_members,
-                            target.permissions.kick_members,
-                            target.permissions.manage_roles,
-                            target.permissions.manage_guild,
-                            target.permissions.manage_channels,
-                            target.permissions.manage_messages,
-                            target.permissions.moderate_members,
-                            target.permissions.administrator
-                        ]
-                        
-                        if any(dangerous_perms):
-                            skipped_hierarchy_count += 1
-                            failed_hierarchy_roles.append(target.name)
-                            logger.info('Skipped copying role %s (Discord restricts bots from managing roles with moderation permissions like ban_members, kick_members, etc.)',
-                                       target.name)
-                            continue
-                    
-                    await destination_category.set_permissions(target, overwrite=overwrite)
-                    copied_count += 1
-                    logger.info('Copied permissions for %s from %s to %s',
-                               target, source_category.name, destination_category.name)
-            except discord.Forbidden as e:
-                # Log the specific role that failed and provide detailed feedback
-                if isinstance(target, discord.Role):
-                    skipped_hierarchy_count += 1
-                    failed_hierarchy_roles.append(target.name)
-                    
-                    # Check if this is likely due to Discord's moderation permission restrictions
-                    dangerous_perms = [
-                        target.permissions.ban_members,
-                        target.permissions.kick_members,
-                        target.permissions.manage_roles,
-                        target.permissions.manage_guild,
-                        target.permissions.manage_channels,
-                        target.permissions.manage_messages,
-                        target.permissions.moderate_members,
-                        target.permissions.administrator
-                    ]
-                    
-                    if any(dangerous_perms):
-                        logger.error('Failed to copy permissions for role %s - Discord restricts bots from managing roles with moderation permissions (ban_members, kick_members, etc.): %s', target.name, e)
-                        await interaction.followup.send(
-                            f' **Discord Restriction**: Cannot copy permissions for role **{target.name}** because Discord prevents bots from managing roles with moderation permissions like ban_members, kick_members, manage_roles, etc. You\'ll need to copy these permissions manually.',
-                            ephemeral=True
-                        )
-                    else:
-                        logger.error('Failed to copy permissions for role %s (likely hierarchy issue): %s', target.name, e)
-                else:
-                    logger.error('Failed to copy permissions for %s: %s', target, e)
-                continue
-            except discord.HTTPException as e:
-                logger.error('Failed to copy permissions for %s: %s', target, e)
-                await interaction.followup.send(
-                    f'Warning: Failed to copy permissions for {target}: {e}',
-                    ephemeral=True
-                )
-        
+            f'Copying permissions from {src.name} to {dst.name}...',
+            ephemeral=True)
+        counts = await _copy_overwrites(src, dst)
+
         success_msg = (
-            f'Successfully cloned permissions from **{source_category.name}** to **{destination_category.name}**.\n'
-            f'Copied {copied_count} permission overrides.'
-        )
-        
-        notes = []
-        if skipped_admin_count > 0:
-            notes.append(f'Skipped {skipped_admin_count} Administrator role(s) for security reasons')
-        if skipped_managed_count > 0:
-            notes.append(f'Skipped {skipped_managed_count} managed role(s) (bot roles, booster roles, etc.)')
-        if skipped_hierarchy_count > 0:
-            notes.append(f'Skipped {skipped_hierarchy_count} role(s) due to Discord\'s restrictions on bots managing roles with moderation permissions (ban_members, kick_members, etc.)')
-        
+            f'Successfully cloned permissions from **{src.name}** to '
+            f'**{dst.name}**.\n'
+            f'Copied {counts["processed"]} permission overrides.')
+        notes = _format_skip_notes(counts)
         if notes:
             success_msg += f'\n\n **Note:** {", ".join(notes)}.'
-        
         await interaction.followup.send(success_msg, ephemeral=True)
-        
+
     except discord.Forbidden:
-        await interaction.followup.send(
-            'I don\'t have permission to manage permissions on one or both categories.\n\n'
-            '**Possible causes:**\n'
-            '• I lack "Manage Channels" permission\n'
-            '• I lack "Manage Roles" permission\n'
-            '• My role is not high enough in the hierarchy to modify permissions for some roles/members\n'
-            '• Discord restricts bots from managing roles with moderation permissions (ban_members, kick_members, manage_roles, etc.)\n\n'
-            '**Solutions:**\n'
-            '• Ensure I have "Manage Channels" and "Manage Roles" permissions\n'
-            '• Move my role higher than the roles you want to copy permissions for in Server Settings > Roles\n'
-            '• For roles with moderation permissions, you\'ll need to copy their permissions manually as Discord prevents bots from managing these roles for security reasons',
-            ephemeral=True
-        )
+        await interaction.followup.send(_PERM_FORBIDDEN_HELP, ephemeral=True)
     except discord.HTTPException as e:
-        logger.error('Discord API error in clone_category_permissions: %s', e)
+        logger.error('Discord API error in clone_%s_permissions: %s', kind, e)
         await interaction.followup.send(
-            'A Discord API error occurred. Probably rate limiting. Trying a workaround...',
-            ephemeral=True
-        )
-    except Exception as e:
-        logger.error('Unexpected error in clone_category_permissions: %s', e)
+            'A Discord API error occurred. Probably rate limiting.',
+            ephemeral=True)
+    except Exception as e:  # pylint: disable=broad-exception-caught
+        logger.error('Unexpected error in clone_%s_permissions: %s', kind, e)
         await interaction.followup.send(
             'An unexpected error occurred while cloning permissions.',
-            ephemeral=True
-        )
+            ephemeral=True)
+
+
+async def _clear_permissions_command(interaction, obj, kind):
+    """Shared implementation for clear_category/clear_channel."""
+    try:
+        await interaction.response.defer(ephemeral=True)
+
+        await interaction.followup.send(
+            f'Clearing all permission overwrites from **{obj.name}**...',
+            ephemeral=True)
+        counts = await _clear_overwrites_on(obj)
+
+        success_msg = (
+            f'Successfully cleared permissions from **{obj.name}**.\n'
+            f'Cleared {counts["processed"]} permission overwrites.')
+        notes = _format_skip_notes(counts)
+        if notes:
+            success_msg += f'\n\n **Note:** {", ".join(notes)}.'
+        await interaction.followup.send(success_msg, ephemeral=True)
+
+    except discord.Forbidden:
+        await interaction.followup.send(_PERM_FORBIDDEN_HELP, ephemeral=True)
+    except discord.HTTPException as e:
+        logger.error('Discord API error in clear_%s_permissions: %s', kind, e)
+        await interaction.followup.send(
+            'A Discord API error occurred while clearing permissions.',
+            ephemeral=True)
+    except Exception as e:  # pylint: disable=broad-exception-caught
+        logger.error('Unexpected error in clear_%s_permissions: %s', kind, e)
+        await interaction.followup.send(
+            'An unexpected error occurred while clearing permissions.',
+            ephemeral=True)
+
+
+async def clone_category_permissions(interaction: discord.Interaction,
+                                     source_category: discord.CategoryChannel,
+                                     destination_category: discord.CategoryChannel):
+    """Clone permissions from source category to destination category."""
+    await _clone_permissions_command(
+        interaction, source_category, destination_category, kind='category')
 
 clone_category_permissions_error = _command_error_handler
-async def clone_channel_permissions(interaction: discord.Interaction,  # pylint: disable=too-many-branches,too-many-statements,too-many-nested-blocks
-                                  source_channel: discord.abc.GuildChannel,
-                                  destination_channel: discord.abc.GuildChannel):
+async def clone_channel_permissions(interaction: discord.Interaction,
+                                    source_channel: discord.abc.GuildChannel,
+                                    destination_channel: discord.abc.GuildChannel):
     """Clone permissions from source channel to destination channel."""
-    try:
-        await interaction.response.defer(ephemeral=True)
-        
-        # Verify both channels are in the same guild
-        if source_channel.guild.id != destination_channel.guild.id:
-            await interaction.followup.send(
-                'Source and destination channels must be in the same server.',
-                ephemeral=True
-            )
-            return
-        
-        # Clear existing permissions on destination channel
-        await interaction.followup.send(
-            f'Clearing existing permissions on {destination_channel.name}...',
-            ephemeral=True
-        )
-        
-        # Get the bot's highest role for hierarchy checking
-        bot_member = destination_channel.guild.me
-        bot_top_role = bot_member.top_role if bot_member else None
-        
-        # Get all current overwrites and clear them (except Administrator, managed, and hierarchy-protected roles)
-        for target in list(destination_channel.overwrites.keys()):
-            try:
-                # Only process Member and Role objects, skip others
-                if isinstance(target, (discord.Member, discord.Role)):
-                    # Skip roles with Administrator permission to preserve Server Owner permissions
-                    if isinstance(target, discord.Role) and target.permissions.administrator:
-                        logger.info('Skipped clearing Administrator role %s on channel %s', target, destination_channel.name)
-                        continue
-                    # Skip managed roles (bot roles, booster roles, etc.) that can't be modified
-                    if isinstance(target, discord.Role) and target.managed:
-                        logger.info('Skipped clearing managed role %s on channel %s', target, destination_channel.name)
-                        continue
-                    # Skip roles that are higher than or equal to the bot's highest role
-                    if isinstance(target, discord.Role) and bot_top_role and target >= bot_top_role:
-                        logger.info('Skipped clearing role %s (hierarchy: role position %d >= bot position %d)',
-                                   target.name, target.position, bot_top_role.position)
-                        continue
-                    await destination_channel.set_permissions(target, overwrite=None)
-                    logger.info('Cleared permissions for %s on channel %s', target, destination_channel.name)
-            except discord.Forbidden as e:
-                logger.error('Failed to clear permissions for %s: %s', target, e)
-                # Continue without spamming user with individual errors
-                continue
-            except discord.HTTPException as e:
-                logger.error('Failed to clear permissions for %s: %s', target, e)
-        
-        # Copy permissions from source to destination
-        await interaction.followup.send(
-            f'Copying permissions from {source_channel.name} to {destination_channel.name}...',
-            ephemeral=True
-        )
-        
-        copied_count = 0
-        skipped_admin_count = 0
-        skipped_managed_count = 0
-        skipped_hierarchy_count = 0
-        
-        # Get the bot's highest role for hierarchy checking
-        bot_member = destination_channel.guild.me
-        bot_top_role = bot_member.top_role if bot_member else None
-        
-        for target, overwrite in source_channel.overwrites.items():
-            try:
-                # Only process Member and Role objects, skip others
-                if isinstance(target, (discord.Member, discord.Role)):
-                    # Skip roles with Administrator permission to preserve Server Owner permissions
-                    if isinstance(target, discord.Role) and target.permissions.administrator:
-                        skipped_admin_count += 1
-                        logger.info('Skipped copying Administrator role %s from %s to %s',
-                                   target, source_channel.name, destination_channel.name)
-                        continue
-                    
-                    # Skip managed roles (bot roles, booster roles, etc.) that can't be modified
-                    if isinstance(target, discord.Role) and target.managed:
-                        skipped_managed_count += 1
-                        logger.info('Skipped copying managed role %s from %s to %s',
-                                   target, source_channel.name, destination_channel.name)
-                        continue
-                    
-                    # Skip roles that are higher than or equal to the bot's highest role
-                    if isinstance(target, discord.Role) and bot_top_role and target >= bot_top_role:
-                        skipped_hierarchy_count += 1
-                        logger.info('Skipped copying role %s (hierarchy: role position %d >= bot position %d)',
-                                   target.name, target.position, bot_top_role.position)
-                        continue
-                    
-                    # Check for Discord's restricted permissions that bots cannot manage
-                    if isinstance(target, discord.Role):
-                        dangerous_perms = [
-                            target.permissions.ban_members,
-                            target.permissions.kick_members,
-                            target.permissions.manage_roles,
-                            target.permissions.manage_guild,
-                            target.permissions.manage_channels,
-                            target.permissions.manage_messages,
-                            target.permissions.moderate_members,
-                            target.permissions.administrator
-                        ]
-                        
-                        if any(dangerous_perms):
-                            skipped_hierarchy_count += 1
-                            logger.info('Skipped copying role %s (Discord restricts bots from managing roles with moderation permissions)',
-                                       target.name)
-                            continue
-                    
-                    await destination_channel.set_permissions(target, overwrite=overwrite)
-                    copied_count += 1
-                    logger.info('Copied permissions for %s from %s to %s',
-                               target, source_channel.name, destination_channel.name)
-            except discord.Forbidden as e:
-                # Log the specific role that failed and provide detailed feedback
-                if isinstance(target, discord.Role):
-                    skipped_hierarchy_count += 1
-                    
-                    # Check if this is likely due to Discord's moderation permission restrictions
-                    dangerous_perms = [
-                        target.permissions.ban_members,
-                        target.permissions.kick_members,
-                        target.permissions.manage_roles,
-                        target.permissions.manage_guild,
-                        target.permissions.manage_channels,
-                        target.permissions.manage_messages,
-                        target.permissions.moderate_members,
-                        target.permissions.administrator
-                    ]
-                    
-                    if any(dangerous_perms):
-                        logger.error('Failed to copy permissions for role %s - Discord restricts bots from managing roles with moderation permissions: %s', target.name, e)
-                        await interaction.followup.send(
-                            f' **Discord Restriction**: Cannot copy permissions for role **{target.name}** because Discord prevents bots from managing roles with moderation permissions like ban_members, kick_members, manage_roles, etc. You\'ll need to copy these permissions manually.',
-                            ephemeral=True
-                        )
-                    else:
-                        logger.error('Failed to copy permissions for role %s (likely hierarchy issue): %s', target.name, e)
-                else:
-                    logger.error('Failed to copy permissions for %s: %s', target, e)
-                continue
-            except discord.HTTPException as e:
-                logger.error('Failed to copy permissions for %s: %s', target, e)
-                await interaction.followup.send(
-                    f'Warning: Failed to copy permissions for {target}: {e}',
-                    ephemeral=True
-                )
-        
-        success_msg = (
-            f'Successfully cloned permissions from **{source_channel.name}** to **{destination_channel.name}**.\n'
-            f'Copied {copied_count} permission overrides.'
-        )
-        
-        notes = []
-        if skipped_admin_count > 0:
-            notes.append(f'Skipped {skipped_admin_count} Administrator role(s) for security reasons')
-        if skipped_managed_count > 0:
-            notes.append(f'Skipped {skipped_managed_count} managed role(s) (bot roles, booster roles, etc.)')
-        if skipped_hierarchy_count > 0:
-            notes.append(f'Skipped {skipped_hierarchy_count} role(s) due to hierarchy or Discord\'s restrictions on bots managing roles with moderation permissions')
-        
-        if notes:
-            success_msg += f'\n\n **Note:** {", ".join(notes)}.'
-        
-        await interaction.followup.send(success_msg, ephemeral=True)
-        
-    except discord.Forbidden:
-        await interaction.followup.send(
-            'I don\'t have permission to manage permissions on one or both channels.\n\n'
-            '**Possible causes:**\n'
-            '• I lack "Manage Channels" permission\n'
-            '• I lack "Manage Roles" permission\n'
-            '• My role is not high enough in the hierarchy to modify permissions for some roles/members\n'
-            '• Discord restricts bots from managing roles with moderation permissions (ban_members, kick_members, etc.)\n'
-            '• The channels are in categories I cannot access\n\n'
-            '**Solutions:**\n'
-            '• Ensure I have "Manage Channels" and "Manage Roles" permissions\n'
-            '• Move my role higher than the roles you want to copy permissions for in Server Settings > Roles\n'
-            '• Check that I can view and access both channels\n'
-            '• For roles with moderation permissions, you\'ll need to copy their permissions manually',
-            ephemeral=True
-        )
-    except discord.HTTPException as e:
-        logger.error('Discord API error in clone_channel_permissions: %s', e)
-        await interaction.followup.send(
-            'A Discord API error occurred. Probably rate limiting. Trying a workaround...',
-            ephemeral=True
-        )
-    except Exception as e:
-        logger.error('Unexpected error in clone_channel_permissions: %s', e)
-        await interaction.followup.send(
-            'An unexpected error occurred while cloning permissions.',
-            ephemeral=True
-        )
+    await _clone_permissions_command(
+        interaction, source_channel, destination_channel, kind='channel')
 
 clone_channel_permissions_error = _command_error_handler
 async def clone_role_permissions(interaction: discord.Interaction,  # pylint: disable=too-many-return-statements,too-many-branches,too-many-statements
@@ -3304,303 +3094,16 @@ async def clone_role_permissions(interaction: discord.Interaction,  # pylint: di
         )
 
 clone_role_permissions_error = _command_error_handler
-async def clear_category_permissions(interaction: discord.Interaction,  # pylint: disable=too-many-branches,too-many-statements,too-many-nested-blocks
-                                   category: discord.CategoryChannel):
+async def clear_category_permissions(interaction: discord.Interaction,
+                                     category: discord.CategoryChannel):
     """Clear all permission overwrites from a category."""
-    try:
-        await interaction.response.defer(ephemeral=True)
-        
-        # Get the bot's highest role for hierarchy checking
-        bot_member = category.guild.me
-        bot_top_role = bot_member.top_role if bot_member else None
-        
-        cleared_count = 0
-        skipped_admin_count = 0
-        skipped_managed_count = 0
-        skipped_hierarchy_count = 0
-        failed_roles = []
-        
-        await interaction.followup.send(
-            f'Clearing all permission overwrites from **{category.name}**...',
-            ephemeral=True
-        )
-        
-        # Get all current overwrites and clear them
-        for target in list(category.overwrites.keys()):
-            try:
-                # Only process Member and Role objects, skip others
-                if isinstance(target, (discord.Member, discord.Role)):
-                    # Skip roles with Administrator permission to preserve Server Owner permissions
-                    if isinstance(target, discord.Role) and target.permissions.administrator:
-                        skipped_admin_count += 1
-                        logger.info('Skipped clearing Administrator role %s on category %s', target, category.name)
-                        continue
-                    
-                    # Skip managed roles (bot roles, booster roles, etc.) that can't be modified
-                    if isinstance(target, discord.Role) and target.managed:
-                        skipped_managed_count += 1
-                        logger.info('Skipped clearing managed role %s on category %s', target, category.name)
-                        continue
-                    
-                    # Skip roles that are higher than or equal to the bot's highest role
-                    if isinstance(target, discord.Role) and bot_top_role and target >= bot_top_role:
-                        skipped_hierarchy_count += 1
-                        logger.info('Skipped clearing role %s (hierarchy: role position %d >= bot position %d)',
-                                   target.name, target.position, bot_top_role.position)
-                        continue
-                    
-                    # Check for Discord's restricted permissions that bots cannot manage
-                    if isinstance(target, discord.Role):
-                        dangerous_perms = [
-                            target.permissions.ban_members,
-                            target.permissions.kick_members,
-                            target.permissions.manage_roles,
-                            target.permissions.manage_guild,
-                            target.permissions.manage_channels,
-                            target.permissions.manage_messages,
-                            target.permissions.moderate_members,
-                            target.permissions.administrator
-                        ]
-                        
-                        if any(dangerous_perms):
-                            skipped_hierarchy_count += 1
-                            failed_roles.append(target.name)
-                            logger.info('Skipped clearing role %s (Discord restricts bots from managing roles with moderation permissions)',
-                                       target.name)
-                            continue
-                    
-                    await category.set_permissions(target, overwrite=None)
-                    cleared_count += 1
-                    logger.info('Cleared permissions for %s on category %s', target, category.name)
-                    
-            except discord.Forbidden as e:
-                # Log the specific role that failed and provide detailed feedback
-                if isinstance(target, discord.Role):
-                    skipped_hierarchy_count += 1
-                    failed_roles.append(target.name)
-                    
-                    # Check if this is likely due to Discord's moderation permission restrictions
-                    dangerous_perms = [
-                        target.permissions.ban_members,
-                        target.permissions.kick_members,
-                        target.permissions.manage_roles,
-                        target.permissions.manage_guild,
-                        target.permissions.manage_channels,
-                        target.permissions.manage_messages,
-                        target.permissions.moderate_members,
-                        target.permissions.administrator
-                    ]
-                    
-                    if any(dangerous_perms):
-                        logger.error('Failed to clear permissions for role %s - Discord restricts bots from managing roles with moderation permissions: %s', target.name, e)
-                        await interaction.followup.send(
-                            f' **Discord Restriction**: Cannot clear permissions for role **{target.name}** because Discord prevents bots from managing roles with moderation permissions. You\'ll need to clear these permissions manually.',
-                            ephemeral=True
-                        )
-                    else:
-                        logger.error('Failed to clear permissions for role %s (likely hierarchy issue): %s', target.name, e)
-                else:
-                    logger.error('Failed to clear permissions for %s: %s', target, e)
-                continue
-            except discord.HTTPException as e:
-                logger.error('Failed to clear permissions for %s: %s', target, e)
-                await interaction.followup.send(
-                    f'Warning: Failed to clear permissions for {target}: {e}',
-                    ephemeral=True
-                )
-        
-        success_msg = (
-            f'Successfully cleared permissions from **{category.name}**.\n'
-            f'Cleared {cleared_count} permission overwrites.'
-        )
-        
-        notes = []
-        if skipped_admin_count > 0:
-            notes.append(f'Skipped {skipped_admin_count} Administrator role(s) for security reasons')
-        if skipped_managed_count > 0:
-            notes.append(f'Skipped {skipped_managed_count} managed role(s) (bot roles, booster roles, etc.)')
-        if skipped_hierarchy_count > 0:
-            notes.append(f'Skipped {skipped_hierarchy_count} role(s) due to Discord\'s restrictions on bots managing roles with moderation permissions')
-        
-        if notes:
-            success_msg += f'\n\n **Note:** {", ".join(notes)}.'
-        
-        await interaction.followup.send(success_msg, ephemeral=True)
-        
-    except discord.Forbidden:
-        await interaction.followup.send(
-            'I don\'t have permission to manage permissions on this category.\n\n'
-            '**Possible causes:**\n'
-            '• I lack "Manage Channels" permission\n'
-            '• I lack "Manage Roles" permission\n'
-            '• My role is not high enough in the hierarchy to modify permissions for some roles/members\n'
-            '• Discord restricts bots from managing roles with moderation permissions\n\n'
-            '**Solutions:**\n'
-            '• Ensure I have "Manage Channels" and "Manage Roles" permissions\n'
-            '• Move my role higher than the roles you want to clear permissions for\n'
-            '• For roles with moderation permissions, you\'ll need to clear their permissions manually',
-            ephemeral=True
-        )
-    except discord.HTTPException as e:
-        logger.error('Discord API error in clear_category_permissions: %s', e)
-        await interaction.followup.send(
-            'A Discord API error occurred while clearing permissions.',
-            ephemeral=True
-        )
-    except Exception as e:
-        logger.error('Unexpected error in clear_category_permissions: %s', e)
-        await interaction.followup.send(
-            'An unexpected error occurred while clearing permissions.',
-            ephemeral=True
-        )
+    await _clear_permissions_command(interaction, category, kind='category')
 
 clear_category_permissions_error = _command_error_handler
-async def clear_channel_permissions(interaction: discord.Interaction,  # pylint: disable=too-many-branches,too-many-statements,too-many-nested-blocks
-                                  channel: discord.abc.GuildChannel):
+async def clear_channel_permissions(interaction: discord.Interaction,
+                                    channel: discord.abc.GuildChannel):
     """Clear all permission overwrites from a channel."""
-    try:
-        await interaction.response.defer(ephemeral=True)
-        
-        # Get the bot's highest role for hierarchy checking
-        bot_member = channel.guild.me
-        bot_top_role = bot_member.top_role if bot_member else None
-        
-        cleared_count = 0
-        skipped_admin_count = 0
-        skipped_managed_count = 0
-        skipped_hierarchy_count = 0
-        
-        await interaction.followup.send(
-            f'Clearing all permission overwrites from **{channel.name}**...',
-            ephemeral=True
-        )
-        
-        # Get all current overwrites and clear them
-        for target in list(channel.overwrites.keys()):
-            try:
-                # Only process Member and Role objects, skip others
-                if isinstance(target, (discord.Member, discord.Role)):
-                    # Skip roles with Administrator permission to preserve Server Owner permissions
-                    if isinstance(target, discord.Role) and target.permissions.administrator:
-                        skipped_admin_count += 1
-                        logger.info('Skipped clearing Administrator role %s on channel %s', target, channel.name)
-                        continue
-                    
-                    # Skip managed roles (bot roles, booster roles, etc.) that can't be modified
-                    if isinstance(target, discord.Role) and target.managed:
-                        skipped_managed_count += 1
-                        logger.info('Skipped clearing managed role %s on channel %s', target, channel.name)
-                        continue
-                    
-                    # Skip roles that are higher than or equal to the bot's highest role
-                    if isinstance(target, discord.Role) and bot_top_role and target >= bot_top_role:
-                        skipped_hierarchy_count += 1
-                        logger.info('Skipped clearing role %s (hierarchy: role position %d >= bot position %d)',
-                                   target.name, target.position, bot_top_role.position)
-                        continue
-                    
-                    # Check for Discord's restricted permissions that bots cannot manage
-                    if isinstance(target, discord.Role):
-                        dangerous_perms = [
-                            target.permissions.ban_members,
-                            target.permissions.kick_members,
-                            target.permissions.manage_roles,
-                            target.permissions.manage_guild,
-                            target.permissions.manage_channels,
-                            target.permissions.manage_messages,
-                            target.permissions.moderate_members,
-                            target.permissions.administrator
-                        ]
-                        
-                        if any(dangerous_perms):
-                            skipped_hierarchy_count += 1
-                            logger.info('Skipped clearing role %s (Discord restricts bots from managing roles with moderation permissions)',
-                                       target.name)
-                            continue
-                    
-                    await channel.set_permissions(target, overwrite=None)
-                    cleared_count += 1
-                    logger.info('Cleared permissions for %s on channel %s', target, channel.name)
-                    
-            except discord.Forbidden as e:
-                # Log the specific role that failed and provide detailed feedback
-                if isinstance(target, discord.Role):
-                    skipped_hierarchy_count += 1
-                    
-                    # Check if this is likely due to Discord's moderation permission restrictions
-                    dangerous_perms = [
-                        target.permissions.ban_members,
-                        target.permissions.kick_members,
-                        target.permissions.manage_roles,
-                        target.permissions.manage_guild,
-                        target.permissions.manage_channels,
-                        target.permissions.manage_messages,
-                        target.permissions.moderate_members,
-                        target.permissions.administrator
-                    ]
-                    
-                    if any(dangerous_perms):
-                        logger.error('Failed to clear permissions for role %s - Discord restricts bots from managing roles with moderation permissions: %s', target.name, e)
-                        await interaction.followup.send(
-                            f' **Discord Restriction**: Cannot clear permissions for role **{target.name}** because Discord prevents bots from managing roles with moderation permissions. You\'ll need to clear these permissions manually.',
-                            ephemeral=True
-                        )
-                    else:
-                        logger.error('Failed to clear permissions for role %s (likely hierarchy issue): %s', target.name, e)
-                else:
-                    logger.error('Failed to clear permissions for %s: %s', target, e)
-                continue
-            except discord.HTTPException as e:
-                logger.error('Failed to clear permissions for %s: %s', target, e)
-                await interaction.followup.send(
-                    f'Warning: Failed to clear permissions for {target}: {e}',
-                    ephemeral=True
-                )
-        
-        success_msg = (
-            f'Successfully cleared permissions from **{channel.name}**.\n'
-            f'Cleared {cleared_count} permission overwrites.'
-        )
-        
-        notes = []
-        if skipped_admin_count > 0:
-            notes.append(f'Skipped {skipped_admin_count} Administrator role(s) for security reasons')
-        if skipped_managed_count > 0:
-            notes.append(f'Skipped {skipped_managed_count} managed role(s) (bot roles, booster roles, etc.)')
-        if skipped_hierarchy_count > 0:
-            notes.append(f'Skipped {skipped_hierarchy_count} role(s) due to hierarchy or Discord\'s restrictions on bots managing roles with moderation permissions')
-        
-        if notes:
-            success_msg += f'\n\n **Note:** {", ".join(notes)}.'
-        
-        await interaction.followup.send(success_msg, ephemeral=True)
-        
-    except discord.Forbidden:
-        await interaction.followup.send(
-            'I don\'t have permission to manage permissions on this channel.\n\n'
-            '**Possible causes:**\n'
-            '• I lack "Manage Channels" permission\n'
-            '• I lack "Manage Roles" permission\n'
-            '• My role is not high enough in the hierarchy to modify permissions for some roles/members\n'
-            '• Discord restricts bots from managing roles with moderation permissions\n\n'
-            '**Solutions:**\n'
-            '• Ensure I have "Manage Channels" and "Manage Roles" permissions\n'
-            '• Move my role higher than the roles you want to clear permissions for\n'
-            '• For roles with moderation permissions, you\'ll need to clear their permissions manually',
-            ephemeral=True
-        )
-    except discord.HTTPException as e:
-        logger.error('Discord API error in clear_channel_permissions: %s', e)
-        await interaction.followup.send(
-            'A Discord API error occurred while clearing permissions.',
-            ephemeral=True
-        )
-    except Exception as e:
-        logger.error('Unexpected error in clear_channel_permissions: %s', e)
-        await interaction.followup.send(
-            'An unexpected error occurred while clearing permissions.',
-            ephemeral=True
-        )
+    await _clear_permissions_command(interaction, channel, kind='channel')
 
 clear_channel_permissions_error = _command_error_handler
 async def clear_role_permissions(interaction: discord.Interaction,  # pylint: disable=too-many-branches
@@ -3735,161 +3238,78 @@ async def clear_role_permissions(interaction: discord.Interaction,  # pylint: di
         )
 
 clear_role_permissions_error = _command_error_handler
-async def sync_channel_perms(interaction: discord.Interaction,  # pylint: disable=too-many-locals,too-many-branches,too-many-statements,too-many-nested-blocks
-                           source_category: discord.CategoryChannel):
-    """Sync permissions for all channels in the source category with the category's permissions."""
+async def sync_channel_perms(interaction: discord.Interaction,
+                             source_category: discord.CategoryChannel):
+    """Sync each channel in source_category with the category's permissions."""
     try:
         await interaction.response.defer(ephemeral=True)
-        
-        # Check if guild exists
+
         if not interaction.guild:
-            await interaction.followup.send('This command can only be used in a server.', ephemeral=True)
+            await interaction.followup.send(
+                'This command can only be used in a server.', ephemeral=True)
             return
-        
-        # Get all channels in the source category
+
         channels_in_category = source_category.channels
-        
         if not channels_in_category:
-            await interaction.followup.send(f'No channels found in category **{source_category.name}**.', ephemeral=True)
+            await interaction.followup.send(
+                f'No channels found in category **{source_category.name}**.',
+                ephemeral=True)
             return
-        
+
         await interaction.followup.send(
-            f'Syncing permissions for {len(channels_in_category)} channel(s) in **{source_category.name}** with the category permissions...',
-            ephemeral=True
-        )
-        
-        # Get the bot's highest role for hierarchy checking
-        bot_member = source_category.guild.me
-        bot_top_role = bot_member.top_role if bot_member else None
-        
+            f'Syncing permissions for {len(channels_in_category)} channel(s) '
+            f'in **{source_category.name}**...', ephemeral=True)
+
         synced_count = 0
-        failed_channels = []
         total_overwrites_synced = 0
-        
+        failed_channels = []
+
         for channel in channels_in_category:
             try:
-                # Clear existing permissions on the channel first
-                cleared_count = 0
-                for target in list(channel.overwrites.keys()):
-                    try:
-                        # Only process Member and Role objects, skip others
-                        if isinstance(target, (discord.Member, discord.Role)):
-                            # Skip roles with Administrator permission to preserve Server Owner permissions
-                            if isinstance(target, discord.Role) and target.permissions.administrator:
-                                continue
-                            # Skip managed roles (bot roles, booster roles, etc.) that can't be modified
-                            if isinstance(target, discord.Role) and target.managed:
-                                continue
-                            # Skip roles that are higher than or equal to the bot's highest role
-                            if isinstance(target, discord.Role) and bot_top_role and target >= bot_top_role:
-                                continue
-                            # Check for Discord's restricted permissions that bots cannot manage
-                            if isinstance(target, discord.Role):
-                                dangerous_perms = [
-                                    target.permissions.ban_members,
-                                    target.permissions.kick_members,
-                                    target.permissions.manage_roles,
-                                    target.permissions.manage_guild,
-                                    target.permissions.manage_channels,
-                                    target.permissions.manage_messages,
-                                    target.permissions.moderate_members,
-                                    target.permissions.administrator
-                                ]
-                                if any(dangerous_perms):
-                                    continue
-                            
-                            await channel.set_permissions(target, overwrite=None)
-                            cleared_count += 1
-                    except (discord.Forbidden, discord.HTTPException):
-                        # Continue if we can't clear a specific permission
-                        continue
-                
-                # Copy permissions from category to channel
-                copied_count = 0
-                for target, overwrite in source_category.overwrites.items():
-                    try:
-                        # Only process Member and Role objects, skip others
-                        if isinstance(target, (discord.Member, discord.Role)):
-                            # Skip roles with Administrator permission to preserve Server Owner permissions
-                            if isinstance(target, discord.Role) and target.permissions.administrator:
-                                continue
-                            # Skip managed roles (bot roles, booster roles, etc.) that can't be modified
-                            if isinstance(target, discord.Role) and target.managed:
-                                continue
-                            # Skip roles that are higher than or equal to the bot's highest role
-                            if isinstance(target, discord.Role) and bot_top_role and target >= bot_top_role:
-                                continue
-                            # Check for Discord's restricted permissions that bots cannot manage
-                            if isinstance(target, discord.Role):
-                                dangerous_perms = [
-                                    target.permissions.ban_members,
-                                    target.permissions.kick_members,
-                                    target.permissions.manage_roles,
-                                    target.permissions.manage_guild,
-                                    target.permissions.manage_channels,
-                                    target.permissions.manage_messages,
-                                    target.permissions.moderate_members,
-                                    target.permissions.administrator
-                                ]
-                                if any(dangerous_perms):
-                                    continue
-                            
-                            await channel.set_permissions(target, overwrite=overwrite)
-                            copied_count += 1
-                    except (discord.Forbidden, discord.HTTPException):
-                        # Continue if we can't copy a specific permission
-                        continue
-                
+                await _clear_overwrites_on(channel)
+                counts = await _copy_overwrites(source_category, channel)
                 synced_count += 1
-                total_overwrites_synced += copied_count
-                logger.info('Synced permissions for channel %s in category %s (cleared: %d, copied: %d)',
-                           channel.name, source_category.name, cleared_count, copied_count)
-                
+                total_overwrites_synced += counts['processed']
+                logger.info(
+                    'Synced permissions for channel %s in category %s '
+                    '(copied: %d)',
+                    channel.name, source_category.name, counts['processed'])
             except (discord.Forbidden, discord.HTTPException) as e:
                 failed_channels.append(f"{channel.name} ({type(e).__name__})")
-                logger.error('Failed to sync permissions for channel %s: %s', channel.name, e)
-        
-        # Send results
+                logger.error('Failed to sync permissions for channel %s: %s',
+                             channel.name, e)
+
         success_msg = (
-            f'Successfully synced permissions for **{synced_count}** out of **{len(channels_in_category)}** channel(s) in **{source_category.name}**.\n'
-            f'Total permission overwrites synced: **{total_overwrites_synced}**'
-        )
-        
+            f'Successfully synced permissions for **{synced_count}** out of '
+            f'**{len(channels_in_category)}** channel(s) in '
+            f'**{source_category.name}**.\n'
+            f'Total permission overwrites synced: **{total_overwrites_synced}**')
+
         if failed_channels:
-            success_msg += f'\n\n **Failed to sync {len(failed_channels)} channel(s):**\n' + '\n'.join(f'• {name}' for name in failed_channels[:10])
+            success_msg += (
+                f'\n\n **Failed to sync {len(failed_channels)} channel(s):**\n'
+                + '\n'.join(f'• {name}' for name in failed_channels[:10]))
             if len(failed_channels) > 10:
                 success_msg += f'\n... and {len(failed_channels) - 10} more'
-        
-        success_msg += '\n\n📝 **Note:** Skipped Administrator roles, managed roles, and roles with moderation permissions for security reasons.'
-        
+
+        success_msg += (
+            '\n\n📝 **Note:** Skipped Administrator roles, managed roles, '
+            'and roles with moderation permissions for security reasons.')
+
         await interaction.followup.send(success_msg, ephemeral=True)
-        
+
     except discord.Forbidden:
-        await interaction.followup.send(
-            'I don\'t have permission to manage permissions on this category or its channels.\n\n'
-            '**Possible causes:**\n'
-            '• I lack "Manage Channels" permission\n'
-            '• I lack "Manage Roles" permission\n'
-            '• My role is not high enough in the hierarchy to modify permissions for some roles/members\n'
-            '• Discord restricts bots from managing roles with moderation permissions\n\n'
-            '**Solutions:**\n'
-            '• Ensure I have "Manage Channels" and "Manage Roles" permissions\n'
-            '• Move my role higher than the roles you want to sync permissions for\n'
-            '• For roles with moderation permissions, you\'ll need to sync their permissions manually',
-            ephemeral=True
-        )
+        await interaction.followup.send(_PERM_FORBIDDEN_HELP, ephemeral=True)
     except discord.HTTPException as e:
         logger.error('Discord API error in sync_channel_perms: %s', e)
         await interaction.followup.send(
             'A Discord API error occurred while syncing permissions.',
-            ephemeral=True
-        )
-    except Exception as e:
+            ephemeral=True)
+    except Exception as e:  # pylint: disable=broad-exception-caught
         logger.error('Unexpected error in sync_channel_perms: %s', e)
         await interaction.followup.send(
             'An unexpected error occurred while syncing permissions.',
-            ephemeral=True
-        )
+            ephemeral=True)
 
 sync_channel_perms_error = _command_error_handler
 async def list_users_without_roles(interaction: discord.Interaction):
