@@ -427,13 +427,18 @@ from commands import (  # pylint: disable=wrong-import-position
 )
 setup_commands(bot)
 
-try:
-    if TOKEN:
-        bot.run(TOKEN)
-    else:
-        raise ValueError("DISCORD_BOT_TOKEN environment variable is not set")
-except KeyboardInterrupt:
-    logger.info("Shutting down gracefully...")
-except Exception as e:
-    logger.error("Fatal error: %s", e)
-    raise
+def main():
+    try:
+        if TOKEN:
+            bot.run(TOKEN)
+        else:
+            raise ValueError("DISCORD_BOT_TOKEN environment variable is not set")
+    except KeyboardInterrupt:
+        logger.info("Shutting down gracefully...")
+    except Exception as e:
+        logger.error("Fatal error: %s", e)
+        raise
+
+
+if __name__ == '__main__':
+    main()
