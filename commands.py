@@ -1385,7 +1385,7 @@ def register_commands():
          error=log_tail_error)
     _reg('add_event_feed',
          'Adds a calendar or RSS feed and its announcement channel',
-         add_event_feed_command,
+         add_event_feed_command, mod_only=True,
          describe={'feed_name': 'A short name to identify this feed',
                    'calendar_url': 'URL of the calendar or RSS feed',
                    'channel': 'Channel to post weekly/day-of event announcements'},
@@ -1393,11 +1393,13 @@ def register_commands():
     _reg('list_event_feeds', 'Lists all registered event feeds',
          list_event_feeds_command)
     _reg('remove_event_feed', 'Removes an event feed by name',
-         remove_event_feed_command,
-         describe={'feed_name': 'Name of the feed to remove'})
+         remove_event_feed_command, mod_only=True,
+         describe={'feed_name': 'Name of the feed to remove'},
+         error=remove_event_feed_error)
     _reg('check_event_feeds',
          'Manually check all event feeds for new events now',
-         check_event_feeds_command, error=check_event_feeds_error)
+         check_event_feeds_command, mod_only=True,
+         error=check_event_feeds_error)
     _reg('bot_mood', "Check on the bot's current mood", bot_command)
     _reg('pet_bot', 'Pet the bot', pet_bot_command)
     _reg('bot_pick_fav', 'See who the bot prefers today',
@@ -2110,6 +2112,8 @@ async def remove_event_feed_command(interaction: discord.Interaction,
     await interaction.response.send_message(
         f'✅ Removed event feed **"{feed_name}"**',
         ephemeral=True)
+
+remove_event_feed_error = _command_error_handler
 
 async def bot_command(interaction: discord.Interaction):
     """Check on the bot."""

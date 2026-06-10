@@ -64,10 +64,10 @@ MODERATOR_ROLE_NAME, however the PetBot commands can be leveraged by all users.
 
 | Command | Description | Access |
 |---|---|---|
-| `/add_event_feed` | Subscribe to an iCal or RSS feed (including Meetup.com); auto-detects feed type, runs an immediate check, creates Discord Scheduled Events with duplicate detection, and enables automatic event announcements to the chosen channel | All |
+| `/add_event_feed` | Subscribe to an iCal or RSS feed (including Meetup.com); auto-detects feed type, runs an immediate check, creates Discord Scheduled Events with duplicate detection, and enables automatic event announcements to the chosen channel | Mod |
 | `/list_event_feeds` | List all registered event feeds | All |
-| `/remove_event_feed` | Remove a feed by name (announcements are disabled when the last feed is removed) | All |
-| `/check_event_feeds` | Manually trigger a check of all feeds for new events | All |
+| `/remove_event_feed` | Remove a feed by name (announcements are disabled when the last feed is removed) | Mod |
+| `/check_event_feeds` | Manually trigger a check of all feeds for new events | Mod |
 
 Once a feed is added, everything else is automatic: feeds are re-checked every Monday at 9am, a "This Week" preview of the server's Discord Scheduled Events posts Monday at 10am, and day-of reminders post daily at 10am (timezone set by `BOT_TIMEZONE` in `config.py`, default US Central).
 
