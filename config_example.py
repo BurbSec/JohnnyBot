@@ -22,6 +22,11 @@ CHILD_ROLE_NAMES = {'Kids', 'Bambinos', 'Girls'}
 # Update checking configuration
 UPDATE_CHECKING_ENABLED = True  # Set to False to disable automatic update checking
 UPDATE_CHECK_REPO_URL = "https://github.com/BurbSec/JohnnyBot"
+# When True, updates that passed CI and don't modify config_example.py
+# are pulled automatically and the bot restarts itself. Requires the
+# bot to run from a git checkout. Anything else (CI not green, config
+# changes, pull/install failure) falls back to a moderator notification.
+AUTO_UPDATE_ENABLED = False
 
 # Timezone for scheduled jobs and event announcements
 BOT_TIMEZONE = 'America/Chicago'

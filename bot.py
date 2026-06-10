@@ -1,6 +1,7 @@
 """Discord bot for server management and automation with reminder functionality."""
 # pylint: disable=line-too-long,trailing-whitespace,cyclic-import
 import os
+import sys
 import asyncio
 import logging
 from datetime import datetime, timedelta
@@ -36,8 +37,94 @@ def _parse_repo_from_url(url):
         return parts[1].removesuffix('.git')
     return None
 
+def _get_moderators_channel():
+    """Find the moderators channel across all guilds, or None."""
+    return next(
+        (ch for g in bot.guilds for ch in g.text_channels
+         if ch.name == MODERATORS_CHANNEL_NAME), None)
+
+async def _run_cmd(*args):
+    """Run a command in the bot directory without blocking the event loop.
+
+    Returns (returncode, stdout, stderr) as decoded strings.
+    """
+    proc = await asyncio.create_subprocess_exec(
+        *args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=os.path.dirname(os.path.abspath(__file__))
+    )
+    stdout, stderr = await proc.communicate()
+    return proc.returncode, stdout.decode().strip(), stderr.decode().strip()
+
+async def _ci_passed(session, repo_path, sha):
+    """Return True if all completed check runs for `sha` succeeded.
+
+    Requires at least one check run so an untested commit is never
+    auto-deployed.
+    """
+    url = f"https://api.github.com/repos/{repo_path}/commits/{sha}/check-runs"
+    try:
+        async with session.get(url) as response:
+            if response.status != 200:
+                logger.warning("Failed to fetch check runs: HTTP %s", response.status)
+                return False
+            runs = (await response.json()).get('check_runs', [])
+    except (aiohttp.ClientError, KeyError, ValueError) as e:
+        logger.error("Error fetching check runs: %s", e)
+        return False
+    if not runs:
+        logger.info("No check runs found for %s; skipping auto-update", sha[:8])
+        return False
+    return all(
+        run['status'] == 'completed'
+        and run['conclusion'] in ('success', 'neutral', 'skipped')
+        for run in runs
+    )
+
+async def _auto_update_and_restart(local_commit, remote_commit, deps_changed):
+    """Pull the latest code, reinstall deps if needed, and re-exec the bot.
+
+    On success this never returns (the process is replaced). Returns an
+    error string on failure so the caller can notify moderators.
+    """
+    rc, _, err = await _run_cmd('git', 'pull', '--ff-only')
+    if rc != 0:
+        return f"`git pull --ff-only` failed: {err or 'unknown error'}"
+
+    if deps_changed:
+        rc, _, err = await _run_cmd(
+            sys.executable, '-m', 'pip', 'install', '-r', 'requirements.txt')
+        if rc != 0:
+            # Code is already pulled; restarting with missing deps could
+            # crash-loop, so bail out and ask for a manual fix
+            return f"`pip install -r requirements.txt` failed: {err or 'unknown error'}"
+
+    channel = _get_moderators_channel()
+    if channel:
+        try:
+            await channel.send(
+                "🤖 **Auto-updating JohnnyBot**\n\n"
+                f"`{local_commit[:8]}` → `{remote_commit[:8]}` — "
+                "restarting now. Back in a moment!"
+            )
+        except (discord.HTTPException, discord.Forbidden) as e:
+            logger.error("Error sending auto-update notice: %s", e)
+
+    logger.info("Auto-update complete (%s -> %s); restarting",
+                local_commit[:8], remote_commit[:8])
+    logging.shutdown()
+    bot_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'bot.py')
+    os.execv(sys.executable, [sys.executable, bot_path])
+    return None  # unreachable; satisfies linters
+
 async def check_for_updates():
-    """Check for updates from the GitHub repository by comparing commit hashes."""
+    """Check for updates from the GitHub repository by comparing commit hashes.
+
+    With AUTO_UPDATE_ENABLED, updates whose CI passed and which don't
+    touch config_example.py are pulled and the bot restarts itself;
+    everything else falls back to a moderator notification.
+    """
     global _last_notified_commit
     # Read via the config module so /update_checking toggles take
     # effect at runtime (a `from config import` binding would not)
@@ -46,17 +133,10 @@ async def check_for_updates():
 
     # Get the current local commit hash (async to avoid blocking event loop)
     try:
-        proc = await asyncio.create_subprocess_exec(
-            'git', 'rev-parse', 'HEAD',
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=os.path.dirname(__file__)
-        )
-        stdout, stderr = await proc.communicate()
-        if proc.returncode != 0:
-            logger.error("Failed to get local git commit hash: %s", stderr.decode())
+        rc, local_commit, err = await _run_cmd('git', 'rev-parse', 'HEAD')
+        if rc != 0:
+            logger.error("Failed to get local git commit hash: %s", err)
             return
-        local_commit = stdout.decode().strip()
     except OSError as e:
         logger.error("Error getting local git commit: %s", e)
         return
@@ -67,7 +147,9 @@ async def check_for_updates():
         logger.error("Could not parse repo from URL: %s", UPDATE_CHECK_REPO_URL)
         return
 
-    # Get the latest commit hash and check if config.py changed
+    auto_update = bool(getattr(config, 'AUTO_UPDATE_ENABLED', False))
+
+    # Get the latest commit hash and check what changed
     try:
         timeout = aiohttp.ClientTimeout(total=30)
         async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -88,30 +170,58 @@ async def check_for_updates():
                 logger.info("Already notified for commit %s, skipping", remote_commit[:8])
                 return
 
-            # Check if config.py was changed between local and remote
+            # Check what changed between local and remote
             compare_url = f"https://api.github.com/repos/{repo_path}/compare/{local_commit}...{remote_commit}"
+            changed_files = []
             async with session.get(compare_url) as response:
-                config_changed = False
                 if response.status == 200:
                     compare_data = await response.json()
                     changed_files = [f['filename'] for f in compare_data.get('files', [])]
-                    config_changed = 'config_example.py' in changed_files
                 else:
                     logger.warning("Failed to fetch commit comparison: HTTP %s", response.status)
+            config_changed = 'config_example.py' in changed_files
+
+            # Auto-update only commits that passed CI and don't
+            # require config changes
+            ci_ok = False
+            if auto_update and not config_changed:
+                ci_ok = await _ci_passed(session, repo_path, remote_commit)
     except (aiohttp.ClientError, KeyError, ValueError) as e:
         logger.error("Error fetching remote git info: %s", e)
         return
 
     logger.info("Update available: local=%s, remote=%s", local_commit[:8], remote_commit[:8])
+
+    if auto_update and not config_changed and ci_ok:
+        error = await _auto_update_and_restart(
+            local_commit, remote_commit, 'requirements.txt' in changed_files)
+        # Only reached on failure — os.execv never returns
+        logger.error("Auto-update failed: %s", error)
+        _last_notified_commit = remote_commit
+        channel = _get_moderators_channel()
+        if channel:
+            try:
+                await channel.send(
+                    "❌ **Auto-update failed**\n\n"
+                    f"{error}\n\n"
+                    "**Please update manually** from the bot directory "
+                    "on the server.\n\n"
+                    f"Repository: {UPDATE_CHECK_REPO_URL}"
+                )
+            except (discord.HTTPException, discord.Forbidden) as e:
+                logger.error("Error sending auto-update failure notice: %s", e)
+        return
+
+    if auto_update and not config_changed and not ci_ok:
+        logger.info("Auto-update skipped: CI not green for %s", remote_commit[:8])
+
     _last_notified_commit = remote_commit
     await send_update_notification(local_commit, remote_commit, config_changed)
 
 async def send_update_notification(local_commit, remote_commit, config_changed=False):
     """Send update notification to the moderators channel."""
     try:
-        moderators_channel = next(
-            (ch for g in bot.guilds for ch in g.text_channels
-             if ch.name == MODERATORS_CHANNEL_NAME), None)
+        moderators_channel = _get_moderators_channel()
 
         if not moderators_channel:
             logger.error("Moderators channel '%s' not found", MODERATORS_CHANNEL_NAME)

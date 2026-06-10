@@ -85,7 +85,7 @@ Once a feed is added, everything else is automatic: feeds are re-checked every M
 | Command | Description | Access |
 |---|---|---|
 | `/voice_chaperone` | Enable/disable automatic voice channel safety monitoring (alerts mods when only 1 adult + 1 child are in a channel) | Mod |
-| `/update_checking` | Enable/disable automatic daily checks for new commits on GitHub with moderator notifications | Mod |
+| `/update_checking` | Enable/disable automatic daily checks for new commits on GitHub with moderator notifications; with `AUTO_UPDATE_ENABLED` in `config.py`, the bot pulls CI-passing updates and restarts itself | Mod |
 | `/log_tail` | DM the last N lines of the bot log to yourself | All |
 | `/dashboard` | Display all available commands grouped by category | All |
 
