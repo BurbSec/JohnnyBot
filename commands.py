@@ -3703,7 +3703,9 @@ def format_dashboard_message():
         message_parts.append("\n")
     
     message_parts.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
-    message_parts.append("*Use `/help <command>` for more details on any command*")
+    message_parts.append(
+        "*Full command documentation: "
+        "<https://github.com/BurbSec/JohnnyBot/wiki/Commands-Reference>*")
     
     return ''.join(message_parts)
 
