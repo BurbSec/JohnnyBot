@@ -29,7 +29,7 @@ MODERATOR_ROLE_NAME, however the PetBot commands can be leveraged by all users.
 | `/kick_role` | Kick all members with a specified role from the server | Mod |
 | `/timeout` | Timeout a member for a specified duration | Mod |
 | `/botsay` | Make the bot send a message to a specified channel | Mod |
-| `/message_dump` | Dump a user's messages from a channel into a downloadable file (via temporary hosted link) | Mod |
+| `/message_dump` | Dump a user's messages from a channel into a zipped archive DM'd to you (25 MB cap) | Mod |
 
 ### Permissions Management
 
@@ -49,14 +49,14 @@ MODERATOR_ROLE_NAME, however the PetBot commands can be leveraged by all users.
 |---|---|---|
 | `/assign_role` | Mass-assign a role to multiple users at once | Mod |
 | `/remove_role` | Mass-remove a role from multiple users at once | Mod |
-| `/list_users_without_roles` | List all users with no server roles assigned | Mod |
+| `/list_users_without_roles` | List all users with no server roles assigned | All |
 
 ### Reminders
 
 | Command | Description | Access |
 |---|---|---|
 | `/set_reminder` | Set a recurring reminder message to a channel at a specified interval | Mod |
-| `/list_reminders` | List all active reminders | Mod |
+| `/list_reminders` | List all active reminders | All |
 | `/delete_reminder` | Delete a reminder by title | Mod |
 | `/delete_all_reminders` | Delete all active reminders | Mod |
 
@@ -64,19 +64,19 @@ MODERATOR_ROLE_NAME, however the PetBot commands can be leveraged by all users.
 
 | Command | Description | Access |
 |---|---|---|
-| `/add_event_feed` | Subscribe to an iCal or RSS feed (including Meetup.com); auto-detects feed type; configurable description, location, and link display; creates Discord Scheduled Events with duplicate detection | Mod |
-| `/list_event_feeds` | List all registered event feeds | Mod |
-| `/remove_event_feed` | Remove a feed by name | Mod |
-| `/check_event_feeds` | Manually trigger a check of all feeds for new events | Mod |
-| `/event_announce` | Enable weekly event announcements posted Mon & Thu at 10am CT; works independently of feeds | Mod |
-| `/disable_event_announce` | Disable weekly event announcements | Mod |
+| `/add_event_feed` | Subscribe to an iCal or RSS feed (including Meetup.com); auto-detects feed type, runs an immediate check, creates Discord Scheduled Events with duplicate detection, and enables automatic event announcements to the chosen channel | All |
+| `/list_event_feeds` | List all registered event feeds | All |
+| `/remove_event_feed` | Remove a feed by name (announcements are disabled when the last feed is removed) | All |
+| `/check_event_feeds` | Manually trigger a check of all feeds for new events | All |
+
+Once a feed is added, everything else is automatic: feeds are re-checked every Monday at 9am, a "This Week" preview of the server's Discord Scheduled Events posts Monday at 10am, and day-of reminders post daily at 10am (timezone set by `BOT_TIMEZONE` in `config.py`, default US Central).
 
 ### Autoreply
 
 | Command | Description | Access |
 |---|---|---|
 | `/autoreply add` | Add an autoreply rule with a trigger string, reply text, and optional case sensitivity | Mod |
-| `/autoreply list` | List all autoreply rules for this server | Mod |
+| `/autoreply list` | List all autoreply rules for this server | All |
 | `/autoreply remove` | Remove an autoreply rule by ID | Mod |
 | `/autoreply toggle` | Enable or disable an autoreply rule by ID | Mod |
 
@@ -86,8 +86,8 @@ MODERATOR_ROLE_NAME, however the PetBot commands can be leveraged by all users.
 |---|---|---|
 | `/voice_chaperone` | Enable/disable automatic voice channel safety monitoring (alerts mods when only 1 adult + 1 child are in a channel) | Mod |
 | `/update_checking` | Enable/disable automatic daily checks for new commits on GitHub with moderator notifications | Mod |
-| `/log_tail` | DM the last N lines of the bot log to yourself | Mod |
-| `/dashboard` | Display all available commands grouped by category | Mod |
+| `/log_tail` | DM the last N lines of the bot log to yourself | All |
+| `/dashboard` | Display all available commands grouped by category | All |
 
 ### PetBot Interactions
 
@@ -106,7 +106,7 @@ MODERATOR_ROLE_NAME, however the PetBot commands can be leveraged by all users.
    pip install -r requirements.txt
    ```
 
-2. **Configure:** Edit [`config.py`](config.py) with your server settings
+2. **Configure:** Copy [`config_example.py`](config_example.py) to `config.py` and edit it with your server settings (`config.py` is gitignored)
 
 3. **Set Token:** Add your Discord bot token as environment variable:
    ```shell
