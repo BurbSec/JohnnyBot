@@ -1,5 +1,12 @@
-# Claude Code
+# Agent instruction files
 CLAUDE.md
+CLAUDE.local.md
+AGENTS.md
+AGENTS.local.md
+GEMINI.md
+COPILOT.md
+.github/copilot-instructions.md
+.cursorrules
 .claude/
 
 # Local config (copy from config_example.py)
