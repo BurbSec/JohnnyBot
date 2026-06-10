@@ -1475,7 +1475,6 @@ def register_commands():
          'Display a dashboard of all available commands grouped by category',
          dashboard_command, error=dashboard_command_error)
 
-    register_update_checking_command()
     register_autoreply_commands()
 
 def setup_commands(bot_param):
@@ -3303,47 +3302,6 @@ async def voice_chaperone_command(interaction: discord.Interaction, enabled: boo
         )
 
 voice_chaperone_error = _command_error_handler
-async def update_checking_command(interaction: discord.Interaction, enabled: bool):
-    """Enable or disable the automatic update checking functionality."""
-    try:
-        config.UPDATE_CHECKING_ENABLED = enabled
-        
-        status = "enabled" if enabled else "disabled"
-        current_status = "✅ Enabled" if config.UPDATE_CHECKING_ENABLED else "❌ Disabled"
-        
-        await interaction.response.send_message(
-            f'Automatic update checking has been **{status}**.\n'
-            f'Current status: {current_status}\n\n'
-            f'ℹ️ This setting controls whether the bot automatically checks for updates from the GitHub repository '
-            f'daily and notifies moderators when updates are available.',
-            ephemeral=True
-        )
-        
-        logger.info('Update checking %s by user %s', status, interaction.user)
-        
-    except Exception as e:
-        logger.error('Error in update_checking command: %s', e)
-        await interaction.response.send_message(
-            'An error occurred while updating the update checking setting.',
-            ephemeral=True
-        )
-
-update_checking_error = _command_error_handler
-def register_update_checking_command():
-    """Register the update checking command."""
-    if tree is None:
-        return
-
-    @tree.command(name='update_checking',
-                  description='Enable or disable the automatic update checking functionality')
-    @app_commands.describe(enabled='True to enable, False to disable update checking')
-    @app_commands.checks.has_role(MODERATOR_ROLE_NAME)
-    async def _update_checking(interaction: discord.Interaction, enabled: bool):
-        await update_checking_command(interaction, enabled)
-
-    # Add error handler for update_checking
-    _update_checking.on_error = update_checking_error
-
 def load_autoreplies():
     """Load autoreply rules from file."""
     if os.path.exists(AUTOREPLIES_FILE):
@@ -3675,7 +3633,6 @@ def get_command_categories():
         "⚙️ System & Utilities": [
             "/log_tail - DM the last specified number of lines of the bot log",
             "/voice_chaperone - Enable or disable voice channel chaperone functionality",
-            "/update_checking - Enable or disable automatic update checking",
             "/dashboard - Display this command dashboard"
         ],
         "💬 Autoreply System": [

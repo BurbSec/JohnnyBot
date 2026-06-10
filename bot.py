@@ -126,8 +126,6 @@ async def check_for_updates():
     everything else falls back to a moderator notification.
     """
     global _last_notified_commit
-    # Read via the config module so /update_checking toggles take
-    # effect at runtime (a `from config import` binding would not)
     if not config.UPDATE_CHECKING_ENABLED:
         return
 
@@ -388,9 +386,8 @@ async def on_ready():  # pylint: disable=too-many-statements
                     logger.info(
                         'Day-of reminder scheduled: daily 10am CT')
 
-                # Daily update checking. Always scheduled so the
-                # /update_checking runtime toggle works; the job
-                # itself no-ops when checking is disabled.
+                # Daily update checking; the job no-ops when
+                # UPDATE_CHECKING_ENABLED is off in config.py
                 sched.add_job(
                     check_for_updates,
                     trigger=IntervalTrigger(hours=24),
