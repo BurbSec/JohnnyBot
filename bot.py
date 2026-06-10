@@ -21,7 +21,6 @@ from config import (
     ADULT_ROLE_NAMES,
     CHILD_ROLE_NAMES,
 
-    UPDATE_CHECKING_ENABLED,
     UPDATE_CHECK_REPO_URL,
     BOT_TIMEZONE,
     logger
@@ -40,7 +39,9 @@ def _parse_repo_from_url(url):
 async def check_for_updates():
     """Check for updates from the GitHub repository by comparing commit hashes."""
     global _last_notified_commit
-    if not UPDATE_CHECKING_ENABLED:
+    # Read via the config module so /update_checking toggles take
+    # effect at runtime (a `from config import` binding would not)
+    if not config.UPDATE_CHECKING_ENABLED:
         return
 
     # Get the current local commit hash (async to avoid blocking event loop)
@@ -94,7 +95,7 @@ async def check_for_updates():
                 if response.status == 200:
                     compare_data = await response.json()
                     changed_files = [f['filename'] for f in compare_data.get('files', [])]
-                    config_changed = 'config.py' in changed_files
+                    config_changed = 'config_example.py' in changed_files
                 else:
                     logger.warning("Failed to fetch commit comparison: HTTP %s", response.status)
     except (aiohttp.ClientError, KeyError, ValueError) as e:
@@ -119,10 +120,11 @@ async def send_update_notification(local_commit, remote_commit, config_changed=F
         if config_changed:
             message = (
                 "⚠️ **Breaking Changes in New Version**\n\n"
-                f"`config.py` has been modified in the latest update.\n"
+                f"`config_example.py` has been modified in the latest update.\n"
                 f"Current version: `{local_commit[:8]}`\n"
                 f"Latest version: `{remote_commit[:8]}`\n\n"
-                f"**Please update manually** — review the config changes before pulling.\n\n"
+                f"**Please update manually** — review the config changes and "
+                f"update your local `config.py` before pulling.\n\n"
                 f"Repository: {UPDATE_CHECK_REPO_URL}"
             )
         else:
@@ -276,16 +278,18 @@ async def on_ready():  # pylint: disable=too-many-statements
                     logger.info(
                         'Day-of reminder scheduled: daily 10am CT')
 
-                # Daily update checking
-                if UPDATE_CHECKING_ENABLED:
-                    sched.add_job(
-                        check_for_updates,
-                        trigger=IntervalTrigger(hours=24),
-                        next_run_time=(
-                            datetime.now() + timedelta(minutes=5))
-                    )
-                    logger.info(
-                        'Update checking scheduler started')
+                # Daily update checking. Always scheduled so the
+                # /update_checking runtime toggle works; the job
+                # itself no-ops when checking is disabled.
+                sched.add_job(
+                    check_for_updates,
+                    trigger=IntervalTrigger(hours=24),
+                    next_run_time=(
+                        datetime.now() + timedelta(minutes=5))
+                )
+                logger.info(
+                    'Update checking scheduled (enabled=%s)',
+                    config.UPDATE_CHECKING_ENABLED)
 
                 # Register all persisted reminders as scheduler jobs
                 register_all_reminder_jobs()
