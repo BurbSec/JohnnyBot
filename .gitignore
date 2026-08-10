@@ -17,6 +17,7 @@ reminders.json
 event_feeds.json
 event_announce.json
 autoreplies.json
+chaperone_mutes.json
 johnnybot.log
 temp/
 
