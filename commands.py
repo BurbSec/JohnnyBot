@@ -927,9 +927,15 @@ class EventFeed:  # pylint: disable=too-few-public-methods,too-many-public-metho
             pass
 
         for event in new_events:
-            await self._create_discord_event(
+            created, _action = await self._create_discord_event(
                 guild, event, existing_events)
-            posted_events.add(event['uid'])
+            # Only mark as posted once Discord actually accepted it —
+            # marking on failure meant the event never retried and had
+            # to be picked up manually by reconcile_discord_events()
+            if created:
+                posted_events.add(event['uid'])
+                if created not in existing_events:
+                    existing_events.append(created)
 
         feed_data['last_checked'] = datetime.now()
         feed_data['posted_events'] = posted_events
@@ -953,6 +959,10 @@ class EventFeed:  # pylint: disable=too-few-public-methods,too-many-public-metho
 
         Uses pre-fetched existing_events list to avoid redundant API
         calls.
+
+        Returns (event, action) where action is one of 'created',
+        'updated', 'unchanged' or 'failed'. Callers need the
+        distinction: reporting a repair as a creation is misleading.
         """
         try:
             # Discord trims trailing whitespace server-side — strip
@@ -1043,18 +1053,18 @@ class EventFeed:  # pylint: disable=too-few-public-methods,too-many-public-metho
                         logger.info(
                             "Discord Event '%s' already up to date, "
                             "skipping", name)
-                        return ev
+                        return ev, 'unchanged'
 
                     # edit() requires end_time for external events that
                     # don't already have one set
                     if 'location' in changes and not ev.end_time:
                         changes['end_time'] = end_time
 
-                    await ev.edit(**changes)
+                    edited = await ev.edit(**changes)
                     logger.info(
                         "Updated Discord Event '%s' (%s)",
                         name, ', '.join(sorted(changes)))
-                    return ev
+                    return edited or ev, 'updated'
 
             # No existing match — create new
             # privacy_level is required by the Discord API; discord.py
@@ -1073,7 +1083,7 @@ class EventFeed:  # pylint: disable=too-few-public-methods,too-many-public-metho
             logger.info(
                 "Created Discord Event '%s' (ID: %s) in guild %s",
                 name, discord_event.id, guild.name)
-            return discord_event
+            return discord_event, 'created'
 
         except (discord.Forbidden, ValueError, TypeError) as e:
             logger.error(
@@ -1087,7 +1097,7 @@ class EventFeed:  # pylint: disable=too-few-public-methods,too-many-public-metho
             logger.error(
                 "Unexpected error creating Discord Event '%s': %s",
                 event['summary'], e)
-        return None
+        return None, 'failed'
 
     # ── Announce system (recurring Mon/Thu job) ──────────────────────
 
@@ -1172,6 +1182,7 @@ class EventFeed:  # pylint: disable=too-few-public-methods,too-many-public-metho
         results = {
             'feeds_checked': 0,
             'events_created': 0,
+            'events_updated': 0,
             'errors': [],
         }
 
@@ -1210,11 +1221,14 @@ class EventFeed:  # pylint: disable=too-few-public-methods,too-many-public-metho
                             events)
 
                     for ev in events:
-                        created = await self._create_discord_event(
-                            guild, ev, existing)
-                        if created:
+                        created, action = (
+                            await self._create_discord_event(
+                                guild, ev, existing))
+                        if action == 'created':
                             existing.append(created)
                             results['events_created'] += 1
+                        elif action == 'updated':
+                            results['events_updated'] += 1
                 except Exception as e:  # pylint: disable=broad-exception-caught
                     results['errors'].append(f"{fname}: {e}")
                     logger.error(
@@ -1222,9 +1236,10 @@ class EventFeed:  # pylint: disable=too-few-public-methods,too-many-public-metho
 
         logger.info(
             "Reconcile complete: %d feeds, %d events created, "
-            "%d errors",
+            "%d updated, %d errors",
             results['feeds_checked'],
             results['events_created'],
+            results['events_updated'],
             len(results['errors']))
         return results
 
@@ -1285,6 +1300,29 @@ reminders: Dict[int, Dict[str, Any]] = {}
 event_feed: Optional[EventFeed] = None
 autoreplies: Dict[str, Dict[str, Any]] = {}  # Store autoreply rules {rule_id: rule_data}
 autoreplies_lock: Optional[threading.Lock] = None
+
+# Users the bot has DMed recently. A reply to one of our own DMs (the
+# /message_dump archive, /log_tail output) is solicited, so it must not
+# trip the DM auto-kick. Maps user id -> grace expiry timestamp.
+DM_GRACE_SECONDS = 24 * 60 * 60
+_recent_bot_dms: Dict[int, float] = {}
+_recent_bot_dms_lock = threading.Lock()
+
+
+def note_bot_dm(user_id: int) -> None:
+    """Record that the bot just DMed this user, granting reply grace."""
+    with _recent_bot_dms_lock:
+        _recent_bot_dms[user_id] = (
+            time_module.time() + DM_GRACE_SECONDS)
+
+
+def was_recently_dmed(user_id: int) -> bool:
+    """True if the bot DMed this user inside the grace window."""
+    now = time_module.time()
+    with _recent_bot_dms_lock:
+        for uid in [u for u, exp in _recent_bot_dms.items() if exp <= now]:
+            del _recent_bot_dms[uid]
+        return user_id in _recent_bot_dms
 
 
 def _load_reminders():
@@ -1915,6 +1953,7 @@ async def log_tail_command(interaction: discord.Interaction, lines: int):
         with open(LOG_FILE, 'r', encoding='utf-8') as log_file:
             last_lines = ''.join(deque(log_file, maxlen=lines))
         if last_lines:
+            note_bot_dm(interaction.user.id)
             await interaction.user.send(f'```{last_lines}```')
             await interaction.response.send_message('Log lines sent to your DMs.', ephemeral=True)
         else:
@@ -2079,7 +2118,9 @@ async def check_event_feeds_command(interaction: discord.Interaction):
             f"Feeds checked: **{results['feeds_checked']}**\n"
             f"New events posted: **{results['events_posted']}**\n"
             f"Missing Discord events created: "
-            f"**{recon['events_created']}**"
+            f"**{recon['events_created']}**\n"
+            f"Existing events repaired: "
+            f"**{recon['events_updated']}**"
         ]
 
         all_errors = list(results['errors']) + list(recon['errors'])
@@ -2090,6 +2131,7 @@ async def check_event_feeds_command(interaction: discord.Interaction):
 
         if (results['events_posted'] == 0
                 and recon['events_created'] == 0
+                and recon['events_updated'] == 0
                 and not all_errors):
             parts.append(
                 "\n\nNo new events found in the next 30 days "
@@ -2286,8 +2328,13 @@ async def message_dump_command(interaction: discord.Interaction, user: discord.U
             )
         
         try:
+            # Anchor to UTC — a naive datetime is read as server-local
+            # by discord.py's snowflake conversion, shifting the start
+            # of the window by the host's UTC offset.
             start_datetime = datetime.strptime(start_date, "%Y-%m-%d")
-            start_datetime = start_datetime.replace(hour=0, minute=0, second=0, microsecond=0)
+            start_datetime = start_datetime.replace(
+                hour=0, minute=0, second=0, microsecond=0,
+                tzinfo=timezone.utc)
         except ValueError:
             await interaction.followup.send(
                 "Invalid date format. Please use YYYY-MM-DD format (e.g., 2025-01-01).",
@@ -2330,10 +2377,12 @@ async def message_dump_command(interaction: discord.Interaction, user: discord.U
             ephemeral=True
         )
         
-        # Simplified approach to message fetching
+        # Simplified approach to message fetching.
+        # Passing `after` makes discord.py iterate oldest-first, so
+        # pagination walks *forward* from the newest id seen so far.
         messages = []
         total_processed = 0
-        last_message_id = None
+        newest_message_id = None
         
         # Log the start of message fetching
         logger.info("Starting message fetch for user %s in channel %s", user.id, channel.id)
@@ -2349,10 +2398,14 @@ async def message_dump_command(interaction: discord.Interaction, user: discord.U
                 # Determine how many messages to fetch in this batch
                 batch_size = min(100, limit - total_processed)
                 
-                # Set up the fetch parameters
-                fetch_kwargs = {'limit': batch_size, 'after': start_datetime}
-                if last_message_id:
-                    fetch_kwargs['before'] = discord.Object(id=last_message_id)
+                # Set up the fetch parameters. Resume from the newest
+                # message already seen; the date only anchors batch one.
+                fetch_kwargs = {'limit': batch_size}
+                if newest_message_id:
+                    fetch_kwargs['after'] = discord.Object(
+                        id=newest_message_id)
+                else:
+                    fetch_kwargs['after'] = start_datetime
                 
                 # Log the current fetch attempt
                 logger.info("Fetching batch with params: %s, processed so far: %s", fetch_kwargs, total_processed)
@@ -2363,17 +2416,14 @@ async def message_dump_command(interaction: discord.Interaction, user: discord.U
                 
                 async for msg in channel.history(**fetch_kwargs):
                     messages_in_this_batch += 1
-                    # Keep track of the last message ID for pagination
-                    if last_message_id is None or msg.id < last_message_id:
-                        last_message_id = msg.id
-                    
+                    # Advance the pagination cursor (oldest-first, so
+                    # the highest id seen is where the next batch starts)
+                    if newest_message_id is None or msg.id > newest_message_id:
+                        newest_message_id = msg.id
+
                     # Count this message
                     total_processed += 1
-                    
-                    # Log message details for debugging
-                    logger.info("Message %s from author ID: %s, target user ID: %s, match: %s",
-                               msg.id, msg.author.id, user.id, msg.author.id == user.id)
-                    
+
                     # Check if this message is from our target user
                     if msg.author.id == user.id:
                         # Format the message more efficiently
@@ -2433,8 +2483,10 @@ async def message_dump_command(interaction: discord.Interaction, user: discord.U
             # Add the batch to our collection
             messages.extend(current_batch)
             
-            # Send a progress update every 500 messages or at the end of a batch
-            if total_processed % 500 == 0 or batch_count < batch_size:
+            # Send a progress update every 500 messages. (Previously this
+            # also fired on any short batch, which meant a followup on
+            # nearly every batch.)
+            if total_processed and total_processed % 500 == 0:
                 await interaction.followup.send(
                     f"Progress update: Processed {total_processed} messages, found {len(messages)} from {user.mention}...",
                     ephemeral=True
@@ -2517,6 +2569,7 @@ async def message_dump_command(interaction: discord.Interaction, user: discord.U
             f"**Messages found:** {len(messages)}\n"
             f"**Messages processed:** {total_processed}")
 
+        note_bot_dm(interaction.user.id)
         await interaction.user.send(
             dm_message, file=discord.File(zip_path))
 

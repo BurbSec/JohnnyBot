@@ -372,11 +372,15 @@ async def on_ready():  # pylint: disable=too-many-statements
                     logger.info(
                         'Weekly announce scheduled: Monday 10am CT')
 
-                # Day-of reminder: daily 10am Central
+                # Day-of reminder: 10am Central, Tue-Sun. Mondays are
+                # skipped because the weekly preview fires at the same
+                # minute and already covers that day's events — running
+                # both posted every Monday event twice.
                 if hasattr(event_feed, 'announce_todays_events'):
                     sched.add_job(
                         event_feed.announce_todays_events,
                         trigger=CronTrigger(
+                            day_of_week='tue-sun',
                             hour=10,
                             minute=0,
                             timezone=BOT_TIMEZONE),
@@ -384,7 +388,7 @@ async def on_ready():  # pylint: disable=too-many-statements
                         replace_existing=True
                     )
                     logger.info(
-                        'Day-of reminder scheduled: daily 10am CT')
+                        'Day-of reminder scheduled: Tue-Sun 10am CT')
 
                 # Daily update checking; the job no-ops when
                 # UPDATE_CHECKING_ENABLED is off in config.py
@@ -407,10 +411,75 @@ async def on_ready():  # pylint: disable=too-many-statements
     except (AttributeError, ImportError, ValueError) as e:
         logger.error('Failed to start event feed scheduler: %s', e)
 
+async def handle_unsolicited_dm(message):
+    """Kick anyone who DMs the bot.
+
+    Exempt: moderators, and anyone the bot itself DMed recently — the
+    /message_dump archive and /log_tail output arrive by DM, so a reply
+    to one of those is solicited and must not be punished.
+    """
+    author = message.author
+
+    if _was_recently_dmed(author.id):
+        logger.info(
+            'Ignoring DM from %s (replying to a DM we sent)', author)
+        return
+
+    # A user can share more than one guild with the bot; moderator
+    # status anywhere exempts them everywhere.
+    memberships = [
+        m for m in (g.get_member(author.id) for g in bot.guilds) if m]
+    if any(role.name == MODERATOR_ROLE_NAME
+           for m in memberships for role in getattr(m, 'roles', [])):
+        logger.info('Ignoring DM from moderator %s', author)
+        return
+
+    if not memberships:
+        logger.info(
+            'DM from %s who shares no guild with the bot; nothing to kick',
+            author)
+        return
+
+    logger.warning('Kicking %s for DMing the bot', author)
+    for member in memberships:
+        try:
+            await member.kick(reason='Sent an unsolicited DM to the bot')
+            logger.info('Kicked %s from %s for DMing the bot',
+                        member, member.guild.name)
+        except discord.Forbidden:
+            logger.error(
+                'Missing permission to kick %s from %s',
+                member, member.guild.name)
+        except discord.HTTPException as e:
+            logger.error('Failed to kick %s from %s: %s',
+                         member, member.guild.name, e)
+            continue
+
+        moderators_channel = discord.utils.get(
+            member.guild.text_channels, name=MODERATORS_CHANNEL_NAME)
+        if not moderators_channel:
+            continue
+        try:
+            await moderators_channel.send(
+                f"👢 Kicked **{member}** (ID: {member.id}) for DMing the bot.\n"
+                f"> {message.content[:200] or '[no text content]'}"
+            )
+        except (discord.HTTPException, discord.Forbidden) as e:
+            logger.error('Failed to report DM kick: %s', e)
+
 @bot.event
 async def on_message(message):
     """Monitor messages in protected channels and delete non-moderator messages. Also check for autoreply rules."""
     if message.author.bot:
+        return
+
+    # DMs have no guild and DMChannel has no .name, so handle them
+    # before anything that assumes a guild channel.
+    if message.guild is None:
+        try:
+            await handle_unsolicited_dm(message)
+        except Exception as e:  # pylint: disable=broad-exception-caught
+            logger.error('Error handling DM from %s: %s', message.author, e)
         return
 
     try:
@@ -420,8 +489,8 @@ async def on_message(message):
         pass
     except Exception as e:
         logger.error('Error checking autoreply rules: %s', e)
-    
-    if message.channel.name in PROTECTED_CHANNELS:
+
+    if getattr(message.channel, 'name', None) in PROTECTED_CHANNELS:
         has_moderator_role = any(
             role.name == MODERATOR_ROLE_NAME
             for role in getattr(message.author, 'roles', []))
@@ -453,62 +522,115 @@ def get_user_role_type(member):
         return 'child'
     return 'neither'
 
-async def check_voice_channel_safety(channel):  # pylint: disable=too-many-branches
-    """Check if a voice channel has only one adult and one child, and take action if so.
-    
-    Args:
-        channel: Discord voice channel object
-    """
-    if not channel or not hasattr(channel, 'members'):
-        return
-    
+# Members the chaperone itself muted, so we only ever lift our own
+# mutes and never one a moderator applied by hand.
+_chaperone_muted = set()
+# Voice channels currently in the flagged 1-adult/1-child state.
+# Muting a member re-fires on_voice_state_update, so without this the
+# same incident alerts the moderators two or three times.
+_chaperone_flagged = set()
+
+def _count_adults_children(channel):
+    """Return (adults, children) among the non-bot members of a channel."""
     adults = []
     children = []
-    
     for member in channel.members:
         if member.bot:
             continue
-            
         role_type = get_user_role_type(member)
         if role_type == 'adult':
             adults.append(member)
         elif role_type == 'child':
             children.append(member)
-    
-    if len(adults) == 1 and len(children) == 1:
-        logger.warning(
-            'ALERT: One adult (%s) and one child (%s) detected in voice channel %s',
-            adults[0].display_name,
-            children[0].display_name,
-            channel.name
-        )
-        
+    return adults, children
+
+async def _unmute_member(member, reason):
+    """Lift a chaperone mute. Discord rejects this unless the member is
+    connected to voice, so leave them flagged and retry on rejoin."""
+    if member.id not in _chaperone_muted:
+        return
+    if not member.voice or not member.voice.channel:
+        return
+    try:
+        await member.edit(mute=False)
+        _chaperone_muted.discard(member.id)
+        logger.info('Unmuted %s (%s)', member.display_name, reason)
+    except discord.HTTPException as e:
+        logger.error('Failed to unmute %s: %s', member.display_name, e)
+
+async def check_voice_channel_safety(channel):  # pylint: disable=too-many-branches
+    """Check if a voice channel has only one adult and one child, and take action if so.
+
+    When the channel returns to a safe state, any mute this feature
+    applied is lifted again — otherwise members stay server-muted
+    indefinitely and a moderator has to clear each one by hand.
+
+    Args:
+        channel: Discord voice channel object
+    """
+    if not channel or not hasattr(channel, 'members'):
+        return
+
+    adults, children = _count_adults_children(channel)
+    unsafe = len(adults) == 1 and len(children) == 1
+
+    if not unsafe:
+        # Safe again (or empty) — release our mutes and re-arm alerting
+        was_flagged = channel.id in _chaperone_flagged
+        _chaperone_flagged.discard(channel.id)
         for member in channel.members:
-            if not member.bot:
-                try:
-                    await member.edit(mute=True)
-                    logger.info('Muted %s in channel %s', member.display_name, channel.name)
-                except discord.HTTPException as e:
-                    logger.error('Failed to mute %s: %s', member.display_name, e)
-        
+            await _unmute_member(
+                member, f'{channel.name} no longer 1 adult + 1 child')
+        if was_flagged:
+            logger.info(
+                'Voice channel %s cleared; chaperone mutes lifted',
+                channel.name)
+        return
+
+    already_flagged = channel.id in _chaperone_flagged
+    _chaperone_flagged.add(channel.id)
+
+    for member in channel.members:
+        if member.bot or member.id in _chaperone_muted:
+            continue
         try:
-            moderators_channel = discord.utils.get(
-                channel.guild.text_channels,
-                name=MODERATORS_CHANNEL_NAME)
-            
-            if moderators_channel:
-                alert_message = (
-                    f"🚨 **ALERT**: There is only one adult ({adults[0].mention}) and one child "
-                    f"({children[0].mention}) currently in {channel.mention}\n\n"
-                    f"All members in the channel have been muted for safety."
-                )
-                await moderators_channel.send(alert_message)
-                logger.info('Alert sent to moderators channel for voice channel %s', channel.name)
-            else:
-                logger.error('Moderators channel "%s" not found', MODERATORS_CHANNEL_NAME)
-                
+            await member.edit(mute=True)
+            _chaperone_muted.add(member.id)
+            logger.info('Muted %s in channel %s', member.display_name, channel.name)
         except discord.HTTPException as e:
-            logger.error('Failed to send alert to moderators channel: %s', e)
+            logger.error('Failed to mute %s: %s', member.display_name, e)
+
+    if already_flagged:
+        # Same incident, still open — don't re-alert
+        return
+
+    logger.warning(
+        'ALERT: One adult (%s) and one child (%s) detected in voice channel %s',
+        adults[0].display_name,
+        children[0].display_name,
+        channel.name
+    )
+
+    try:
+        moderators_channel = discord.utils.get(
+            channel.guild.text_channels,
+            name=MODERATORS_CHANNEL_NAME)
+
+        if moderators_channel:
+            alert_message = (
+                f"🚨 **ALERT**: There is only one adult ({adults[0].mention}) and one child "
+                f"({children[0].mention}) currently in {channel.mention}\n\n"
+                f"All members in the channel have been muted for safety. "
+                f"The mute lifts automatically once the channel is no longer "
+                f"one adult and one child."
+            )
+            await moderators_channel.send(alert_message)
+            logger.info('Alert sent to moderators channel for voice channel %s', channel.name)
+        else:
+            logger.error('Moderators channel "%s" not found', MODERATORS_CHANNEL_NAME)
+
+    except discord.HTTPException as e:
+        logger.error('Failed to send alert to moderators channel: %s', e)
 
 @bot.event
 async def on_voice_state_update(member, before, after):
@@ -519,22 +641,31 @@ async def on_voice_state_update(member, before, after):
     # Read VOICE_CHAPERONE_ENABLED from the config module each call so
     # runtime toggles via /voice_chaperone take effect immediately.
     if not config.VOICE_CHAPERONE_ENABLED:
+        # Turning the feature off shouldn't strand anyone muted
+        await _unmute_member(member, 'voice chaperone disabled')
         return
-    
+
     channels_to_check = set()
-    
+
     if before.channel:
         channels_to_check.add(before.channel)
-    
+
     if after.channel:
         channels_to_check.add(after.channel)
-    
+
     for channel in channels_to_check:
         await check_voice_channel_safety(channel)
+
+    # Someone who walked out of a flagged channel (or rejoined voice
+    # still carrying our mute) gets released here — check_voice_channel_safety
+    # only sees the members currently in the channel it inspects.
+    if after.channel and after.channel.id not in _chaperone_flagged:
+        await _unmute_member(member, 'left flagged voice channel')
 
 from commands import (  # pylint: disable=wrong-import-position
     setup_commands,
     check_message_for_autoreplies as _check_autoreplies,
+    was_recently_dmed as _was_recently_dmed,
 )
 setup_commands(bot)
 
