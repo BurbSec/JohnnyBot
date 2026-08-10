@@ -13,6 +13,8 @@ import aiohttp
 import discord
 from discord.ext import commands
 
+import json
+
 import config
 from config import (
     TOKEN,
@@ -279,6 +281,14 @@ async def on_ready():  # pylint: disable=too-many-statements
         logger.info('Logged in as %s (ID: %s)', bot.user, bot.user.id)
         logger.info('Bot initialization complete')
 
+    # Lift any chaperone mutes left outstanding by the last shutdown
+    # before doing anything slower (command sync takes ~15s)
+    _load_chaperone_mutes()
+    try:
+        await sweep_chaperone_mutes()
+    except (discord.HTTPException, AttributeError) as e:
+        logger.error('Chaperone startup sweep failed: %s', e)
+
     registered_commands = bot.tree.get_commands()
     logger.info('Pre-sync commands: %s', [cmd.name for cmd in registered_commands])
 
@@ -426,9 +436,23 @@ async def handle_unsolicited_dm(message):
         return
 
     # A user can share more than one guild with the bot; moderator
-    # status anywhere exempts them everywhere.
-    memberships = [
-        m for m in (g.get_member(author.id) for g in bot.guilds) if m]
+    # status anywhere exempts them everywhere. Fall back to an API
+    # fetch when the member cache misses — kicking is irreversible for
+    # the member, so never decide it on a stale cache.
+    memberships = []
+    for guild in bot.guilds:
+        member = guild.get_member(author.id)
+        if member is None:
+            try:
+                member = await guild.fetch_member(author.id)
+            except discord.NotFound:
+                continue
+            except discord.HTTPException as e:
+                logger.error(
+                    'Could not fetch %s in %s, skipping kick there: %s',
+                    author, guild.name, e)
+                continue
+        memberships.append(member)
     if any(role.name == MODERATOR_ROLE_NAME
            for m in memberships for role in getattr(m, 'roles', [])):
         logger.info('Ignoring DM from moderator %s', author)
@@ -523,12 +547,62 @@ def get_user_role_type(member):
     return 'neither'
 
 # Members the chaperone itself muted, so we only ever lift our own
-# mutes and never one a moderator applied by hand.
+# mutes and never one a moderator applied by hand. Persisted, because
+# a restart while someone is muted would otherwise strand them: the
+# unmute path skips anyone missing from this set.
 _chaperone_muted = set()
 # Voice channels currently in the flagged 1-adult/1-child state.
 # Muting a member re-fires on_voice_state_update, so without this the
-# same incident alerts the moderators two or three times.
+# same incident alerts the moderators two or three times. Not
+# persisted — rebuilt by the startup sweep from live channel state.
 _chaperone_flagged = set()
+
+# Kept out of config.py: deployed configs are not tracked by git and
+# would not have the constant after a pull.
+CHAPERONE_MUTES_FILE = getattr(
+    config, 'CHAPERONE_MUTES_FILE',
+    os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                 'chaperone_mutes.json'))
+
+def _load_chaperone_mutes():
+    """Restore the set of members this feature muted before a restart."""
+    if not os.path.exists(CHAPERONE_MUTES_FILE):
+        return
+    try:
+        with open(CHAPERONE_MUTES_FILE, 'r', encoding='utf-8') as f:
+            _chaperone_muted.update(int(uid) for uid in json.load(f))
+        logger.info('Loaded %d outstanding chaperone mutes',
+                    len(_chaperone_muted))
+    except (OSError, IOError, ValueError, TypeError) as e:
+        logger.error('Failed to load chaperone mutes: %s', e)
+
+def _save_chaperone_mutes():
+    """Persist outstanding chaperone mutes so a restart can lift them."""
+    # Never let a persistence problem abort the mute/unmute it is
+    # recording — the safety action matters more than the bookkeeping.
+    try:
+        _atomic_json_write(
+            CHAPERONE_MUTES_FILE, [int(uid) for uid in _chaperone_muted])
+    except (OSError, IOError, TypeError, ValueError) as e:
+        logger.error('Failed to save chaperone mutes: %s', e)
+
+async def sweep_chaperone_mutes():
+    """Re-evaluate every populated voice channel at startup.
+
+    Rebuilds the flagged-channel set from live state and lifts mutes
+    left over from before the restart.
+    """
+    if not config.VOICE_CHAPERONE_ENABLED:
+        return
+    for guild in bot.guilds:
+        for channel in guild.voice_channels:
+            if channel.members:
+                await check_voice_channel_safety(channel)
+    if _chaperone_muted:
+        logger.info(
+            '%d chaperone mutes still outstanding after startup sweep '
+            '(members not currently connected to voice)',
+            len(_chaperone_muted))
 
 def _count_adults_children(channel):
     """Return (adults, children) among the non-bot members of a channel."""
@@ -554,6 +628,7 @@ async def _unmute_member(member, reason):
     try:
         await member.edit(mute=False)
         _chaperone_muted.discard(member.id)
+        _save_chaperone_mutes()
         logger.info('Unmuted %s (%s)', member.display_name, reason)
     except discord.HTTPException as e:
         logger.error('Failed to unmute %s: %s', member.display_name, e)
@@ -596,6 +671,7 @@ async def check_voice_channel_safety(channel):  # pylint: disable=too-many-branc
         try:
             await member.edit(mute=True)
             _chaperone_muted.add(member.id)
+            _save_chaperone_mutes()
             logger.info('Muted %s in channel %s', member.display_name, channel.name)
         except discord.HTTPException as e:
             logger.error('Failed to mute %s: %s', member.display_name, e)
@@ -666,6 +742,7 @@ from commands import (  # pylint: disable=wrong-import-position
     setup_commands,
     check_message_for_autoreplies as _check_autoreplies,
     was_recently_dmed as _was_recently_dmed,
+    _atomic_json_write,
 )
 setup_commands(bot)
 
