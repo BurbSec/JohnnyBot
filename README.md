@@ -16,6 +16,14 @@ MODERATOR_ROLE_NAME, however the PetBot commands can be leveraged by all users.
 - **[Setup Guide](../../wiki/Setup-Guide)** - Complete installation and configuration
 - **[Commands Reference](../../wiki/Commands-Reference)** - All available commands with examples
 
+## Automatic Behavior
+
+These run without being invoked, so they are worth knowing about before you deploy:
+
+- **DMs to the bot get you kicked.** Anyone who sends the bot a direct message is removed from every server they share with it, and the kick is reported to the moderators channel. Two exemptions: users with `MODERATOR_ROLE_NAME`, and anyone the bot itself DMed in the last 24 hours — so replying to a `/message_dump` archive or `/log_tail` output is safe.
+- **Protected channels are enforced.** Messages posted by non-moderators in any channel listed in `PROTECTED_CHANNELS` are deleted.
+- **Voice channel chaperone.** When a voice channel contains exactly one adult and one child (by `ADULT_ROLE_NAMES` / `CHILD_ROLE_NAMES`), everyone in it is server-muted and the moderators channel is alerted once. The mute lifts automatically when the channel is no longer one adult and one child, when a muted member moves to a safe channel, or when the feature is disabled — including across a bot restart, since outstanding mutes are persisted to `chaperone_mutes.json`. Only mutes the bot applied are lifted; a manual moderator mute is never undone. Toggle with `/voice_chaperone`.
+
 ## Key Features
 
 ### Moderation
@@ -37,7 +45,7 @@ MODERATOR_ROLE_NAME, however the PetBot commands can be leveraged by all users.
 |---|---|---|
 | `/clone_category_permissions` | Clone permission overwrites from one category to another | Mod |
 | `/clone_channel_permissions` | Clone permission overwrites from one channel to another | Mod |
-| `/clone_role_permissions` | Clone permissions from one role to another | Mod |
+| `/clone_role_permissions` | Clone permissions from one role to another (moderation permissions — Administrator, ban/kick, manage roles/guild/channels/messages, timeout — are excluded and must be granted manually) | Mod |
 | `/clear_category_permissions` | Clear all permission overwrites from a category | Mod |
 | `/clear_channel_permissions` | Clear all permission overwrites from a channel | Mod |
 | `/clear_role_permissions` | Reset a role's permissions to default | Mod |
@@ -49,7 +57,7 @@ MODERATOR_ROLE_NAME, however the PetBot commands can be leveraged by all users.
 |---|---|---|
 | `/assign_role` | Mass-assign a role to multiple users at once | Mod |
 | `/remove_role` | Mass-remove a role from multiple users at once | Mod |
-| `/list_users_without_roles` | List all users with no server roles assigned | All |
+| `/list_users_without_roles` | List all users with no server roles assigned | Mod |
 
 ### Reminders
 
@@ -69,7 +77,7 @@ MODERATOR_ROLE_NAME, however the PetBot commands can be leveraged by all users.
 | `/remove_event_feed` | Remove a feed by name (announcements are disabled when the last feed is removed) | Mod |
 | `/check_event_feeds` | Manually trigger a check of all feeds for new events | Mod |
 
-Once a feed is added, everything else is automatic: feeds are re-checked every Monday at 9am, a "This Week" preview of the server's Discord Scheduled Events posts Monday at 10am, and day-of reminders post daily at 10am (timezone set by `BOT_TIMEZONE` in `config.py`, default US Central).
+Once a feed is added, everything else is automatic: feeds are re-checked every Monday at 9am, a "This Week" preview of the server's Discord Scheduled Events posts Monday at 10am, and day-of reminders post Tuesday through Sunday at 10am (Monday is skipped because the weekly preview already covers that day's events). Timezone is set by `BOT_TIMEZONE` in `config.py`, default US Central.
 
 ### Autoreply
 
@@ -84,8 +92,8 @@ Once a feed is added, everything else is automatic: feeds are re-checked every M
 
 | Command | Description | Access |
 |---|---|---|
-| `/voice_chaperone` | Enable/disable automatic voice channel safety monitoring (alerts mods when only 1 adult + 1 child are in a channel) | Mod |
-| `/log_tail` | DM the last N lines of the bot log to yourself | All |
+| `/voice_chaperone` | Enable/disable automatic voice channel safety monitoring (when only 1 adult + 1 child are in a channel, everyone present is server-muted and mods are alerted; the mute lifts automatically once the channel is no longer 1 adult + 1 child) | Mod |
+| `/log_tail` | DM the last N lines of the bot log to yourself | Mod |
 | `/dashboard` | Display all available commands grouped by category | All |
 
 Update checking is configured in `config.py` (not via slash command): `UPDATE_CHECKING_ENABLED` turns on daily checks for new commits with moderator notifications, and `AUTO_UPDATE_ENABLED` additionally makes the bot pull CI-passing updates and restart itself.
