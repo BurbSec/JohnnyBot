@@ -770,11 +770,13 @@ class EventFeed:  # pylint: disable=too-few-public-methods,too-many-public-metho
                     return None
                 html = await response.text()
 
-            # Extract JSON-LD Event data
+            # Extract JSON-LD Event data. The script tag carries extra
+            # attributes on Meetup (data-next-head=""), so match any
+            # attribute order/content rather than an exact tag.
             ld_matches = re.findall(
-                r'<script type="application/ld\+json">'
-                r'(.*?)</script>',
-                html, re.DOTALL)
+                r'<script[^>]*type=["\']application/ld\+json["\']'
+                r'[^>]*>(.*?)</script>',
+                html, re.DOTALL | re.IGNORECASE)
 
             for match in ld_matches:
                 try:
@@ -797,6 +799,61 @@ class EventFeed:  # pylint: disable=too-few-public-methods,too-many-public-metho
                 "Error scraping event page %s: %s", url, e)
             return None
 
+    def _parse_jsonld_location(self, location_data) -> str:
+        """Flatten a schema.org location value into a display string.
+
+        Handles Place (with a PostalAddress dict or plain-string
+        address), VirtualLocation (online events), a bare string, and
+        a list of any of the above.
+        """
+        if not location_data:
+            return ''
+
+        # Some feeds emit a list of locations (e.g. a venue plus an
+        # online stream) — take the first one that yields anything.
+        if isinstance(location_data, list):
+            for item in location_data:
+                parsed = self._parse_jsonld_location(item)
+                if parsed:
+                    return parsed
+            return ''
+
+        if isinstance(location_data, str):
+            return self._strip_urls(location_data)
+
+        if not isinstance(location_data, dict):
+            return ''
+
+        loc_name = str(location_data.get('name', '') or '').strip()
+
+        if location_data.get('@type') == 'VirtualLocation':
+            # The only useful field is a URL, which _strip_urls would
+            # wipe — and Discord rejects an empty external location.
+            return loc_name or 'Online'
+
+        address = location_data.get('address')
+        street = ''
+        if isinstance(address, dict):
+            # Meetup packs locality/region into streetAddress already
+            # ("318 Union St, Mishawaka, IN"), so only fall back to the
+            # separate fields when streetAddress is absent.
+            street = str(address.get('streetAddress', '') or '').strip()
+            if not street:
+                street = ', '.join(
+                    part for part in (
+                        str(address.get('addressLocality', '') or '').strip(),
+                        str(address.get('addressRegion', '') or '').strip(),
+                    ) if part)
+        elif isinstance(address, str):
+            street = address.strip()
+
+        if loc_name and street:
+            location = f"{loc_name}, {street}"
+        else:
+            location = loc_name or street
+
+        return self._strip_urls(location)
+
     def _parse_jsonld_event(self, data: dict, url: str,
                             uid: str) -> Optional[Dict[str, Any]]:
         """Parse a JSON-LD Event object into our event dict."""
@@ -805,25 +862,7 @@ class EventFeed:  # pylint: disable=too-few-public-methods,too-many-public-metho
             data.get('description', ''))
 
         # Parse location
-        location_data = data.get('location', {})
-        location = ''
-        if isinstance(location_data, dict):
-            loc_name = location_data.get('name', '')
-            address = location_data.get('address', {})
-            if isinstance(address, dict):
-                street = address.get('streetAddress', '')
-                if loc_name and street:
-                    location = f"{loc_name}, {street}"
-                elif loc_name:
-                    location = loc_name
-                elif street:
-                    location = street
-            elif loc_name:
-                location = loc_name
-        elif isinstance(location_data, str):
-            location = location_data
-
-        location = self._strip_urls(location)
+        location = self._parse_jsonld_location(data.get('location'))
 
         # Parse dates
         start_str = data.get('startDate', '')
@@ -920,7 +959,10 @@ class EventFeed:  # pylint: disable=too-few-public-methods,too-many-public-metho
             # before we compare against fetched events or we'll never
             # dedup and will loop-recreate every run
             name = event['summary'].strip()[:100]
-            description = event.get('description', '')[:1000]
+            # Description is just the event page URL — a bare URL so
+            # Discord auto-links it (masked [text](url) markdown is not
+            # rendered in scheduled-event descriptions).
+            description = (event.get('link') or '').strip()[:1000]
             start_time = event['start_date']
             end_time = event.get('end_date')
             location = event.get('location', '')
@@ -977,18 +1019,41 @@ class EventFeed:  # pylint: disable=too-few-public-methods,too-many-public-metho
                     if _prefix(ev_name) != name_prefix:
                         continue
 
-                    # Same event (matched on prefix + time)
-                    if ev_name == name:
+                    # Same event (matched on prefix + time) — sync any
+                    # field that drifted. Name isn't the only thing that
+                    # can change: events created before the location
+                    # scraper worked are stuck on the placeholder, and
+                    # they'd never be repaired if we gated on the title.
+                    changes = {}
+                    if ev_name != name:
+                        changes['name'] = name
+                    if description and (ev.description or '') != description:
+                        changes['description'] = description
+                    # Only sync location when we actually have one — a
+                    # transient scrape failure yields the placeholder,
+                    # and we must not clobber a good venue with it.
+                    # Only external events carry a location; passing one
+                    # for a voice/stage event raises TypeError.
+                    if (location
+                            and ev.entity_type == discord.EntityType.external
+                            and (ev.location or '') != event_location):
+                        changes['location'] = event_location
+
+                    if not changes:
                         logger.info(
                             "Discord Event '%s' already up to date, "
                             "skipping", name)
                         return ev
 
-                    # Title changed — update in place
-                    await ev.edit(name=name)
+                    # edit() requires end_time for external events that
+                    # don't already have one set
+                    if 'location' in changes and not ev.end_time:
+                        changes['end_time'] = end_time
+
+                    await ev.edit(**changes)
                     logger.info(
-                        "Updated Discord Event title: '%s' → '%s'",
-                        ev_name, name)
+                        "Updated Discord Event '%s' (%s)",
+                        name, ', '.join(sorted(changes)))
                     return ev
 
             # No existing match — create new
