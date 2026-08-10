@@ -214,6 +214,21 @@ def _format_list_with_overflow(items, max_shown=10, prefix='• '):
     return result
 
 
+def _format_names_inline(members, max_shown=25):
+    """Comma-joined display names, truncated to stay under Discord's cap."""
+    names = [getattr(m, 'display_name', str(m)) for m in members]
+    shown = ', '.join(names[:max_shown])
+    if len(names) > max_shown:
+        shown += f' ... and {len(names) - max_shown} more'
+    return shown
+
+
+def _is_moderator(user):
+    """True if the user carries the moderator role in this guild."""
+    return any(role.name == MODERATOR_ROLE_NAME
+               for role in getattr(user, 'roles', []))
+
+
 async def _check_role_hierarchy(interaction, role):
     """Check bot and user role hierarchy. Returns False and responds if blocked."""
     bot_member = interaction.guild.me
@@ -238,7 +253,6 @@ async def _check_role_hierarchy(interaction, role):
 
 async def _command_error_handler(interaction, error):
     """Generic command error handler."""
-    last_log = get_last_log_line()
     if isinstance(error, app_commands.errors.MissingRole):
         msg = 'You do not have the required role to use this command.'
     elif isinstance(error, discord.HTTPException):
@@ -247,8 +261,24 @@ async def _command_error_handler(interaction, error):
     else:
         logger.error('Command error: %s', error)
         msg = f'Error: {error}'
-    await interaction.response.send_message(
-        f'{msg}\n\nLast log: {last_log}', ephemeral=True)
+
+    # The trailing log line is a debugging aid for moderators. It used
+    # to be appended unconditionally — including to the MissingRole
+    # reply, which is by definition sent to someone not authorised to
+    # read the log.
+    if _is_moderator(interaction.user):
+        msg = f'{msg}\n\nLast log: {get_last_log_line()}'
+
+    # Commands that already deferred have used up the initial response;
+    # sending again raises InteractionResponded and the user is left
+    # watching the spinner with no message at all.
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(msg, ephemeral=True)
+        else:
+            await interaction.response.send_message(msg, ephemeral=True)
+    except discord.HTTPException as e:
+        logger.error('Failed to deliver error message to user: %s', e)
 
 
 class EventFeed:  # pylint: disable=too-few-public-methods,too-many-public-methods
@@ -1483,7 +1513,7 @@ def register_commands():
          error=timeout_error)
     _reg('log_tail',
          'DM the last specified number of lines of the bot log to the user',
-         log_tail_command,
+         log_tail_command, mod_only=True,
          describe={'lines': 'Number of lines to retrieve from the log'},
          error=log_tail_error)
     _reg('add_event_feed',
@@ -1558,7 +1588,8 @@ def register_commands():
          error=sync_channel_perms_error)
     _reg('list_users_without_roles',
          'Lists all users that do not have any server role assigned',
-         list_users_without_roles, error=list_users_without_roles_error)
+         list_users_without_roles, mod_only=True,
+         error=list_users_without_roles_error)
     _reg('assign_role', 'Assigns a role to multiple users at once',
          assign_role, mod_only=True,
          describe={'role': 'Role to assign to the users',
@@ -2625,7 +2656,7 @@ def _classify_perm_target(target, bot_top_role):
 
 def _empty_counts():
     return {'processed': 0, 'skipped_admin': 0, 'skipped_managed': 0,
-            'skipped_hierarchy': 0, 'skipped_dangerous': 0}
+            'skipped_hierarchy': 0, 'skipped_dangerous': 0, 'failed': 0}
 
 
 async def _apply_to_overwrites(obj, action_label, items, apply_fn):
@@ -2652,10 +2683,14 @@ async def _apply_to_overwrites(obj, action_label, items, apply_fn):
             logger.info('%s permissions for %s on %s',
                         action_label.capitalize(), target, obj.name)
         except discord.Forbidden as e:
-            counts['skipped_hierarchy'] += 1
+            # Counted separately: this used to be folded into
+            # skipped_hierarchy, so the summary blamed role hierarchy
+            # for what is often a missing "Manage Roles" permission.
+            counts['failed'] += 1
             logger.error('Failed to %s permissions for %s: %s',
                          action_label, target, e)
         except discord.HTTPException as e:
+            counts['failed'] += 1
             logger.error('Failed to %s permissions for %s: %s',
                          action_label, target, e)
     return counts
@@ -2675,6 +2710,29 @@ async def _copy_overwrites(src, dst):
     return await _apply_to_overwrites(
         dst, 'copy', items,
         lambda t, ow: dst.set_permissions(t, overwrite=ow))
+
+
+async def _mirror_overwrites(src, dst):
+    """Make dst's overwrites match src's without ever baring dst.
+
+    Applies src's overwrites first, then drops only the targets dst has
+    that src does not. Clearing first (the previous approach) left a
+    window where dst had no overwrites at all — and if every copy then
+    failed, a private channel stayed wide open while the command still
+    reported success.
+    """
+    counts = await _copy_overwrites(src, dst)
+
+    stale = [(t, None) for t in dst.overwrites
+             if t not in src.overwrites]
+    if stale:
+        removed = await _apply_to_overwrites(
+            dst, 'clear', stale,
+            lambda t, _ow: dst.set_permissions(t, overwrite=None))
+        for key in ('skipped_admin', 'skipped_managed',
+                    'skipped_hierarchy', 'skipped_dangerous', 'failed'):
+            counts[key] += removed[key]
+    return counts
 
 
 def _format_skip_notes(counts):
@@ -2727,19 +2785,23 @@ async def _clone_permissions_command(interaction, src, dst, kind):
             return
 
         await interaction.followup.send(
-            f'Clearing existing permissions on {dst.name}...',
-            ephemeral=True)
-        await _clear_overwrites_on(dst)
-
-        await interaction.followup.send(
             f'Copying permissions from {src.name} to {dst.name}...',
             ephemeral=True)
-        counts = await _copy_overwrites(src, dst)
+        counts = await _mirror_overwrites(src, dst)
 
-        success_msg = (
-            f'Successfully cloned permissions from **{src.name}** to '
-            f'**{dst.name}**.\n'
-            f'Copied {counts["processed"]} permission overrides.')
+        if counts['failed']:
+            success_msg = (
+                f'⚠️ **Partially cloned** permissions from **{src.name}** '
+                f'to **{dst.name}**.\n'
+                f'Applied {counts["processed"]} override(s), '
+                f'**{counts["failed"]} failed**.\n'
+                f'{dst.name} may not be fully protected — check it '
+                f'before relying on it.')
+        else:
+            success_msg = (
+                f'Successfully cloned permissions from **{src.name}** to '
+                f'**{dst.name}**.\n'
+                f'Copied {counts["processed"]} permission overrides.')
         notes = _format_skip_notes(counts)
         if notes:
             success_msg += f'\n\n **Note:** {", ".join(notes)}.'
@@ -2769,9 +2831,15 @@ async def _clear_permissions_command(interaction, obj, kind):
             ephemeral=True)
         counts = await _clear_overwrites_on(obj)
 
-        success_msg = (
-            f'Successfully cleared permissions from **{obj.name}**.\n'
-            f'Cleared {counts["processed"]} permission overwrites.')
+        if counts['failed']:
+            success_msg = (
+                f'⚠️ **Partially cleared** permissions from **{obj.name}**.\n'
+                f'Cleared {counts["processed"]} overwrite(s), '
+                f'**{counts["failed"]} failed**.')
+        else:
+            success_msg = (
+                f'Successfully cleared permissions from **{obj.name}**.\n'
+                f'Cleared {counts["processed"]} permission overwrites.')
         notes = _format_skip_notes(counts)
         if notes:
             success_msg += f'\n\n **Note:** {", ".join(notes)}.'
@@ -2885,24 +2953,33 @@ async def clone_role_permissions(interaction: discord.Interaction,  # pylint: di
         
         # Copy the permissions from source role to destination role (excluding Administrator)
         try:
-            # Create a copy of source permissions but exclude Administrator permission
+            # Strip every permission clear_role_permissions refuses to
+            # touch, not just Administrator. Otherwise this command
+            # hands out ban_members/manage_roles/etc. via the bot —
+            # letting a moderator grant permissions they may not hold
+            # themselves — while the matching clear command declines
+            # to manage those same roles.
             new_permissions = discord.Permissions(source_role.permissions.value)
-            new_permissions.administrator = False
-            
+            excluded = [attr for attr in _DANGEROUS_PERM_ATTRS
+                        if getattr(source_role.permissions, attr)]
+            for attr in _DANGEROUS_PERM_ATTRS:
+                setattr(new_permissions, attr, False)
+
             await destination_role.edit(
                 permissions=new_permissions,
-                reason=f'Permissions cloned from {source_role.name} by {interaction.user} (Administrator permission excluded)'
+                reason=f'Permissions cloned from {source_role.name} by {interaction.user} (moderation permissions excluded)'
             )
-            
-            # Check if Administrator permission was excluded
-            admin_excluded = source_role.permissions.administrator and not new_permissions.administrator
+
             success_msg = (
                 f'Successfully cloned permissions from **{source_role.name}** to **{destination_role.name}**.\n'
                 f'The destination role now has the same server-wide permissions as the source role.'
             )
-            
-            if admin_excluded:
-                success_msg += '\n\n **Note:** Administrator permission was excluded for security reasons.'
+
+            if excluded:
+                success_msg += (
+                    '\n\n **Note:** These permissions were excluded for '
+                    'security reasons: ' + ', '.join(excluded) + '. '
+                    'Grant them manually if you intend to.')
             
             await interaction.followup.send(success_msg, ephemeral=True)
             
@@ -2938,7 +3015,8 @@ async def clone_role_permissions(interaction: discord.Interaction,  # pylint: di
     except discord.HTTPException as e:
         logger.error('Discord API error in clone_role_permissions: %s', e)
         await interaction.followup.send(
-            'A Discord API error occurred. Probably rate limiting. Trying a workaround...',
+            'A Discord API error occurred. Probably rate limiting. '
+            'Wait a moment and try again.',
             ephemeral=True
         )
     except Exception as e:
@@ -3121,14 +3199,18 @@ async def sync_channel_perms(interaction: discord.Interaction,
 
         for channel in channels_in_category:
             try:
-                await _clear_overwrites_on(channel)
-                counts = await _copy_overwrites(source_category, channel)
-                synced_count += 1
+                counts = await _mirror_overwrites(source_category, channel)
                 total_overwrites_synced += counts['processed']
+                if counts['failed']:
+                    failed_channels.append(
+                        f"{channel.name} ({counts['failed']} override(s))")
+                else:
+                    synced_count += 1
                 logger.info(
                     'Synced permissions for channel %s in category %s '
-                    '(copied: %d)',
-                    channel.name, source_category.name, counts['processed'])
+                    '(copied: %d, failed: %d)',
+                    channel.name, source_category.name,
+                    counts['processed'], counts['failed'])
             except (discord.Forbidden, discord.HTTPException) as e:
                 failed_channels.append(f"{channel.name} ({type(e).__name__})")
                 logger.error('Failed to sync permissions for channel %s: %s',
@@ -3211,18 +3293,36 @@ async def list_users_without_roles(interaction: discord.Interaction):
             color=0xff9900
         )
         
-        # Split users into chunks to avoid Discord's 1024 character limit per field
-        chunk_size = 20  # Conservative chunk size to stay under 1024 characters
-        user_chunks = [users_without_roles[i:i + chunk_size] for i in range(0, len(users_without_roles), chunk_size)]
-        
-        for i, chunk in enumerate(user_chunks):
-            field_name = f"Users {i * chunk_size + 1}-{min((i + 1) * chunk_size, user_count)}"
-            user_list = '\n'.join([f"• {member.display_name} ({member.mention})" for member in chunk])
-            embed.add_field(name=field_name, value=user_list, inline=False)
-        
-        # Add footer with additional info
-        embed.set_footer(text="Note: This list excludes bots and only shows users with no roles beyond @everyone")
-        
+        # Pack fields by measured length rather than a fixed count: a
+        # field caps at 1024 characters and an embed at 25 fields, and
+        # a long-display-name server overran both, raising HTTPException
+        # that nothing here caught.
+        max_fields = 20  # leaves headroom under the 25-field cap
+        lines = [f"• {m.display_name} ({m.mention})"
+                 for m in users_without_roles]
+        fields = []
+        current, current_len, first_index = [], 0, 0
+        for i, line in enumerate(lines):
+            if current and current_len + len(line) + 1 > 1000:
+                fields.append((first_index, i - 1, current))
+                current, current_len, first_index = [], 0, i
+            current.append(line)
+            current_len += len(line) + 1
+        if current:
+            fields.append((first_index, len(lines) - 1, current))
+
+        truncated = len(fields) > max_fields
+        for start, end, chunk in fields[:max_fields]:
+            embed.add_field(name=f"Users {start + 1}-{end + 1}",
+                            value='\n'.join(chunk), inline=False)
+
+        footer = ("Note: This list excludes bots and only shows users "
+                  "with no roles beyond @everyone")
+        if truncated:
+            shown = fields[max_fields - 1][1] + 1
+            footer = (f"Showing the first {shown} of {user_count}. " + footer)
+        embed.set_footer(text=footer)
+
         await interaction.followup.send(embed=embed, ephemeral=True)
         
         logger.info('Listed %d users without roles for user %s in guild %s',
@@ -3232,6 +3332,12 @@ async def list_users_without_roles(interaction: discord.Interaction):
         await interaction.followup.send(
             'I don\'t have permission to view server members.\n'
             'Please ensure I have the "View Server Members" permission.',
+            ephemeral=True
+        )
+    except discord.HTTPException as e:
+        logger.error('Discord API error in list_users_without_roles: %s', e)
+        await interaction.followup.send(
+            'A Discord API error occurred while building the list.',
             ephemeral=True
         )
 
@@ -3289,16 +3395,19 @@ async def assign_role(interaction: discord.Interaction, role: discord.Role,  # p
         # Build response message
         response_parts = []
         
+        # Every list is truncated: an uncapped roster of ~60+ names blew
+        # past Discord's 2000-char limit, so the send raised and a fully
+        # successful mass assignment was reported as an API error.
         if assigned_members:
-            assigned_list = ', '.join([member.display_name for member in assigned_members])
+            assigned_list = _format_names_inline(assigned_members)
             response_parts.append(f' **Successfully assigned {role.mention} to {len(assigned_members)} member(s):** {assigned_list}')
-        
+
         if already_had_role:
-            already_had_list = ', '.join([member.display_name for member in already_had_role])
+            already_had_list = _format_names_inline(already_had_role)
             response_parts.append(f' **Already had the role ({len(already_had_role)} member(s)):** {already_had_list}')
-        
+
         if failed_to_find:
-            failed_find_list = ', '.join(failed_to_find)
+            failed_find_list = _format_names_inline(failed_to_find)
             response_parts.append(f'❌ **Could not find:** {failed_find_list}')
         
         if failed_assignments:
@@ -3368,16 +3477,17 @@ async def remove_role(interaction: discord.Interaction, role: discord.Role,  # p
         # Build response message
         response_parts = []
         
+        # Truncated for the same reason as assign_role above
         if removed_members:
-            removed_list = ', '.join([member.display_name for member in removed_members])
+            removed_list = _format_names_inline(removed_members)
             response_parts.append(f' **Successfully removed {role.mention} from {len(removed_members)} member(s):** {removed_list}')
-        
+
         if didnt_have_role:
-            didnt_have_list = ', '.join([member.display_name for member in didnt_have_role])
+            didnt_have_list = _format_names_inline(didnt_have_role)
             response_parts.append(f' **Didn\'t have the role ({len(didnt_have_role)} member(s)):** {didnt_have_list}')
-        
+
         if failed_to_find:
-            failed_find_list = ', '.join(failed_to_find)
+            failed_find_list = _format_names_inline(failed_to_find)
             response_parts.append(f'❌ **Could not find:** {failed_find_list}')
         
         if failed_removals:
