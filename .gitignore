@@ -18,8 +18,10 @@ event_feeds.json
 event_announce.json
 autoreplies.json
 chaperone_mutes.json
+auto_backups.json
 johnnybot.log
 temp/
+backups/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

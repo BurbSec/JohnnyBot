@@ -12,11 +12,14 @@ import json
 import uuid
 import zipfile
 import shutil
+import hashlib
 from collections import deque
+from urllib.parse import urlparse
 from datetime import datetime, time as _dtime, timedelta, timezone
 from typing import Optional, Dict, Any
 from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.jobstores.base import JobLookupError
 import discord
 from discord import app_commands
 import aiohttp
@@ -29,7 +32,6 @@ except ImportError:
     dateparser = None
 import config
 from config import (
-    MODERATOR_ROLE_NAME,
     LOG_FILE,
     REMINDERS_FILE,
     TEMP_DIR,
@@ -224,9 +226,17 @@ def _format_names_inline(members, max_shown=25):
 
 
 def _is_moderator(user):
-    """True if the user carries the moderator role in this guild."""
-    return any(role.name == MODERATOR_ROLE_NAME
-               for role in getattr(user, 'roles', []))
+    """True if the user has the manage_messages permission in this guild.
+
+    Mirrors the mod_only command gate (has_permissions(manage_messages=True))
+    rather than checking for a role literally named MODERATOR_ROLE_NAME —
+    this decides whether to leak the debug log line onto an error
+    message, and that trust boundary must match who can run mod
+    commands in the first place. Note this is broader than admin_only
+    (server_backup/restore/auto_backup), which requires Administrator.
+    """
+    perms = getattr(user, 'guild_permissions', None)
+    return bool(getattr(perms, 'manage_messages', False) or getattr(perms, 'administrator', False))
 
 
 async def _check_role_hierarchy(interaction, role):
@@ -251,10 +261,44 @@ async def _check_role_hierarchy(interaction, role):
     return True
 
 
+async def _send_or_followup(interaction, content, **kwargs):
+    """Send a response, or a followup if the interaction already has one.
+
+    A handler that responds more than once via response.send_message
+    raises InteractionResponded, which masks whatever error message it
+    was trying to deliver. Commands with more than one possible response
+    point (e.g. a confirm-then-act flow) should route their fallback
+    error messages through this instead of calling response.send_message
+    directly in an except block.
+    """
+    kwargs.setdefault('ephemeral', True)
+    if interaction.response.is_done():
+        await interaction.followup.send(content, **kwargs)
+    else:
+        await interaction.response.send_message(content, **kwargs)
+
+
 async def _command_error_handler(interaction, error):
     """Generic command error handler."""
+    # app_commands wraps any exception raised inside a command callback
+    # (including discord.Forbidden from an unguarded API call) in
+    # CommandInvokeError before it reaches on_error — without unwrapping
+    # it here, a missing-permissions failure would show the user a bare
+    # "Error: 403 Forbidden (...)" instead of an actionable message.
+    if isinstance(error, app_commands.errors.CommandInvokeError):
+        error = error.original
+
     if isinstance(error, app_commands.errors.MissingRole):
         msg = 'You do not have the required role to use this command.'
+    elif isinstance(error, app_commands.errors.MissingPermissions):
+        needed = ', '.join(
+            p.replace('_', ' ').title() for p in error.missing_permissions
+        ) or 'the required permission'
+        msg = f'You need the {needed} permission to use this command.'
+    elif isinstance(error, discord.Forbidden):
+        logger.error('Discord permission error: %s', error)
+        msg = ("I don't have the Discord server permissions needed to do "
+               "that. Ask a server admin to check my role's permissions.")
     elif isinstance(error, discord.HTTPException):
         logger.error('Discord API error: %s', error)
         msg = 'Discord API error occurred.'
@@ -265,9 +309,13 @@ async def _command_error_handler(interaction, error):
     # The trailing log line is a debugging aid for moderators. It used
     # to be appended unconditionally — including to the MissingRole
     # reply, which is by definition sent to someone not authorised to
-    # read the log.
-    if _is_moderator(interaction.user):
-        msg = f'{msg}\n\nLast log: {get_last_log_line()}'
+    # read the log. get_last_log_line() reads the log file and could
+    # itself raise; that must never take down the response below it.
+    try:
+        if _is_moderator(interaction.user):
+            msg = f'{msg}\n\nLast log: {get_last_log_line()}'
+    except OSError as e:
+        logger.error('Failed to read last log line for error message: %s', e)
 
     # Commands that already deferred have used up the initial response;
     # sending again raises InteractionResponded and the user is left
@@ -279,6 +327,21 @@ async def _command_error_handler(interaction, error):
             await interaction.response.send_message(msg, ephemeral=True)
     except discord.HTTPException as e:
         logger.error('Failed to deliver error message to user: %s', e)
+
+
+async def _tree_error_handler(interaction, error):
+    """Tree-wide backstop so a command that forgets to bind `error=` (or
+    whose local error= itself fails to respond) still can't leave the
+    user staring at "The application did not respond".
+
+    discord.py's CommandTree._dispatch_error always calls tree.on_error
+    in a finally block, in addition to any per-command error= handler —
+    so without the is_done() guard, every already-handled command would
+    get a second, duplicate error message here.
+    """
+    if interaction.response.is_done():
+        return
+    await _command_error_handler(interaction, error)
 
 
 class EventFeed:  # pylint: disable=too-few-public-methods,too-many-public-methods
@@ -1330,6 +1393,8 @@ reminders: Dict[int, Dict[str, Any]] = {}
 event_feed: Optional[EventFeed] = None
 autoreplies: Dict[str, Dict[str, Any]] = {}  # Store autoreply rules {rule_id: rule_data}
 autoreplies_lock: Optional[threading.Lock] = None
+auto_backup_configs: Dict[int, Dict[str, Any]] = {}  # {guild_id: {interval_seconds, last_hash, last_backup_at}}
+auto_backup_lock: Optional[threading.Lock] = None
 
 # Users the bot has DMed recently. A reply to one of our own DMs (the
 # /message_dump archive, /log_tail output) is solicited, so it must not
@@ -1426,16 +1491,28 @@ def register_all_reminder_jobs():
 
 
 def _reg(name, description, handler, *,
-         describe=None, mod_only=False, error=None):
+         describe=None, mod_only=False, admin_only=False, error=None):
     """Register `handler` as a slash command directly (no wrapper function).
 
     handler must be an `async def` whose first arg is the interaction.
+
+    `mod_only` gates on the invoker's resolved `manage_messages`
+    permission — the permission that lets someone delete other people's
+    messages, used here as the signal for "this is a moderator" rather
+    than a role literally named MODERATOR_ROLE_NAME. Discord resolves
+    this correctly regardless of which role(s) grant it.
+
+    `admin_only` is stricter: it requires the resolved Administrator
+    permission bit, reserved for commands that can rewrite the whole
+    guild's structure (server backup/restore).
     """
     cmd = handler
     if describe:
         cmd = app_commands.describe(**describe)(cmd)
-    if mod_only:
-        cmd = app_commands.checks.has_role(MODERATOR_ROLE_NAME)(cmd)
+    if admin_only:
+        cmd = app_commands.checks.has_permissions(administrator=True)(cmd)
+    elif mod_only:
+        cmd = app_commands.checks.has_permissions(manage_messages=True)(cmd)
     cmd = tree.command(name=name, description=description)(cmd)
     if error is not None:
         cmd.on_error = error
@@ -1469,7 +1546,7 @@ def register_commands():
 
     _reg('list_reminders', 'Lists all current reminders', _list_reminders)
     _reg('delete_all_reminders', 'Deletes all active reminders',
-         delete_all_reminders, mod_only=True)
+         delete_all_reminders, mod_only=True, error=_command_error_handler)
     _reg('delete_reminder', 'Deletes a reminder by title',
          delete_reminder, mod_only=True,
          describe={'title': 'Title of the reminder to delete'})
@@ -1524,7 +1601,7 @@ def register_commands():
                    'channel': 'Channel to post weekly/day-of event announcements'},
          error=add_event_feed_error)
     _reg('list_event_feeds', 'Lists all registered event feeds',
-         list_event_feeds_command)
+         list_event_feeds_command, error=list_event_feeds_error)
     _reg('remove_event_feed', 'Removes an event feed by name',
          remove_event_feed_command, mod_only=True,
          describe={'feed_name': 'Name of the feed to remove'},
@@ -1533,12 +1610,15 @@ def register_commands():
          'Manually check all event feeds for new events now',
          check_event_feeds_command, mod_only=True,
          error=check_event_feeds_error)
-    _reg('bot_mood', "Check on the bot's current mood", bot_command)
-    _reg('pet_bot', 'Pet the bot', pet_bot_command)
+    _reg('bot_mood', "Check on the bot's current mood", bot_command,
+         error=bot_command_error)
+    _reg('pet_bot', 'Pet the bot', pet_bot_command,
+         error=pet_bot_command_error)
     _reg('bot_pick_fav', 'See who the bot prefers today',
          bot_pick_fav_command,
          describe={'user1': 'First potential favorite',
-                   'user2': 'Second potential favorite'})
+                   'user2': 'Second potential favorite'},
+         error=bot_pick_fav_command_error)
     _reg('message_dump',
          "Dump a user's messages from a channel into a downloadable file",
          message_dump_command, mod_only=True,
@@ -1608,6 +1688,23 @@ def register_commands():
     _reg('dashboard',
          'Display a dashboard of all available commands grouped by category',
          dashboard_command, error=dashboard_command_error)
+    _reg('server_backup',
+         'Create a full structural backup of this server (roles, channels, '
+         'categories, emoji) and DM it to you',
+         server_backup_command, admin_only=True, error=server_backup_error)
+    _reg('server_restore',
+         'Restore server structure from a backup file, with a preview and '
+         'confirmation before anything changes',
+         server_restore_command, admin_only=True,
+         describe={'backup_file': 'The .json backup file produced by /server_backup'},
+         error=server_restore_error)
+    _reg('auto_backup',
+         'Enable/disable automatic server backups on an interval; only '
+         'creates a new backup when the structure actually changed',
+         auto_backup_command, admin_only=True,
+         describe={'enabled': 'True to enable automatic backups, False to disable',
+                   'interval_hours': 'Hours between backup checks (default 24; only used when enabling)'},
+         error=auto_backup_error)
 
     register_autoreply_commands()
 
@@ -1615,20 +1712,26 @@ def setup_commands(bot_param):
     """Initialize command module with bot instance and register commands."""
     # Using globals is necessary here to initialize module-level variables
     # pylint: disable=global-statement
-    global bot_instance, tree, scheduler, reminders, event_feed, autoreplies, autoreplies_lock  # pylint: disable=line-too-long
+    global bot_instance, tree, scheduler, reminders, event_feed, autoreplies, autoreplies_lock, auto_backup_configs, auto_backup_lock  # pylint: disable=line-too-long
     bot_instance = bot_param
     if bot_instance:
         tree = bot_instance.tree
+        tree.on_error = _tree_error_handler
     reminders = {}
     event_feed = EventFeed(bot_instance)
     autoreplies = {}
     autoreplies_lock = threading.Lock()
+    auto_backup_configs = {}
+    auto_backup_lock = threading.Lock()
 
     # Load existing reminders from disk
     _load_reminders()
 
     # Load existing autoreply rules
     load_autoreplies()
+
+    # Load existing auto-backup configs
+    _load_auto_backup_configs()
 
     # Shared scheduler for event feeds and reminders
     if event_feed:
@@ -1663,7 +1766,7 @@ def create_set_reminder_command():
         message='Message content of the reminder',
         interval='Interval in seconds between reminders (minimum 60)'
     )
-    @app_commands.checks.has_role(MODERATOR_ROLE_NAME)
+    @app_commands.checks.has_permissions(manage_messages=True)
     async def set_reminder_command(interaction: discord.Interaction,
                                   channel: discord.TextChannel, title: str,
                                   message: str, interval: int):
@@ -1673,9 +1776,12 @@ def create_set_reminder_command():
     async def on_error(interaction: discord.Interaction, error):
         """Handles errors for the set_reminder command."""
         last_log = get_last_log_line()
-        if isinstance(error, app_commands.errors.MissingRole):
+        if isinstance(error, app_commands.errors.MissingPermissions):
+            needed = ', '.join(
+                p.replace('_', ' ').title() for p in error.missing_permissions
+            ) or 'the required permission'
             await interaction.response.send_message(
-                f'You do not have the required role to use this command.\n\nLast log: {last_log}', ephemeral=True)
+                f'You need the {needed} permission to use this command.\n\nLast log: {last_log}', ephemeral=True)
         elif isinstance(error, InvalidReminderInterval):
             await interaction.response.send_message(f'Invalid interval: {error}\n\nLast log: {last_log}', ephemeral=True)
         elif isinstance(error, discord.HTTPException):
@@ -2180,37 +2286,63 @@ async def check_event_feeds_command(interaction: discord.Interaction):
 check_event_feeds_error = _command_error_handler
 async def list_event_feeds_command(interaction: discord.Interaction):
     """Lists all registered event feeds with settings."""
-    if (not event_feed or not interaction.guild
-            or interaction.guild.id not in event_feed.feeds
-            or not event_feed.feeds[interaction.guild.id]):
-        await interaction.response.send_message(
-            'No event feeds registered', ephemeral=True)
-        return
+    try:
+        if (not event_feed or not interaction.guild
+                or interaction.guild.id not in event_feed.feeds
+                or not event_feed.feeds[interaction.guild.id]):
+            await interaction.response.send_message(
+                'No event feeds registered', ephemeral=True)
+            return
 
-    guild_feeds = event_feed.feeds[interaction.guild.id]
-    embed = discord.Embed(
-        title=f"📅 Event Feeds ({len(guild_feeds)})",
-        color=0x00ff00
-    )
-
-    for url, data in guild_feeds.items():
-        fname = data.get('name', 'Unnamed')
-        feed_type = data.get('feed_type', 'ical').upper()
-        ch = data.get('channel', 'unknown')
-
-        # Truncate URL for display
-        display_url = (
-            url if len(url) <= 60 else url[:57] + "...")
-
-        value = (
-            f"**URL:** {display_url}\n"
-            f"**Type:** {feed_type} | **Channel:** #{ch}"
+        guild_feeds = event_feed.feeds[interaction.guild.id]
+        embed = discord.Embed(
+            title=f"📅 Event Feeds ({len(guild_feeds)})",
+            color=0x00ff00
         )
-        embed.add_field(
-            name=f"📌 {fname}", value=value, inline=False)
 
-    await interaction.response.send_message(
-        embed=embed, ephemeral=True)
+        # Discord caps embeds at 25 fields; a name field also caps at
+        # 256 chars. Neither was enforced here, so a guild with enough
+        # feeds (or one long user-supplied feed name) could raise an
+        # HTTPException nothing caught.
+        max_fields = 25
+        items = list(guild_feeds.items())
+        truncated = len(items) > max_fields
+        for url, data in items[:max_fields]:
+            fname = data.get('name', 'Unnamed')
+            if len(fname) > 240:
+                fname = fname[:237] + '...'
+            feed_type = data.get('feed_type', 'ical').upper()
+            ch = data.get('channel', 'unknown')
+
+            display_url = (
+                url if len(url) <= 60 else url[:57] + "...")
+
+            value = (
+                f"**URL:** {display_url}\n"
+                f"**Type:** {feed_type} | **Channel:** #{ch}"
+            )
+            embed.add_field(
+                name=f"📌 {fname}", value=value, inline=False)
+
+        if truncated:
+            embed.set_footer(
+                text=f"Showing {max_fields} of {len(items)} feeds")
+
+        await interaction.response.send_message(
+            embed=embed, ephemeral=True)
+    except discord.Forbidden:
+        await _send_or_followup(
+            interaction, "I don't have permission to do that here.")
+    except discord.HTTPException as e:
+        logger.error('Discord API error in list_event_feeds_command: %s', e)
+        await _send_or_followup(
+            interaction, 'A Discord API error occurred while listing event feeds.')
+    except Exception as e:  # pylint: disable=broad-exception-caught
+        logger.error('Unexpected error in list_event_feeds_command: %s', e)
+        await _send_or_followup(
+            interaction, 'An unexpected error occurred while listing event feeds.')
+
+list_event_feeds_error = _command_error_handler
 
 async def remove_event_feed_command(interaction: discord.Interaction,
                                     feed_name: str):
@@ -2263,6 +2395,8 @@ async def bot_command(interaction: discord.Interaction):
         # Handle case where interaction has timed out
         logger.warning("Interaction timed out for bot command from %s", interaction.user)
 
+bot_command_error = _command_error_handler
+
 async def pet_bot_command(interaction: discord.Interaction):
     """Pet the bot."""
     try:
@@ -2273,6 +2407,8 @@ async def pet_bot_command(interaction: discord.Interaction):
     except discord.errors.NotFound:
         # Handle case where interaction has timed out
         logger.warning("Interaction timed out for pet_bot command from %s", interaction.user)
+
+pet_bot_command_error = _command_error_handler
 
 async def bot_pick_fav_command(interaction: discord.Interaction, user1: discord.User, user2: discord.User):
     """See who the bot prefers today."""
@@ -2311,6 +2447,8 @@ async def bot_pick_fav_command(interaction: discord.Interaction, user1: discord.
     except discord.errors.NotFound:
         # Handle case where interaction has timed out
         logger.warning("Interaction timed out for bot_pick_fav command from %s", interaction.user)
+
+bot_pick_fav_command_error = _command_error_handler
 
 def cleanup_orphaned_dumps():
     """Clean up orphaned message dump files and folders older than 30 minutes.
@@ -3947,24 +4085,751 @@ async def dashboard_command(interaction: discord.Interaction):
                        interaction.user, interaction.channel.name if hasattr(interaction.channel, 'name') else 'DM')
             
     except discord.Forbidden:
-        await interaction.response.send_message(
-            "I don't have permission to post messages in this channel.",
-            ephemeral=True
-        )
+        # The confirmation branch above may have already used the
+        # interaction's one initial response (e.g. channel.send() is
+        # what raised) — sending again via response.send_message would
+        # itself raise InteractionResponded and mask this message.
+        await _send_or_followup(
+            interaction,
+            "I don't have permission to post messages in this channel.")
     except discord.HTTPException as e:
         logger.error('Discord API error in dashboard_command: %s', e)
-        await interaction.response.send_message(
-            "A Discord API error occurred while posting the dashboard.",
-            ephemeral=True
-        )
-    except Exception as e:
+        await _send_or_followup(
+            interaction, "A Discord API error occurred while posting the dashboard.")
+    except Exception as e:  # pylint: disable=broad-exception-caught
         logger.error('Unexpected error in dashboard_command: %s', e)
-        await interaction.response.send_message(
-            "An unexpected error occurred while posting the dashboard.",
-            ephemeral=True
-        )
+        await _send_or_followup(
+            interaction, "An unexpected error occurred while posting the dashboard.")
 
 dashboard_command_error = _command_error_handler
+
+
+# ---------------------------------------------------------------------------
+# Server backup / restore
+# ---------------------------------------------------------------------------
+
+BACKUP_FORMAT_VERSION = 1
+BACKUPS_DIR = os.path.join(os.path.dirname(__file__), 'backups')
+os.makedirs(BACKUPS_DIR, exist_ok=True)
+_ALLOWED_EMOJI_HOSTS = {'cdn.discordapp.com', 'media.discordapp.net'}
+_DANGEROUS_PERM_MASK = discord.Permissions(
+    **{attr: True for attr in _DANGEROUS_PERM_ATTRS}).value
+
+
+def _serialize_overwrites(overwrites):
+    """Serialize permission overwrites. Member-targeted overwrites are
+    skipped — a restore target's membership rarely matches the source
+    server's, so replaying them would silently apply the wrong grants."""
+    entries = []
+    for target, overwrite in overwrites.items():
+        if not isinstance(target, discord.Role):
+            continue
+        allow, deny = overwrite.pair()
+        entries.append({
+            'target_name': target.name,
+            'allow': allow.value,
+            'deny': deny.value,
+        })
+    return entries
+
+
+def _serialize_role(role):
+    return {
+        'name': role.name,
+        'color': role.colour.value,
+        'permissions': role.permissions.value,
+        'hoist': role.hoist,
+        'mentionable': role.mentionable,
+    }
+
+
+def _serialize_channel(channel):
+    entry = {
+        'name': channel.name,
+        'type': str(channel.type),
+        'category': channel.category.name if channel.category else None,
+        'overwrites': _serialize_overwrites(channel.overwrites),
+    }
+    if isinstance(channel, discord.TextChannel):
+        entry['topic'] = channel.topic
+        entry['nsfw'] = channel.nsfw
+        entry['slowmode_delay'] = channel.slowmode_delay
+    if isinstance(channel, discord.VoiceChannel):
+        entry['bitrate'] = channel.bitrate
+        entry['user_limit'] = channel.user_limit
+    return entry
+
+
+def build_backup_dict(guild):
+    """Serialize a guild's structure (roles, categories, channels, emoji)
+    into a JSON-safe dict. Message history, members, invites, audit logs,
+    and boost state are never included — they can't be restored via the
+    API and a backup that implied otherwise would be misleading."""
+    roles = [_serialize_role(r) for r in guild.roles
+             if not r.is_default() and not r.managed]
+    categories = [
+        {
+            'name': c.name,
+            'overwrites': _serialize_overwrites(c.overwrites),
+        }
+        for c in guild.categories
+    ]
+    channels = [
+        _serialize_channel(ch) for ch in guild.channels
+        if isinstance(ch, (discord.TextChannel, discord.VoiceChannel))
+    ]
+    emojis = [
+        {'name': e.name, 'url': str(e.url), 'animated': e.animated}
+        for e in guild.emojis
+    ]
+    return {
+        'version': BACKUP_FORMAT_VERSION,
+        'guild_id': guild.id,
+        'guild_name': guild.name,
+        'created_at': datetime.now(timezone.utc).isoformat(),
+        'roles': roles,
+        'categories': categories,
+        'channels': channels,
+        'emojis': emojis,
+    }
+
+
+def _save_backup_file(guild, data, tag='backup'):
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    filename = f'{tag}_{guild.id}_{timestamp}.json'
+    path = os.path.join(BACKUPS_DIR, filename)
+    _atomic_json_write(path, data)
+    return path
+
+
+def _role_differs(role, data):
+    return (role.permissions.value != data['permissions']
+            or role.colour.value != data['color']
+            or role.hoist != data.get('hoist', False)
+            or role.mentionable != data.get('mentionable', False))
+
+
+def _diff_backup(guild, data):
+    """Compare a backup against the guild's current state, matching
+    roles/categories/channels/emoji by name so re-running a restore is
+    idempotent instead of piling up duplicates."""
+    plan = {
+        'roles_create': [], 'roles_update': [],
+        'categories_create': [],
+        'channels_create': [],
+        'emojis_create': [],
+    }
+    existing_roles = {r.name: r for r in guild.roles}
+    for r in data.get('roles', []):
+        cur = existing_roles.get(r['name'])
+        if cur is None:
+            plan['roles_create'].append(r['name'])
+        elif _role_differs(cur, r):
+            plan['roles_update'].append(r['name'])
+
+    existing_category_names = {c.name for c in guild.categories}
+    for c in data.get('categories', []):
+        if c['name'] not in existing_category_names:
+            plan['categories_create'].append(c['name'])
+
+    existing_channel_keys = {
+        (ch.name, str(ch.type)) for ch in guild.channels
+        if isinstance(ch, (discord.TextChannel, discord.VoiceChannel))
+    }
+    for ch in data.get('channels', []):
+        if (ch['name'], ch['type']) not in existing_channel_keys:
+            plan['channels_create'].append(ch['name'])
+
+    existing_emoji_names = {e.name for e in guild.emojis}
+    for e in data.get('emojis', []):
+        if e['name'] not in existing_emoji_names:
+            plan['emojis_create'].append(e['name'])
+
+    return plan
+
+
+def _plan_has_changes(plan):
+    return any(plan[key] for key in
+               ('roles_create', 'roles_update', 'categories_create',
+                'channels_create', 'emojis_create'))
+
+
+def _format_restore_plan(plan):
+    lines = []
+
+    def _fmt(label, items):
+        if items:
+            shown = ', '.join(items[:10])
+            more = f' (+{len(items) - 10} more)' if len(items) > 10 else ''
+            lines.append(f'• {label}: {len(items)} — {shown}{more}')
+
+    _fmt('Roles to create', plan['roles_create'])
+    _fmt('Roles to update', plan['roles_update'])
+    _fmt('Categories to create', plan['categories_create'])
+    _fmt('Channels to create', plan['channels_create'])
+    _fmt('Emoji to create', plan['emojis_create'])
+    if not lines:
+        return 'No changes needed — this server already matches the backup.'
+    lines.append(
+        '\nExisting roles/categories/channels that already match by name '
+        'will have their permission overwrites re-synced from the backup.')
+    return '\n'.join(lines)
+
+
+def _format_restore_results(counts):
+    lines = [
+        f"Roles: {counts['roles_created']} created, {counts['roles_updated']} updated",
+        f"Categories created: {counts['categories_created']}",
+        f"Channels created: {counts['channels_created']}",
+        f"Permission overwrites synced: {counts['overwrites_synced']}",
+        f"Emoji created: {counts['emojis_created']}",
+    ]
+    if counts.get('skipped_unsupported_type'):
+        lines.append(
+            f"Skipped {counts['skipped_unsupported_type']} channel(s) of "
+            f"a type restore doesn't support")
+    if counts.get('roles_skipped_unsafe'):
+        lines.append(
+            f"Skipped {counts['roles_skipped_unsafe']} role(s) that are "
+            f"Administrator, managed, above my hierarchy, or have "
+            f"moderation permissions — never modified by restore")
+    if counts.get('roles_dangerous_perms_stripped'):
+        lines.append(
+            f"Stripped moderation-level permission bits (ban/kick/manage_*) "
+            f"from {counts['roles_dangerous_perms_stripped']} role(s) in "
+            f"the backup before applying them")
+    if counts.get('overwrites_skipped_unsafe'):
+        lines.append(
+            f"Skipped {counts['overwrites_skipped_unsafe']} permission "
+            f"overwrite(s) targeting Administrator/managed/hierarchy roles")
+    if counts['failed']:
+        lines.append(
+            f"⚠️ {counts['failed']} operation(s) failed — check the log "
+            f"for details")
+        header = '⚠️ **Restore completed with errors.**'
+    else:
+        header = '✅ **Restore completed.**'
+    return header + '\n' + '\n'.join(lines)
+
+
+async def _sync_overwrites_from_data(obj, overwrite_entries, role_map):
+    """Apply overwrites from backup data, routed through the same
+    admin/managed/hierarchy/dangerous-perm gate `_apply_to_overwrites`
+    already enforces for the clone_*_permissions commands — a restore
+    file is untrusted input and must never be able to grant more than a
+    manual clone would."""
+    items = []
+    for entry in overwrite_entries:
+        role = role_map.get(entry['target_name'])
+        if role is None:
+            continue
+        allow_value = entry['allow'] & ~_DANGEROUS_PERM_MASK
+        overwrite = discord.PermissionOverwrite.from_pair(
+            discord.Permissions(allow_value), discord.Permissions(entry['deny']))
+        items.append((role, overwrite))
+    return await _apply_to_overwrites(
+        obj, 'restore-sync', items,
+        lambda t, ow: obj.set_permissions(t, overwrite=ow))
+
+
+def _merge_overwrite_counts(totals, ow_counts):
+    totals['overwrites_synced'] += ow_counts['processed']
+    totals['failed'] += ow_counts['failed']
+    totals['overwrites_skipped_unsafe'] += sum(
+        ow_counts[key] for key in
+        ('skipped_admin', 'skipped_managed', 'skipped_hierarchy', 'skipped_dangerous'))
+
+
+async def _create_channel_from_data(guild, ch, category):
+    if ch['type'] == 'text':
+        return await guild.create_text_channel(
+            name=ch['name'], category=category, topic=ch.get('topic'),
+            nsfw=ch.get('nsfw', False),
+            slowmode_delay=ch.get('slowmode_delay', 0))
+    if ch['type'] == 'voice':
+        return await guild.create_voice_channel(
+            name=ch['name'], category=category,
+            bitrate=ch.get('bitrate') or 64000,
+            user_limit=ch.get('user_limit', 0))
+    raise ValueError(f"Unsupported channel type: {ch['type']}")
+
+
+def _empty_restore_counts():
+    return {'roles_created': 0, 'roles_updated': 0,
+            'roles_skipped_unsafe': 0, 'roles_dangerous_perms_stripped': 0,
+            'categories_created': 0, 'channels_created': 0,
+            'overwrites_synced': 0, 'overwrites_skipped_unsafe': 0,
+            'emojis_created': 0, 'skipped_unsupported_type': 0, 'failed': 0}
+
+
+async def _apply_backup(guild, data):  # pylint: disable=too-many-branches,too-many-locals
+    """Apply a backup to `guild`, matching existing objects by name so a
+    repeat run updates in place instead of duplicating everything.
+
+    A restore file is untrusted input — the same person who can invoke
+    /server_restore could hand-edit one — so role/overwrite permissions
+    are always routed through the dangerous-perm and hierarchy gates
+    also used by the clone_*_permissions commands, never applied as-is.
+    """
+    counts = _empty_restore_counts()
+    bot_top_role = guild.me.top_role if guild.me else None
+
+    existing_roles = {r.name: r for r in guild.roles}
+    role_map = dict(existing_roles)
+    for r in data.get('roles', []):
+        try:
+            cur = existing_roles.get(r['name'])
+            if cur is not None:
+                verdict = _classify_perm_target(cur, bot_top_role)
+                if verdict != 'process':
+                    counts['roles_skipped_unsafe'] += 1
+                    role_map[r['name']] = cur
+                    logger.info('Skipped restoring role %s (%s)', r['name'], verdict)
+                    continue
+
+            requested_value = r['permissions']
+            safe_value = requested_value & ~_DANGEROUS_PERM_MASK
+            if safe_value != requested_value:
+                counts['roles_dangerous_perms_stripped'] += 1
+            perms = discord.Permissions(safe_value)
+            colour = discord.Colour(r['color'])
+            safe_data = {**r, 'permissions': safe_value}
+
+            if cur is None:
+                cur = await guild.create_role(
+                    name=r['name'], permissions=perms, colour=colour,
+                    hoist=r.get('hoist', False),
+                    mentionable=r.get('mentionable', False))
+                counts['roles_created'] += 1
+            elif _role_differs(cur, safe_data):
+                await cur.edit(permissions=perms, colour=colour,
+                               hoist=r.get('hoist', False),
+                               mentionable=r.get('mentionable', False))
+                counts['roles_updated'] += 1
+            role_map[r['name']] = cur
+        except (discord.Forbidden, discord.HTTPException) as e:
+            counts['failed'] += 1
+            logger.error('Failed to create/update role %s: %s', r['name'], e)
+
+    existing_categories = {c.name: c for c in guild.categories}
+    category_map = dict(existing_categories)
+    for c in data.get('categories', []):
+        try:
+            cur = existing_categories.get(c['name'])
+            if cur is None:
+                cur = await guild.create_category(c['name'])
+                counts['categories_created'] += 1
+            category_map[c['name']] = cur
+            ow_counts = await _sync_overwrites_from_data(
+                cur, c.get('overwrites', []), role_map)
+            _merge_overwrite_counts(counts, ow_counts)
+        except (discord.Forbidden, discord.HTTPException) as e:
+            counts['failed'] += 1
+            logger.error('Failed to create/sync category %s: %s', c['name'], e)
+
+    existing_channels = {
+        (ch.name, str(ch.type)): ch for ch in guild.channels
+        if isinstance(ch, (discord.TextChannel, discord.VoiceChannel))
+    }
+    for ch in data.get('channels', []):
+        try:
+            key = (ch['name'], ch['type'])
+            cur = existing_channels.get(key)
+            category = category_map.get(ch['category']) if ch.get('category') else None
+            if cur is None:
+                cur = await _create_channel_from_data(guild, ch, category)
+                counts['channels_created'] += 1
+            ow_counts = await _sync_overwrites_from_data(
+                cur, ch.get('overwrites', []), role_map)
+            _merge_overwrite_counts(counts, ow_counts)
+        except ValueError:
+            counts['skipped_unsupported_type'] += 1
+        except (discord.Forbidden, discord.HTTPException) as e:
+            counts['failed'] += 1
+            logger.error('Failed to create/sync channel %s: %s', ch['name'], e)
+
+    existing_emoji_names = {e.name for e in guild.emojis}
+    pending_emoji = [e for e in data.get('emojis', [])
+                      if e['name'] not in existing_emoji_names]
+    if pending_emoji:
+        async with aiohttp.ClientSession() as session:
+            for e in pending_emoji:
+                if urlparse(e['url']).hostname not in _ALLOWED_EMOJI_HOSTS:
+                    counts['failed'] += 1
+                    logger.warning(
+                        'Refusing to fetch emoji %s from non-Discord host: %s',
+                        e['name'], e['url'])
+                    continue
+                try:
+                    async with session.get(e['url']) as resp:
+                        if resp.status != 200:
+                            counts['failed'] += 1
+                            continue
+                        image_bytes = await resp.read()
+                    await guild.create_custom_emoji(name=e['name'], image=image_bytes)
+                    counts['emojis_created'] += 1
+                except (discord.Forbidden, discord.HTTPException, aiohttp.ClientError) as ex:
+                    counts['failed'] += 1
+                    logger.error('Failed to create emoji %s: %s', e['name'], ex)
+
+    return counts
+
+
+class _RestoreConfirmView(discord.ui.View):
+    """Confirm/cancel gate for /server_restore. Restoring recreates and
+    edits roles, categories, channels, and emoji across the whole guild,
+    so it never runs off a bare slash command without an explicit second
+    click from the same moderator who invoked it."""
+
+    def __init__(self, author_id):
+        super().__init__(timeout=120)
+        self.author_id = author_id
+        self.result = None
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message(
+                "Only the moderator who started this restore can confirm it.",
+                ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label='Confirm Restore', style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        self.result = True
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(content='Restore starting...', view=self)
+        self.stop()
+
+    @discord.ui.button(label='Cancel', style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        self.result = False
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(content='Restore cancelled.', view=self)
+        self.stop()
+
+
+async def server_backup_command(interaction: discord.Interaction):
+    """Create a full structural backup of the server and DM it to the invoking moderator."""
+    try:
+        await interaction.response.defer(ephemeral=True)
+        data = build_backup_dict(interaction.guild)
+        path = _save_backup_file(interaction.guild, data)
+        try:
+            await interaction.user.send(
+                f'Backup of **{interaction.guild.name}** taken at {data["created_at"]}.',
+                file=discord.File(path))
+            await interaction.followup.send(
+                'Backup complete — sent to your DMs.', ephemeral=True)
+        except discord.Forbidden:
+            await interaction.followup.send(
+                "Backup complete, but I couldn't DM it to you (check your "
+                f"privacy settings). It was saved on the bot host at `{path}`.",
+                ephemeral=True)
+    except discord.HTTPException as e:
+        logger.error('Discord API error in server_backup_command: %s', e)
+        await interaction.followup.send(
+            'A Discord API error occurred while creating the backup.', ephemeral=True)
+    except Exception as e:  # pylint: disable=broad-exception-caught
+        logger.error('Unexpected error in server_backup_command: %s', e)
+        await interaction.followup.send(
+            'An unexpected error occurred while creating the backup.', ephemeral=True)
+
+server_backup_error = _command_error_handler
+
+
+async def server_restore_command(interaction: discord.Interaction, backup_file: discord.Attachment):  # pylint: disable=too-many-return-statements
+    """Restore server structure from a backup file, with a preview and confirmation gate."""
+    try:
+        await interaction.response.defer(ephemeral=True)
+
+        if not backup_file.filename.endswith('.json'):
+            await interaction.followup.send(
+                'Please attach a .json backup file produced by /server_backup.',
+                ephemeral=True)
+            return
+
+        raw = await backup_file.read()
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            await interaction.followup.send('That file is not valid JSON.', ephemeral=True)
+            return
+
+        if data.get('version') != BACKUP_FORMAT_VERSION:
+            await interaction.followup.send(
+                'Unrecognized backup format/version — this file was not '
+                'produced by /server_backup.', ephemeral=True)
+            return
+
+        plan = _diff_backup(interaction.guild, data)
+        summary = _format_restore_plan(plan)
+        if not _plan_has_changes(plan):
+            await interaction.followup.send(
+                f'{summary}', ephemeral=True)
+            return
+
+        cross_guild_warning = ''
+        if data.get('guild_id') != interaction.guild.id:
+            cross_guild_warning = (
+                f'\n\n⚠️ **This backup is from {data.get("guild_name", "an unknown server")} '
+                f'(id {data.get("guild_id", "?")}), not this server ({interaction.guild.name}).** '
+                f'Everything listed above will be newly created here — this is a cross-server '
+                f'clone, not a same-server restore. Make sure that\'s what you intend.')
+
+        view = _RestoreConfirmView(interaction.user.id)
+        await interaction.followup.send(
+            f'**Restore plan for backup of {data.get("guild_name", "?")} '
+            f'taken {data.get("created_at", "unknown time")}:**\n{summary}\n\n'
+            f'⚠️ This will create/update roles, categories, channels, and '
+            f'emoji to match the backup. Member-specific overwrites, message '
+            f'history, audit logs, and role/channel ordering are never '
+            f'restored — new roles land at the bottom of the hierarchy and '
+            f'must be reordered manually. Roles/overwrites that are '
+            f'Administrator, managed, above my role, or carry moderation '
+            f'permissions are never modified. A safety snapshot of the '
+            f'current state will be DMed to you before any changes are '
+            f'made — note that restore only creates and updates, it never '
+            f'deletes, so applying that snapshot afterward will restore '
+            f'names/permissions/overwrites but will NOT remove anything '
+            f'this restore newly creates.{cross_guild_warning}',
+            view=view, ephemeral=True)
+
+        await view.wait()
+        if not view.result:
+            return
+
+        pre_restore_data = build_backup_dict(interaction.guild)
+        pre_path = _save_backup_file(interaction.guild, pre_restore_data, tag='pre_restore')
+        try:
+            await interaction.user.send(
+                'Safety snapshot taken automatically before your /server_restore. '
+                'This records the prior names/permissions/overwrites so you can '
+                'restore *from* it if something looks wrong — but /server_restore '
+                'never deletes, so it will not remove anything the restore you\'re '
+                'about to run newly creates.',
+                file=discord.File(pre_path))
+        except discord.Forbidden:
+            await interaction.followup.send(
+                "Couldn't DM you the pre-restore safety snapshot (check your "
+                f"privacy settings) — proceeding anyway. It was saved on the "
+                f"bot host at `{pre_path}` if you need to roll back.",
+                ephemeral=True)
+
+        counts = await _apply_backup(interaction.guild, data)
+        await interaction.followup.send(_format_restore_results(counts), ephemeral=True)
+
+    except discord.Forbidden:
+        await interaction.followup.send(_PERM_FORBIDDEN_HELP, ephemeral=True)
+    except discord.HTTPException as e:
+        logger.error('Discord API error in server_restore_command: %s', e)
+        await interaction.followup.send(
+            'A Discord API error occurred. Probably rate limiting.', ephemeral=True)
+    except Exception as e:  # pylint: disable=broad-exception-caught
+        logger.error('Unexpected error in server_restore_command: %s', e)
+        await interaction.followup.send(
+            'An unexpected error occurred during restore.', ephemeral=True)
+
+server_restore_error = _command_error_handler
+
+
+# ---------------------------------------------------------------------------
+# Automatic server backups
+# ---------------------------------------------------------------------------
+
+AUTO_BACKUP_FILE = os.path.join(os.path.dirname(__file__), 'auto_backups.json')
+AUTO_BACKUP_MIN_HOURS = 1
+AUTO_BACKUP_MAX_HOURS = 24 * 30
+
+
+def _backup_content_hash(data):
+    """Stable hash of a backup's structural content, ignoring the
+    always-changing `created_at` timestamp and list order — used to
+    detect whether anything actually restorable changed since the last
+    automatic backup. Position isn't captured by build_backup_dict, so
+    a pure drag-reorder must not look like a content change."""
+    stable = {
+        'version': data.get('version'),
+        'guild_id': data.get('guild_id'),
+        'roles': sorted(data.get('roles', []), key=lambda r: r['name']),
+        'categories': sorted(data.get('categories', []), key=lambda c: c['name']),
+        'channels': sorted(data.get('channels', []), key=lambda c: c['name']),
+        'emojis': sorted(data.get('emojis', []), key=lambda e: e['name']),
+    }
+    return hashlib.sha256(
+        json.dumps(stable, sort_keys=True).encode('utf-8')).hexdigest()
+
+
+def _load_auto_backup_configs():
+    """Load auto-backup configs from disk into the module-level dict."""
+    if not os.path.exists(AUTO_BACKUP_FILE):
+        return
+    try:
+        with open(AUTO_BACKUP_FILE, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        for key, cfg in data.items():
+            auto_backup_configs[int(key)] = cfg
+        logger.info("Loaded %d auto-backup config(s) from disk", len(auto_backup_configs))
+    except (OSError, IOError, json.JSONDecodeError) as e:
+        logger.error('Failed to read auto-backup config file: %s', e)
+
+
+def _save_auto_backup_configs():
+    _atomic_json_write(
+        AUTO_BACKUP_FILE,
+        {str(k): v for k, v in auto_backup_configs.items()})
+
+
+def _schedule_auto_backup(guild_id, cfg):
+    """Register (or replace) the APScheduler job for one guild's auto-backup.
+
+    Anchors the first fire to the last persisted check time, not "now" —
+    IntervalTrigger otherwise fires interval-from-now on every job
+    registration, which is called on every bot restart. Without this a
+    daily-interval backup on a bot that restarts more than once a day
+    would never actually fire.
+    """
+    if not scheduler or not scheduler.running:
+        return
+    interval = cfg['interval_seconds']
+    last_checked = cfg.get('last_checked_epoch')
+    now_ts = time_module.time()
+    next_ts = max(last_checked + interval, now_ts) if last_checked else now_ts
+    scheduler.add_job(
+        _run_auto_backup,
+        trigger=IntervalTrigger(seconds=interval),
+        args=[guild_id],
+        id=f'auto_backup_{guild_id}',
+        replace_existing=True,
+        next_run_time=datetime.fromtimestamp(next_ts),
+        misfire_grace_time=min(interval, 3600),
+        coalesce=True,
+    )
+
+
+def register_all_auto_backup_jobs():
+    """Re-register all persisted auto-backup jobs. Called after scheduler.start()."""
+    for guild_id, cfg in auto_backup_configs.items():
+        _schedule_auto_backup(guild_id, cfg)
+    if auto_backup_configs:
+        logger.info("Registered %d auto-backup job(s) with scheduler", len(auto_backup_configs))
+
+
+async def _run_auto_backup(guild_id: int):
+    """APScheduler callback: back up `guild_id` only if its structure
+    changed since the last automatic backup, then post it to the
+    moderators channel."""
+    if not bot_instance:
+        return
+    guild = bot_instance.get_guild(guild_id)
+    if not guild:
+        logger.warning('Auto-backup: guild %s not found, skipping', guild_id)
+        return
+
+    with auto_backup_lock:
+        cfg = auto_backup_configs.get(guild_id)
+    if not cfg:
+        return
+
+    data = build_backup_dict(guild)
+    new_hash = _backup_content_hash(data)
+    changed = new_hash != cfg.get('last_hash')
+    path = _save_backup_file(guild, data, tag='auto') if changed else None
+
+    with auto_backup_lock:
+        # Always persisted, even on a no-delta run, so a restart schedules
+        # the next check relative to the last check rather than firing
+        # interval-from-restart-time (see _schedule_auto_backup).
+        cfg['last_checked_epoch'] = time_module.time()
+        if changed:
+            cfg['last_hash'] = new_hash
+            cfg['last_backup_at'] = data['created_at']
+        try:
+            _save_auto_backup_configs()
+        except (OSError, IOError) as e:
+            logger.error('Failed to persist auto-backup state for guild %s: %s', guild_id, e)
+
+    if not changed:
+        logger.info('Auto-backup: no changes for guild %s, skipping', guild_id)
+        return
+
+    channel = discord.utils.get(guild.text_channels, name=config.MODERATORS_CHANNEL_NAME)
+    if not channel:
+        logger.warning(
+            "Auto-backup: moderators channel '%s' not found in guild %s, "
+            "backup saved to %s but not posted",
+            config.MODERATORS_CHANNEL_NAME, guild_id, path)
+        return
+    try:
+        await channel.send(
+            '📦 Automatic backup taken — server structure changed since '
+            'the last one.',
+            file=discord.File(path))
+    except discord.HTTPException as e:
+        logger.error('Auto-backup: failed to post to moderators channel: %s', e)
+
+
+async def auto_backup_command(interaction: discord.Interaction, enabled: bool,
+                              interval_hours: int = 24):
+    """Enable/disable automatic backups for this server on an interval."""
+    try:
+        await interaction.response.defer(ephemeral=True)
+        guild_id = interaction.guild.id
+
+        if not enabled:
+            with auto_backup_lock:
+                had_config = auto_backup_configs.pop(guild_id, None) is not None
+                if had_config:
+                    _save_auto_backup_configs()
+            if scheduler:
+                try:
+                    scheduler.remove_job(f'auto_backup_{guild_id}')
+                except JobLookupError:
+                    pass
+            msg = ('Automatic backups disabled for this server.' if had_config
+                   else 'Automatic backups were not enabled for this server.')
+            await interaction.followup.send(msg, ephemeral=True)
+            return
+
+        if interval_hours < AUTO_BACKUP_MIN_HOURS:
+            await interaction.followup.send(
+                f'Interval must be at least {AUTO_BACKUP_MIN_HOURS} hour(s).',
+                ephemeral=True)
+            return
+        if interval_hours > AUTO_BACKUP_MAX_HOURS:
+            await interaction.followup.send(
+                f'Interval must be {AUTO_BACKUP_MAX_HOURS} hours or less.',
+                ephemeral=True)
+            return
+
+        with auto_backup_lock:
+            cfg = auto_backup_configs.get(guild_id, {'last_hash': None, 'last_backup_at': None})
+            cfg['interval_seconds'] = interval_hours * 3600
+            auto_backup_configs[guild_id] = cfg
+            _save_auto_backup_configs()
+
+        _schedule_auto_backup(guild_id, cfg)
+
+        await interaction.followup.send(
+            f'Automatic backups enabled for this server, checked every '
+            f'{interval_hours} hour(s). A new backup is only created (and '
+            f'posted to #{config.MODERATORS_CHANNEL_NAME}) when the server '
+            f'structure has actually changed since the last one.',
+            ephemeral=True)
+    except discord.HTTPException as e:
+        logger.error('Discord API error in auto_backup_command: %s', e)
+        await interaction.followup.send(
+            'A Discord API error occurred.', ephemeral=True)
+    except Exception as e:  # pylint: disable=broad-exception-caught
+        logger.error('Unexpected error in auto_backup_command: %s', e)
+        await interaction.followup.send(
+            'An unexpected error occurred.', ephemeral=True)
+
+auto_backup_error = _command_error_handler
+
+
 def register_autoreply_commands():
     """Register all autoreply commands."""
     if tree is None:
@@ -3979,7 +4844,7 @@ def register_autoreply_commands():
         reply='The message to send when the trigger is found',
         case_sensitive='Whether the trigger matching should be case sensitive (default: False)'
     )
-    @app_commands.checks.has_role(MODERATOR_ROLE_NAME)
+    @app_commands.checks.has_permissions(manage_messages=True)
     async def _autoreply_add(interaction: discord.Interaction, trigger: str, reply: str, case_sensitive: bool = False):
         await autoreply_add_command(interaction, trigger, reply, case_sensitive)
 
@@ -3989,18 +4854,19 @@ def register_autoreply_commands():
 
     @autoreply_group.command(name='remove', description='Remove an autoreply rule')
     @app_commands.describe(rule_id='The ID of the autoreply rule to remove')
-    @app_commands.checks.has_role(MODERATOR_ROLE_NAME)
+    @app_commands.checks.has_permissions(manage_messages=True)
     async def _autoreply_remove(interaction: discord.Interaction, rule_id: str):
         await autoreply_remove_command(interaction, rule_id)
 
     @autoreply_group.command(name='toggle', description='Enable or disable an autoreply rule')
     @app_commands.describe(rule_id='The ID of the autoreply rule to toggle')
-    @app_commands.checks.has_role(MODERATOR_ROLE_NAME)
+    @app_commands.checks.has_permissions(manage_messages=True)
     async def _autoreply_toggle(interaction: discord.Interaction, rule_id: str):
         await autoreply_toggle_command(interaction, rule_id)
 
     # Add error handlers
     _autoreply_add.on_error = autoreply_command_error
+    _autoreply_list.on_error = autoreply_command_error
     _autoreply_remove.on_error = autoreply_command_error
     _autoreply_toggle.on_error = autoreply_command_error
 

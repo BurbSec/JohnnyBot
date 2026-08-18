@@ -13,7 +13,10 @@ from logging.handlers import RotatingFileHandler
 # You probably want to change these:
 MODERATORS_CHANNEL_NAME = 'moderators_only'
 PROTECTED_CHANNELS = {'🫠・code_of_conduct', '🧚・hey_listen', '👯・local_events'}
-MODERATOR_ROLE_NAME = 'Moderators'
+# Moderator-gated commands and behaviors check the Discord "Manage
+# Messages" / "Administrator" permission directly rather than a role
+# name — no role to create or name to match, so this works on any
+# server with zero setup beyond the bot's own role having permissions.
 # These are for the "Voice Chaperone" function
 VOICE_CHAPERONE_ENABLED = True  # Set to False to disable voice chaperone functionality
 ADULT_ROLE_NAMES = {'Dads', 'GrownUps'}

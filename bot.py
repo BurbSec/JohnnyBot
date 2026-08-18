@@ -19,7 +19,6 @@ import config
 from config import (
     TOKEN,
     PROTECTED_CHANNELS,
-    MODERATOR_ROLE_NAME,
     MODERATORS_CHANNEL_NAME,
     ADULT_ROLE_NAMES,
     CHILD_ROLE_NAMES,
@@ -84,12 +83,60 @@ async def _ci_passed(session, repo_path, sha):
         for run in runs
     )
 
-async def _auto_update_and_restart(local_commit, remote_commit, deps_changed):
+def _short_sha(sha):
+    return sha[:8] if sha else '?'
+
+
+async def _local_tag_for_commit(sha):
+    """Return a git tag pointing at `sha` in the local checkout, or None.
+
+    Update detection stays commit-SHA-based (see check_for_updates) —
+    this only resolves a friendlier label to display, so a missing or
+    unparsable tag never blocks an update, it just falls back to the
+    short SHA.
+    """
+    try:
+        rc, out, _ = await _run_cmd('git', 'tag', '--points-at', sha)
+    except OSError:
+        return None
+    if rc == 0 and out:
+        return out.splitlines()[0]
+    return None
+
+
+async def _remote_tag_for_commit(session, repo_path, sha):
+    """Return a git tag pointing at `sha` on the remote, or None."""
+    url = f"https://api.github.com/repos/{repo_path}/tags"
+    try:
+        async with session.get(url) as response:
+            if response.status != 200:
+                return None
+            tags = await response.json()
+    except (aiohttp.ClientError, KeyError, ValueError, TypeError):
+        return None
+    for t in tags:
+        if t.get('commit', {}).get('sha') == sha:
+            return t.get('name')
+    return None
+
+
+async def _version_label(session, repo_path, sha, *, local):
+    """A tag name if `sha` is tagged, else its short SHA."""
+    tag = (await _local_tag_for_commit(sha) if local
+           else await _remote_tag_for_commit(session, repo_path, sha))
+    return tag or _short_sha(sha)
+
+
+async def _auto_update_and_restart(local_commit, remote_commit, deps_changed,
+                                   local_version=None, remote_version=None):
     """Pull the latest code, reinstall deps if needed, and re-exec the bot.
 
     On success this never returns (the process is replaced). Returns an
     error string on failure so the caller can notify moderators.
     """
+    local_version = local_version or _short_sha(local_commit)
+    remote_version = remote_version or _short_sha(remote_commit)
+
     rc, _, err = await _run_cmd('git', 'pull', '--ff-only')
     if rc != 0:
         return f"`git pull --ff-only` failed: {err or 'unknown error'}"
@@ -107,14 +154,14 @@ async def _auto_update_and_restart(local_commit, remote_commit, deps_changed):
         try:
             await channel.send(
                 "🤖 **Auto-updating JohnnyBot**\n\n"
-                f"`{local_commit[:8]}` → `{remote_commit[:8]}` — "
+                f"`{local_version}` → `{remote_version}` — "
                 "restarting now. Back in a moment!"
             )
         except (discord.HTTPException, discord.Forbidden) as e:
             logger.error("Error sending auto-update notice: %s", e)
 
     logger.info("Auto-update complete (%s -> %s); restarting",
-                local_commit[:8], remote_commit[:8])
+                local_version, remote_version)
     logging.shutdown()
     bot_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'bot.py')
     os.execv(sys.executable, [sys.executable, bot_path])
@@ -186,15 +233,23 @@ async def check_for_updates():
             ci_ok = False
             if auto_update and not config_changed:
                 ci_ok = await _ci_passed(session, repo_path, remote_commit)
+
+            # Tag names are cosmetic only — detection above stays
+            # commit-SHA-based regardless of whether either side is
+            # tagged, so an untagged commit (or a fork with no tags at
+            # all) still updates correctly, just displayed by short SHA.
+            local_version = await _version_label(session, repo_path, local_commit, local=True)
+            remote_version = await _version_label(session, repo_path, remote_commit, local=False)
     except (aiohttp.ClientError, KeyError, ValueError) as e:
         logger.error("Error fetching remote git info: %s", e)
         return
 
-    logger.info("Update available: local=%s, remote=%s", local_commit[:8], remote_commit[:8])
+    logger.info("Update available: local=%s, remote=%s", local_version, remote_version)
 
     if auto_update and not config_changed and ci_ok:
         error = await _auto_update_and_restart(
-            local_commit, remote_commit, 'requirements.txt' in changed_files)
+            local_commit, remote_commit, 'requirements.txt' in changed_files,
+            local_version, remote_version)
         # Only reached on failure — os.execv never returns
         logger.error("Auto-update failed: %s", error)
         _last_notified_commit = remote_commit
@@ -213,12 +268,12 @@ async def check_for_updates():
         return
 
     if auto_update and not config_changed and not ci_ok:
-        logger.info("Auto-update skipped: CI not green for %s", remote_commit[:8])
+        logger.info("Auto-update skipped: CI not green for %s", remote_version)
 
     _last_notified_commit = remote_commit
-    await send_update_notification(local_commit, remote_commit, config_changed)
+    await send_update_notification(local_version, remote_version, config_changed)
 
-async def send_update_notification(local_commit, remote_commit, config_changed=False):
+async def send_update_notification(local_version, remote_version, config_changed=False):
     """Send update notification to the moderators channel."""
     try:
         moderators_channel = _get_moderators_channel()
@@ -231,8 +286,8 @@ async def send_update_notification(local_commit, remote_commit, config_changed=F
             message = (
                 "⚠️ **Breaking Changes in New Version**\n\n"
                 f"`config_example.py` has been modified in the latest update.\n"
-                f"Current version: `{local_commit[:8]}`\n"
-                f"Latest version: `{remote_commit[:8]}`\n\n"
+                f"Current version: `{local_version}`\n"
+                f"Latest version: `{remote_version}`\n\n"
                 f"**Please update manually** — review the config changes and "
                 f"update your local `config.py` before pulling.\n\n"
                 f"Repository: {UPDATE_CHECK_REPO_URL}"
@@ -241,8 +296,8 @@ async def send_update_notification(local_commit, remote_commit, config_changed=F
             message = (
                 "🤖 **Bot Update Available!**\n\n"
                 f"A new version of JohnnyBot is available on GitHub.\n"
-                f"Current version: `{local_commit[:8]}`\n"
-                f"Latest version: `{remote_commit[:8]}`\n\n"
+                f"Current version: `{local_version}`\n"
+                f"Latest version: `{remote_version}`\n\n"
                 f"**To update:**\n"
                 f"1. Run `git pull` from the bot directory on the server\n"
                 f"2. Restart the bot service\n\n"
@@ -335,7 +390,7 @@ async def on_ready():  # pylint: disable=too-many-statements
         logger.error('Final command sync failure: %s', e)
 
     try:
-        from commands import event_feed, register_all_reminder_jobs  # pylint: disable=import-outside-toplevel
+        from commands import event_feed, register_all_reminder_jobs, register_all_auto_backup_jobs  # pylint: disable=import-outside-toplevel,line-too-long
 
         if event_feed:
             sched = getattr(event_feed, 'scheduler', None)
@@ -414,6 +469,9 @@ async def on_ready():  # pylint: disable=too-many-statements
 
                 # Register all persisted reminders as scheduler jobs
                 register_all_reminder_jobs()
+
+                # Register all persisted auto-backup jobs
+                register_all_auto_backup_jobs()
             else:
                 logger.info('Event feed scheduler already running')
         else:
@@ -453,8 +511,11 @@ async def handle_unsolicited_dm(message):
                     author, guild.name, e)
                 continue
         memberships.append(member)
-    if any(role.name == MODERATOR_ROLE_NAME
-           for m in memberships for role in getattr(m, 'roles', [])):
+    # Matches the mod_only command gate (manage_messages permission)
+    # rather than a role literally named MODERATOR_ROLE_NAME, so DM
+    # exemption tracks the same authorization as command access.
+    if any(getattr(getattr(m, 'guild_permissions', None), 'manage_messages', False)
+           for m in memberships):
         logger.info('Ignoring DM from moderator %s', author)
         return
 
@@ -515,10 +576,14 @@ async def on_message(message):
         logger.error('Error checking autoreply rules: %s', e)
 
     if getattr(message.channel, 'name', None) in PROTECTED_CHANNELS:
-        has_moderator_role = any(
-            role.name == MODERATOR_ROLE_NAME
-            for role in getattr(message.author, 'roles', []))
-        if not has_moderator_role:
+        # Matches the mod_only command gate (manage_messages permission)
+        # rather than a role literally named MODERATOR_ROLE_NAME, so
+        # protected-channel enforcement tracks the same authorization
+        # as command access.
+        is_moderator = getattr(
+            getattr(message.author, 'guild_permissions', None),
+            'manage_messages', False)
+        if not is_moderator:
             try:
                 await message.delete()
                 logger.info(

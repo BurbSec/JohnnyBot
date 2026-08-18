@@ -19,7 +19,6 @@ def _install_config_stub():
     cfg = types.ModuleType('config')
     cfg.MODERATORS_CHANNEL_NAME = 'moderators_only'
     cfg.PROTECTED_CHANNELS = {'code_of_conduct'}
-    cfg.MODERATOR_ROLE_NAME = 'Moderators'
     cfg.VOICE_CHAPERONE_ENABLED = True
     cfg.ADULT_ROLE_NAMES = {'Dads', 'GrownUps'}
     cfg.CHILD_ROLE_NAMES = {'Kids', 'Bambinos'}

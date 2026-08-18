@@ -4,8 +4,10 @@ JohnnyBot does all of the stuff Discord bizarrely won't let you do!
 Designed to automate tons of server management and enforce some rules while
 you're at it. It provides features such as mass role management, message
 moderation, permissions cloning, and event feed integration to ensure a smooth
-server experience. Most commands are limited to users with the
-MODERATOR_ROLE_NAME, however the PetBot commands can be leveraged by all users.
+server experience. Most moderation commands require the "Manage Messages"
+permission (no role to create or name — works on any server out of the
+box); server backup and restore commands require the stricter
+Administrator permission. PetBot commands can be leveraged by all users.
 
 ## Documentation
 
@@ -20,8 +22,8 @@ MODERATOR_ROLE_NAME, however the PetBot commands can be leveraged by all users.
 
 These run without being invoked, so they are worth knowing about before you deploy:
 
-- **DMs to the bot get you kicked.** Anyone who sends the bot a direct message is removed from every server they share with it, and the kick is reported to the moderators channel. Two exemptions: users with `MODERATOR_ROLE_NAME`, and anyone the bot itself DMed in the last 24 hours — so replying to a `/message_dump` archive or `/log_tail` output is safe.
-- **Protected channels are enforced.** Messages posted by non-moderators in any channel listed in `PROTECTED_CHANNELS` are deleted.
+- **DMs to the bot get you kicked.** Anyone who sends the bot a direct message is removed from every server they share with it, and the kick is reported to the moderators channel. Two exemptions: users with the Manage Messages permission, and anyone the bot itself DMed in the last 24 hours — so replying to a `/message_dump` archive or `/log_tail` output is safe.
+- **Protected channels are enforced.** Messages posted by anyone without Manage Messages in any channel listed in `PROTECTED_CHANNELS` are deleted.
 - **Voice channel chaperone.** When a voice channel contains exactly one adult and one child (by `ADULT_ROLE_NAMES` / `CHILD_ROLE_NAMES`), everyone in it is server-muted and the moderators channel is alerted once. The mute lifts automatically when the channel is no longer one adult and one child, when a muted member moves to a safe channel, or when the feature is disabled — including across a bot restart, since outstanding mutes are persisted to `chaperone_mutes.json`. Only mutes the bot applied are lifted; a manual moderator mute is never undone. Toggle with `/voice_chaperone`.
 
 ## Key Features
@@ -88,6 +90,14 @@ Once a feed is added, everything else is automatic: feeds are re-checked every M
 | `/autoreply remove` | Remove an autoreply rule by ID | Mod |
 | `/autoreply toggle` | Enable or disable an autoreply rule by ID | Mod |
 
+### Server Backup
+
+| Command | Description | Access |
+|---|---|---|
+| `/server_backup` | Create a full structural backup of the server (roles, categories, channels, permission overwrites, emoji) and DM it to you as a JSON file | Admin |
+| `/server_restore` | Restore server structure from a backup file. Shows a diff-style preview and requires an explicit confirm click before anything changes; automatically creates a safety snapshot of the current state first. Matches existing roles/categories/channels by name, so re-running is idempotent rather than duplicating everything. Never touches Administrator/managed/above-hierarchy roles or their overwrites, and never restores message history, member-specific overwrites, or audit logs | Admin |
+| `/auto_backup` | Enable/disable automatic backups on an interval (default 24h). A new backup is only created — and posted to the moderators channel — when the server's structure actually changed since the last one | Admin |
+
 ### System & Utilities
 
 | Command | Description | Access |
@@ -96,7 +106,9 @@ Once a feed is added, everything else is automatic: feeds are re-checked every M
 | `/log_tail` | DM the last N lines of the bot log to yourself | Mod |
 | `/dashboard` | Display all available commands grouped by category | All |
 
-Update checking is configured in `config.py` (not via slash command): `UPDATE_CHECKING_ENABLED` turns on daily checks for new commits with moderator notifications, and `AUTO_UPDATE_ENABLED` additionally makes the bot pull CI-passing updates and restart itself.
+`Mod` above means the invoker needs the **Manage Messages** permission — not a specific role name, so there's nothing to configure to make command access work on a new server. `Admin` means the stricter **Administrator** permission, reserved for the backup/restore commands since they can rewrite the server's entire structure.
+
+Update checking is configured in `config.py` (not via slash command): `UPDATE_CHECKING_ENABLED` turns on daily checks for new commits with moderator notifications, and `AUTO_UPDATE_ENABLED` additionally makes the bot pull CI-passing updates and restart itself. Notifications display a git tag (e.g. `v1.0.0`) when the relevant commit is tagged, falling back to a short commit SHA otherwise — tags are cosmetic labels only, update detection itself is still commit-based so untagged commits are never missed.
 
 ### PetBot Interactions
 
