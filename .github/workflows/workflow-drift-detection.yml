@@ -12,26 +12,48 @@ permissions:
 jobs:
   drift:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
       - name: Check for unsigned workflow commits since last week
         id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           SINCE=$(date -u -d '7 days ago' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v-7d +%Y-%m-%dT%H:%M:%SZ)
           ISSUES=""
           while IFS= read -r sha; do
             [ -z "$sha" ] && continue
-            VERIFIED=$(git verify-commit "$sha" 2>/dev/null && echo "yes" || echo "no")
-            AUTHOR_EMAIL=$(git log -1 --format='%ae' "$sha")
             FILES=$(git diff-tree --no-commit-id -r --name-only "$sha" | grep '^\.github/' || true)
-            if [ -n "$FILES" ] && [ "$VERIFIED" = "no" ]; then
+            [ -z "$FILES" ] && continue
+
+            # Signature status comes from GitHub, not `git verify-commit`.
+            # verify-commit cannot work on a runner: SSH-signed commits
+            # need a local gpg.ssh.allowedSignersFile, which does not
+            # exist here, so it reported *every* signed commit as
+            # unsigned. That produced false-positive alerts (issues #2
+            # and #3). GitHub verifies against the keys registered on the
+            # author's account, which needs no local trust setup.
+            RESP=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${sha}" \
+                     --jq '[.commit.verification.verified, .commit.verification.reason] | @tsv' \
+                     2>/dev/null || true)
+            if [ -z "$RESP" ]; then
+              VERIFIED="false"
+              REASON="could not reach the GitHub API to check"
+            else
+              VERIFIED=$(printf '%s' "$RESP" | cut -f1)
+              REASON=$(printf '%s' "$RESP" | cut -f2)
+            fi
+
+            if [ "$VERIFIED" != "true" ]; then
+              AUTHOR_EMAIL=$(git log -1 --format='%ae' "$sha")
               SHORT="${sha:0:7}"
               FILES_ONELINE=$(echo "$FILES" | tr '\n' ',' | sed 's/,$//')
-              ISSUES="${ISSUES}- ${SHORT} (${AUTHOR_EMAIL}): unsigned commit touched ${FILES_ONELINE}"$'\n'
+              ISSUES="${ISSUES}- ${SHORT} (${AUTHOR_EMAIL}): unverified [${REASON}] touched ${FILES_ONELINE}"$'\n'
             fi
           done < <(git log --format='%H' --since="$SINCE" -- .github/)
           if [ -n "$ISSUES" ]; then
@@ -47,7 +69,7 @@ jobs:
 
       - name: Open issue if drift detected
         if: steps.check.outputs.found == 'true'
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         env:
           DRIFT_DETAILS: ${{ steps.check.outputs.details }}
         with:
@@ -56,13 +78,15 @@ jobs:
             const body = [
               '## Workflow drift alert',
               '',
-              'The scheduled drift-detection scan found unsigned commits modifying `.github/` in the past 7 days:',
+              'The scheduled drift-detection scan found commits modifying `.github/` in the past 7 days whose signatures GitHub could not verify:',
               '',
               '```',
               details.trim(),
               '```',
               '',
-              'Please review these commits immediately and verify they are legitimate.',
+              'Each line shows GitHub\u2019s verification reason. `unsigned` means no signature at all; `unknown_key` or `unknown_signature_type` usually means the signing key is not registered on the author\u2019s GitHub account rather than that the commit is malicious.',
+              '',
+              'Please review these commits and confirm they are legitimate.',
               '',
               '_This issue was opened automatically by the drift-detection workflow._'
             ].join('\n');

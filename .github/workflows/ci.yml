@@ -5,20 +5,35 @@ on:
   push:
     branches: [main]
 
+# Least privilege: the test job only needs to read the repo.
+permissions:
+  contents: read
+
+# A new push to the same branch supersedes the run already in flight.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     strategy:
+      # Report every version rather than stopping at the first failure —
+      # with a multi-version matrix, "3.14 also fails" is information.
+      fail-fast: false
       matrix:
-        python-version: ['3.11', '3.12']
+        # 3.11 is the documented floor. The dependencies themselves
+        # require >=3.10, but 3.10 reaches EOL in October 2026, so the
+        # supported floor carries a version of margin.
+        python-version: ['3.11', '3.12', '3.13', '3.14']
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
       - name: Install dependencies
-        run: |
-          pip install -r requirements.txt -r requirements-test.txt
+        run: pip install -r requirements.txt -r requirements-test.txt
       - name: Run tests
         run: pytest -v

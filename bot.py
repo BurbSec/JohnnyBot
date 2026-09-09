@@ -318,14 +318,69 @@ intents.voice_states = True
 
 bot = commands.Bot(command_prefix='!', intents=intents)
 
+async def _sync_commands():
+    """Synchronize application commands with Discord, with retries."""
+    max_retries = 3
+    retry_delay = 5
+
+    for attempt in range(max_retries):
+        try:
+            pre_sync_commands = bot.tree.get_commands()
+            if not pre_sync_commands:
+                logger.error("No commands found in command tree before sync")
+                raise RuntimeError("No commands found in command tree")
+
+            synced = await bot.tree.sync()
+            logger.info('Synced %d global commands', len(synced))
+
+            registered = await bot.tree.fetch_commands()
+            if not registered:
+                raise RuntimeError("No commands registered after sync")
+
+            logger.info('Successfully registered commands: %s',
+                       [cmd.name for cmd in registered])
+            return
+
+        except Exception as e:  # pylint: disable=broad-exception-caught
+            logger.error('Command sync attempt %d failed: %s',
+                        attempt + 1, e)
+            if attempt < max_retries - 1:
+                await asyncio.sleep(retry_delay * (attempt + 1))
+                continue
+            raise
+
+
+@bot.event
+async def setup_hook():
+    """One-time async startup, run before the gateway connects.
+
+    Command sync belongs here rather than in on_ready: on_ready fires
+    again on every reconnect, which is what the old _ready_ran flag and
+    the leading asyncio.sleep(5) were working around.
+
+    Only the sync moves. Anything needing bot.guilds — the chaperone
+    sweep — or anything whose jobs call bot.get_channel — the scheduler
+    registrations — must stay in on_ready, because guild state is not
+    populated yet at this point.
+    """
+    logger.info('Pre-sync commands: %s',
+                [cmd.name for cmd in bot.tree.get_commands()])
+    try:
+        await _sync_commands()
+    except (discord.HTTPException, discord.ClientException, RuntimeError,
+            asyncio.TimeoutError) as e:
+        logger.error('Final command sync failure: %s', e)
+
+
 _ready_ran = False
 
 @bot.event
 async def on_ready():  # pylint: disable=too-many-statements
-    """Handle bot startup initialization including:
-    - Syncing application commands
-    - Starting background tasks
-    - Initializing event feed scheduler
+    """Post-connect startup: chaperone sweep and scheduler registration.
+
+    Still guarded by _ready_ran because on_ready re-fires on reconnect
+    and these steps are not idempotent-by-accident. Command sync now
+    happens once in setup_hook().
     """
     global _ready_ran
     if _ready_ran:
@@ -337,57 +392,11 @@ async def on_ready():  # pylint: disable=too-many-statements
         logger.info('Bot initialization complete')
 
     # Lift any chaperone mutes left outstanding by the last shutdown
-    # before doing anything slower (command sync takes ~15s)
     _load_chaperone_mutes()
     try:
         await sweep_chaperone_mutes()
     except (discord.HTTPException, AttributeError) as e:
         logger.error('Chaperone startup sweep failed: %s', e)
-
-    registered_commands = bot.tree.get_commands()
-    logger.info('Pre-sync commands: %s', [cmd.name for cmd in registered_commands])
-
-    async def sync_commands():
-        """Synchronize application commands with Discord.
-        
-        Attempts to sync commands with retry logic on failure.
-        """
-        max_retries = 3
-        retry_delay = 5
-
-        for attempt in range(max_retries):
-            try:
-                await asyncio.sleep(5)
-
-                pre_sync_commands = bot.tree.get_commands()
-                if not pre_sync_commands:
-                    logger.error("No commands found in command tree before sync")
-                    raise RuntimeError("No commands found in command tree")
-
-                synced = await bot.tree.sync()
-                logger.info('Synced %d global commands', len(synced))
-
-                registered = await bot.tree.fetch_commands()
-                if not registered:
-                    raise RuntimeError("No commands registered after sync")
-
-                logger.info('Successfully registered commands: %s',
-                           [cmd.name for cmd in registered])
-                return
-
-            except Exception as e:
-                logger.error('Command sync attempt %d failed: %s',
-                            attempt + 1, e)
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(retry_delay * (attempt + 1))
-                    continue
-                raise
-
-    try:
-        await sync_commands()
-    except (discord.HTTPException, discord.ClientException, RuntimeError,
-            asyncio.TimeoutError) as e:
-        logger.error('Final command sync failure: %s', e)
 
     try:
         from commands import event_feed, register_all_reminder_jobs, register_all_auto_backup_jobs  # pylint: disable=import-outside-toplevel,line-too-long
@@ -497,9 +506,32 @@ async def handle_unsolicited_dm(message):
     # status anywhere exempts them everywhere. Fall back to an API
     # fetch when the member cache misses — kicking is irreversible for
     # the member, so never decide it on a stale cache.
-    memberships = []
+    # Anyone on the internet can DM the bot, and this used to spend one
+    # fetch_member API call per guild on every such DM — an easy way for
+    # an outsider to burn the global rate limit.
+    #
+    # A cache miss is only trustworthy when the guild is chunked, i.e.
+    # its member cache is known complete. Before chunking finishes (cold
+    # start, or a large guild) a miss means nothing, and treating it as
+    # "not a member" would silently exempt a real member from a kick —
+    # so those guilds still get an API confirmation. Kicking is
+    # irreversible; it must never run off a cache that may be stale.
+    candidates = []
     for guild in bot.guilds:
         member = guild.get_member(author.id)
+        if member is not None:
+            candidates.append((guild, member))
+        elif not guild.chunked:
+            candidates.append((guild, None))  # must confirm via the API
+
+    if not candidates:
+        logger.info(
+            'DM from %s who is not a member of any chunked guild; '
+            'nothing to kick', author)
+        return
+
+    memberships = []
+    for guild, member in candidates:
         if member is None:
             try:
                 member = await guild.fetch_member(author.id)
@@ -615,6 +647,9 @@ def get_user_role_type(member):
 # mutes and never one a moderator applied by hand. Persisted, because
 # a restart while someone is muted would otherwise strand them: the
 # unmute path skips anyone missing from this set.
+# Keyed by (guild_id, user_id), not a bare user id: the same person can
+# be in voice in two guilds the bot serves, and a single-guild key meant
+# one guild's mute suppressed the other's mute *and* its unmute.
 _chaperone_muted = set()
 # Voice channels currently in the flagged 1-adult/1-child state.
 # Muting a member re-fires on_voice_state_update, so without this the
@@ -635,7 +670,22 @@ def _load_chaperone_mutes():
         return
     try:
         with open(CHAPERONE_MUTES_FILE, 'r', encoding='utf-8') as f:
-            _chaperone_muted.update(int(uid) for uid in json.load(f))
+            raw = json.load(f)
+        legacy = 0
+        for entry in raw:
+            # New format is [guild_id, user_id]; the old one was a bare
+            # user id. A legacy entry can't name its guild, so it is
+            # dropped — the startup sweep re-flags anyone still in an
+            # unsafe channel, and the worst case is a stale mute a
+            # moderator clears once.
+            if isinstance(entry, (list, tuple)) and len(entry) == 2:
+                _chaperone_muted.add((int(entry[0]), int(entry[1])))
+            else:
+                legacy += 1
+        if legacy:
+            logger.warning(
+                'Dropped %d chaperone mute(s) in the pre-guild-key '
+                'format; the startup sweep will re-evaluate', legacy)
         logger.info('Loaded %d outstanding chaperone mutes',
                     len(_chaperone_muted))
     except (OSError, IOError, ValueError, TypeError) as e:
@@ -647,7 +697,8 @@ def _save_chaperone_mutes():
     # recording — the safety action matters more than the bookkeeping.
     try:
         _atomic_json_write(
-            CHAPERONE_MUTES_FILE, [int(uid) for uid in _chaperone_muted])
+            CHAPERONE_MUTES_FILE,
+            [[int(gid), int(uid)] for gid, uid in _chaperone_muted])
     except (OSError, IOError, TypeError, ValueError) as e:
         logger.error('Failed to save chaperone mutes: %s', e)
 
@@ -686,13 +737,14 @@ def _count_adults_children(channel):
 async def _unmute_member(member, reason):
     """Lift a chaperone mute. Discord rejects this unless the member is
     connected to voice, so leave them flagged and retry on rejoin."""
-    if member.id not in _chaperone_muted:
+    key = (member.guild.id, member.id)
+    if key not in _chaperone_muted:
         return
     if not member.voice or not member.voice.channel:
         return
     try:
         await member.edit(mute=False)
-        _chaperone_muted.discard(member.id)
+        _chaperone_muted.discard(key)
         _save_chaperone_mutes()
         logger.info('Unmuted %s (%s)', member.display_name, reason)
     except discord.HTTPException as e:
@@ -731,11 +783,11 @@ async def check_voice_channel_safety(channel):  # pylint: disable=too-many-branc
     _chaperone_flagged.add(channel.id)
 
     for member in channel.members:
-        if member.bot or member.id in _chaperone_muted:
+        if member.bot or (channel.guild.id, member.id) in _chaperone_muted:
             continue
         try:
             await member.edit(mute=True)
-            _chaperone_muted.add(member.id)
+            _chaperone_muted.add((channel.guild.id, member.id))
             _save_chaperone_mutes()
             logger.info('Muted %s in channel %s', member.display_name, channel.name)
         except discord.HTTPException as e:

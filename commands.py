@@ -13,8 +13,12 @@ import uuid
 import zipfile
 import shutil
 import hashlib
+import contextlib
+import socket
+import ipaddress
 from collections import deque
 from urllib.parse import urlparse
+from zoneinfo import ZoneInfo
 from datetime import datetime, time as _dtime, timedelta, timezone
 from typing import Optional, Dict, Any
 from apscheduler.triggers.interval import IntervalTrigger
@@ -24,8 +28,7 @@ import discord
 from discord import app_commands
 import aiohttp
 import feedparser
-import pytz
-from icalendar import Calendar
+from icalendar import Calendar, IncompleteComponent
 try:
     from dateutil import parser as dateparser
 except ImportError:
@@ -62,8 +65,107 @@ FEEDS_FILE = os.path.join(os.path.dirname(__file__), 'event_feeds.json')
 # Event announce config file path
 ANNOUNCE_FILE = os.path.join(os.path.dirname(__file__), 'event_announce.json')
 
-# Cached timezone object — avoid recreating on every use
-CENTRAL_TZ = pytz.timezone(BOT_TIMEZONE)
+# Cached timezone object — avoid recreating on every use. zoneinfo
+# rather than pytz: with pytz, `dt.replace(tzinfo=tz)` silently yields
+# the zone's 1883 LMT offset (9 minutes off for America/Chicago) and
+# only `tz.localize(dt)` is correct, so the obvious idiom is the wrong
+# one. zoneinfo makes `.replace()` correct and drops a dependency.
+CENTRAL_TZ = ZoneInfo(BOT_TIMEZONE)
+
+
+# Nothing the bot fetches from a feed should be anywhere near this
+# large; without a cap, aiohttp's .text()/.read() buffer the whole body
+# and one oversized URL takes the process down.
+MAX_FETCH_BYTES = 8 * 1024 * 1024
+MAX_EMOJI_BYTES = 512 * 1024
+MAX_BACKUP_BYTES = 16 * 1024 * 1024
+
+
+class ResponseTooLarge(Exception):
+    """Raised when a fetched body exceeds MAX_FETCH_BYTES."""
+
+
+async def _read_capped(response, url, limit=MAX_FETCH_BYTES):
+    """Read a response body as text, refusing anything over `limit`.
+
+    Checks the advertised Content-Length first, then streams so a
+    missing or lying header can't get past the cap either.
+    """
+    declared = response.content_length
+    if declared is not None and declared > limit:
+        raise ResponseTooLarge(
+            f"{url} declared {declared} bytes (limit {limit})")
+    chunks = []
+    total = 0
+    async for chunk in response.content.iter_chunked(64 * 1024):
+        total += len(chunk)
+        if total > limit:
+            raise ResponseTooLarge(
+                f"{url} exceeded {limit} bytes")
+        chunks.append(chunk)
+    raw = b''.join(chunks)
+    encoding = response.charset or 'utf-8'
+    return raw.decode(encoding, errors='replace')
+
+
+def _host_is_public(hostname):
+    """True if every address `hostname` resolves to is publicly routable.
+
+    Blocking call — run it off the event loop.
+    """
+    for info in socket.getaddrinfo(hostname, None):
+        ip = ipaddress.ip_address(info[4][0])
+        if (ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_reserved or ip.is_multicast
+                or ip.is_unspecified):
+            return False
+    return True
+
+
+async def _validate_fetchable_url(url):
+    """Return an error string if `url` must not be fetched, else None.
+
+    Feed URLs are moderator-supplied and event-page URLs come from feed
+    content, and both are fetched from the bot host — so without this an
+    http://169.254.169.254/ or http://127.0.0.1:<port>/ URL reaches
+    cloud instance metadata and loopback-bound services.
+
+    This resolves DNS and rejects non-public addresses. It is not proof
+    against DNS rebinding (the name is resolved again by aiohttp), but
+    it closes the direct case.
+    """
+    parsed = urlparse(url)
+    if parsed.scheme not in ('http', 'https'):
+        return 'URL must start with http:// or https://.'
+    if not parsed.hostname:
+        return 'URL has no host.'
+    try:
+        public = await asyncio.to_thread(_host_is_public, parsed.hostname)
+    except (socket.gaierror, ValueError) as e:
+        return f'Could not resolve host `{parsed.hostname}`: {e}'
+    if not public:
+        return ('Refusing to fetch a URL that resolves to a private, '
+                'loopback, or link-local address.')
+    return None
+
+
+def _localize_naive(value):
+    """Attach BOT_TIMEZONE to a naive datetime, leaving aware ones alone.
+
+    Feeds emit three date shapes: UTC (`...Z`), zone-qualified (`TZID=`),
+    and zone-less ones — floating local times (`DTSTART:20260915T190000`)
+    and all-day dates (`DTSTART;VALUE=DATE:20260915`, which
+    _extract_ical_event turns into naive midnight). Only that last group
+    arrives naive, and iCal defines it as wall-clock time in the reader's
+    own timezone.
+
+    Reading those as UTC — as this code used to — shifted every floating
+    event by the UTC offset (a 7pm event was created at 2pm Central) and
+    pushed every all-day event onto the previous day.
+    """
+    if isinstance(value, datetime) and value.tzinfo is None:
+        return value.replace(tzinfo=CENTRAL_TZ)
+    return value
 
 
 def get_last_log_line():
@@ -239,6 +341,78 @@ def _is_moderator(user):
     return bool(getattr(perms, 'manage_messages', False) or getattr(perms, 'administrator', False))
 
 
+def _resolved_guild_permissions(interaction):
+    """The invoker's guild-wide permissions, or None if unresolvable.
+
+    Deliberately NOT Interaction.permissions, which app_commands'
+    has_permissions uses: that applies channel overwrites, so a member
+    granted manage_messages by an overwrite in one channel could run
+    every moderator command from that channel. _is_moderator and the two
+    bot.py gates (DM auto-kick exemption, protected-channel enforcement)
+    have always read guild-wide permissions; this is what makes the
+    command gate agree with them.
+
+    Administrator and guild ownership are already folded in by
+    discord.py's Member.guild_permissions.
+    """
+    guild = interaction.guild
+    if guild is None:
+        return None
+    member = guild.get_member(interaction.user.id) or interaction.user
+    return getattr(member, 'guild_permissions', None)
+
+
+def _require_guild_permissions(**perms):
+    """app_commands check on the invoker's *guild-wide* permissions.
+
+    Raises MissingPermissions so the existing error handler renders it
+    identically to the has_permissions check it replaces.
+    """
+    def predicate(interaction):
+        resolved = _resolved_guild_permissions(interaction)
+        if resolved is None:
+            raise app_commands.errors.MissingPermissions(list(perms))
+        missing = [p for p, want in perms.items()
+                   if getattr(resolved, p, False) != want]
+        if missing:
+            raise app_commands.errors.MissingPermissions(missing)
+        return True
+    return app_commands.check(predicate)
+
+
+def _invoker_outranks(interaction, member):
+    """True if the command's invoker is allowed to moderate `member`.
+
+    Mirrors the rule Discord's own UI enforces: you cannot act on someone
+    whose top role sits at or above your own, and the guild owner
+    outranks everyone. The kick commands previously compared targets
+    against the *bot's* top role only, so anyone with manage_messages
+    could kick members ranked above themselves — including the owner —
+    as long as the bot's role happened to be higher.
+
+    Fails closed: if either side's rank can't be resolved we deny rather
+    than allow, since "we don't know who outranks whom" is not a reason
+    to permit an irreversible action. Callers check `interaction.guild`
+    themselves, so a missing guild here is already anomalous.
+    """
+    guild = interaction.guild
+    if guild is None:
+        return False
+    # owner_id is Optional in discord.py; when it's absent neither
+    # shortcut fires and the rank comparison below still applies.
+    if guild.owner_id is not None:
+        if interaction.user.id == guild.owner_id:
+            return True
+        if member.id == guild.owner_id:
+            return False
+    invoker = guild.get_member(interaction.user.id) or interaction.user
+    invoker_top = getattr(invoker, 'top_role', None)
+    member_top = getattr(member, 'top_role', None)
+    if invoker_top is None or member_top is None:
+        return False
+    return member_top < invoker_top
+
+
 async def _check_role_hierarchy(interaction, role):
     """Check bot and user role hierarchy. Returns False and responds if blocked."""
     bot_member = interaction.guild.me
@@ -295,6 +469,8 @@ async def _command_error_handler(interaction, error):
             p.replace('_', ' ').title() for p in error.missing_permissions
         ) or 'the required permission'
         msg = f'You need the {needed} permission to use this command.'
+    elif isinstance(error, app_commands.errors.NoPrivateMessage):
+        msg = 'This command can only be used in a server.'
     elif isinstance(error, discord.Forbidden):
         logger.error('Discord permission error: %s', error)
         msg = ("I don't have the Discord server permissions needed to do "
@@ -346,6 +522,11 @@ async def _tree_error_handler(interaction, error):
 
 class EventFeed:  # pylint: disable=too-few-public-methods,too-many-public-methods
     """Handles event feed subscriptions and notifications for iCal and RSS feeds."""
+
+    # Class-level default so the memo helpers work on any instance,
+    # including ones built via __new__ without running __init__.
+    _fetch_memo: Optional[Dict[Any, Any]] = None
+
     def __init__(self, bot):
         self.bot = bot
         self.feeds: Dict[int, Dict[str, Any]] = {}  # {guild_id: {url: feed_data}}
@@ -353,8 +534,44 @@ class EventFeed:  # pylint: disable=too-few-public-methods,too-many-public-metho
         self.scheduler: Optional[Any] = None  # Will be set in setup_commands
         self.announce_configs: Dict[int, str] = {}  # {guild_id: channel_name}
         self._feeds_lock = threading.Lock()
+        # When not None, a {(kind, url): result} memo shared by
+        # _fetch_calendar / the RSS body fetch / _scrape_event_page.
+        # See memoized_fetches().
+        self._fetch_memo = None
         self._load_feeds()
         self._load_announce_config()
+
+    @contextlib.asynccontextmanager
+    async def memoized_fetches(self):
+        """Memoize feed and event-page fetches for one operation.
+
+        /check_event_feeds runs check_feeds_job() and then
+        reconcile_discord_events(), and reconcile deliberately re-parses
+        every feed with posted_events emptied — so without this the
+        slowest command in the bot performed all of its network I/O
+        twice, including every event-page scrape.
+
+        Deliberately scoped to a single call rather than cached on the
+        instance: feeds must be re-read on the next scheduled run.
+        """
+        self._fetch_memo = {}
+        try:
+            yield
+        finally:
+            self._fetch_memo = None
+
+    def _memo_get(self, kind, url):
+        memo = self._fetch_memo
+        if memo is None:
+            return None, False
+        if (kind, url) in memo:
+            return memo[(kind, url)], True
+        return None, False
+
+    def _memo_put(self, kind, url, value):
+        if self._fetch_memo is not None:
+            self._fetch_memo[(kind, url)] = value
+        return value
 
     # ── Feed persistence ─────────────────────────────────────────────
 
@@ -428,6 +645,10 @@ class EventFeed:  # pylint: disable=too-few-public-methods,too-many-public-metho
             _atomic_json_write(ANNOUNCE_FILE, serializable)
         except (OSError, IOError) as e:
             logger.error("Failed to save announce config: %s", e)
+
+    async def save_feeds_async(self):
+        """Off-loop variant of save_feeds, for use from async paths."""
+        await asyncio.to_thread(self.save_feeds)
 
     def save_feeds(self):
         """Save feed subscriptions to disk."""
@@ -527,10 +748,14 @@ class EventFeed:  # pylint: disable=too-few-public-methods,too-many-public-metho
                                 cleaned += 1
                         except ValueError:
                             to_keep.add(uid)
-                    # Drop legacy uids without dates so they
-                    # get re-checked with composite uid logic
+                    # Legacy uid from before composite keys existed. It
+                    # used to be dropped outright "so it gets re-checked"
+                    # — but the re-check looks for "uid|date", never
+                    # finds it, and re-creates an event already posted.
+                    # Keep it: the prefix match in _fetch_and_parse_rss
+                    # and the 30-day window both still recognise it.
                     else:
-                        cleaned += 1
+                        to_keep.add(uid)
                 feed_data['posted_events'] = to_keep
 
         if cleaned:
@@ -538,8 +763,14 @@ class EventFeed:  # pylint: disable=too-few-public-methods,too-many-public-metho
                         cleaned)
             self.save_feeds()
 
-    async def check_feeds_job(self) -> Dict[str, Any]:
-        """Check all subscribed feeds for new events (next 30 days).
+    async def check_feeds_job(self, guild_id: Optional[int] = None) -> Dict[str, Any]:
+        """Check subscribed feeds for new events (next 30 days).
+
+        `guild_id` limits the run to one guild. The scheduled job passes
+        nothing and sweeps everything; /check_event_feeds passes its own
+        guild, because it used to gate on the caller's guild having
+        feeds and then process *every* guild — creating events in other
+        servers and reporting their feed names in the caller's summary.
 
         Returns a summary dict with counts for reporting.
         """
@@ -547,7 +778,6 @@ class EventFeed:  # pylint: disable=too-few-public-methods,too-many-public-metho
 
         results = {
             'feeds_checked': 0,
-            'events_found': 0,
             'events_posted': 0,
             'errors': []
         }
@@ -569,11 +799,13 @@ class EventFeed:  # pylint: disable=too-few-public-methods,too-many-public-metho
                 return ('error', fname, str(e))
 
         tasks = []
-        for guild_id, feeds in self.feeds.items():
-            guild = self.bot.get_guild(guild_id)
+        for gid, feeds in self.feeds.items():
+            if guild_id is not None and gid != guild_id:
+                continue
+            guild = self.bot.get_guild(gid)
             if not guild:
                 results['errors'].append(
-                    f"Guild {guild_id} not found")
+                    f"Guild {gid} not found")
                 continue
             for url, feed_data in feeds.items():
                 tasks.append(_check_one(guild, url, feed_data))
@@ -595,8 +827,8 @@ class EventFeed:  # pylint: disable=too-few-public-methods,too-many-public-metho
             results['events_posted'],
             len(results['errors']))
 
-        # Persist all feed state changes in one write
-        self.save_feeds()
+        # Persist all feed state changes in one write, off the loop
+        await self.save_feeds_async()
 
         return results
 
@@ -638,12 +870,22 @@ class EventFeed:  # pylint: disable=too-few-public-methods,too-many-public-metho
 
     async def _fetch_calendar(self, url: str):
         """Fetch and parse calendar from URL."""
+        cached, hit = self._memo_get('cal', url)
+        if hit:
+            return cached
+        return self._memo_put('cal', url, await self._fetch_calendar_uncached(url))
+
+    async def _fetch_calendar_uncached(self, url: str):
+        """Network fetch behind _fetch_calendar's memo."""
+        problem = await _validate_fetchable_url(url)
+        if problem:
+            raise ValueError(f'{url}: {problem}')
         async with aiohttp.ClientSession() as session:
             async with session.get(
                 url, timeout=aiohttp.ClientTimeout(total=30)
             ) as response:
                 response.raise_for_status()
-                text = await response.text()
+                text = await _read_capped(response, url)
                 return Calendar.from_ical(text)
 
     async def _enrich_ical_events(self, events: list) -> list:
@@ -682,13 +924,13 @@ class EventFeed:  # pylint: disable=too-few-public-methods,too-many-public-metho
                                feed_data: Dict[str, Any]) -> list:
         """Parse iCal events, return new ones in the next 30 days."""
         posted_events = feed_data.get('posted_events', set())
-        current_time = datetime.now()
+        # Aware, so a feed's UTC timestamps and a floating local time are
+        # both compared against the same instant.
+        current_time = datetime.now(CENTRAL_TZ)
         cutoff = current_time + timedelta(days=30)
         new_events = []
 
-        for component in calendar.walk():
-            if component.name != "VEVENT":
-                continue
+        for component in calendar.walk('VEVENT'):
             event = self._extract_ical_event(component)
             if not event:
                 continue
@@ -702,13 +944,10 @@ class EventFeed:  # pylint: disable=too-few-public-methods,too-many-public-metho
             if composite_uid in posted_events:
                 continue
             # Only events in the next 30 days
-            if hasattr(sd, 'tzinfo') and sd.tzinfo:
-                sd_naive = sd.replace(tzinfo=None)
-            else:
-                sd_naive = sd
-            if sd_naive < current_time - timedelta(hours=1):
+            sd_aware = _localize_naive(sd)
+            if sd_aware < current_time - timedelta(hours=1):
                 continue
-            if sd_naive > cutoff:
+            if sd_aware > cutoff:
                 continue
             new_events.append(event)
 
@@ -730,25 +969,32 @@ class EventFeed:  # pylint: disable=too-few-public-methods,too-many-public-metho
         url = str(component.get('url', ''))
         uid = str(component.get('uid', ''))
 
-        dtstart = component.get('dtstart')
-        if not dtstart:
+        # Event.start/.end resolve DTSTART and DTEND-*or*-DURATION the
+        # way RFC 5545 defines them. The previous hand-rolled version
+        # read only DTEND and otherwise fell back to a flat +1 hour, so
+        # an event published as `DURATION:PT3H` was created as one hour.
+        try:
+            start_date = component.start
+            end_date = component.end
+        except (IncompleteComponent, ValueError) as e:
+            logger.warning("Skipping VEVENT %s: %s", uid or '<no uid>', e)
             return None
 
-        start_date = dtstart.dt
-        if not hasattr(start_date, 'date'):
+        # Normalise all-day `date` values to datetime so everything
+        # downstream (tz handling, window filter) sees one shape.
+        if not isinstance(start_date, datetime):
             start_date = datetime.combine(
                 start_date, datetime.min.time())
+        if not isinstance(end_date, datetime):
+            end_date = datetime.combine(
+                end_date, datetime.min.time())
 
-        dtend = component.get('dtend')
-        if dtend:
-            end_date = dtend.dt
-            if not hasattr(end_date, 'date'):
-                end_date = datetime.combine(
-                    end_date, datetime.min.time())
-        elif isinstance(start_date, datetime):
+        # A VEVENT carrying neither DTEND nor DURATION yields end ==
+        # start; Discord needs a non-zero span.
+        same_awareness = (
+            (start_date.tzinfo is None) == (end_date.tzinfo is None))
+        if same_awareness and end_date <= start_date:
             end_date = start_date + timedelta(hours=1)
-        else:
-            end_date = start_date
 
         return {
             'uid': uid,
@@ -770,7 +1016,7 @@ class EventFeed:  # pylint: disable=too-few-public-methods,too-many-public-metho
         with a small delay between requests to avoid rate limiting.
         """
         posted_events = feed_data.get('posted_events', set())
-        current_time = datetime.now()
+        current_time = datetime.now(CENTRAL_TZ)
         cutoff = current_time + timedelta(days=30)
         new_events = []
 
@@ -790,20 +1036,34 @@ class EventFeed:  # pylint: disable=too-few-public-methods,too-many-public-metho
             timeout=aiohttp.ClientTimeout(total=30)
         ) as session:
             # Fetch and parse the RSS feed
-            async with session.get(url) as response:
-                response.raise_for_status()
-                text = await response.text()
+            text, hit = self._memo_get('rss', url)
+            if not hit:
+                async with session.get(url) as response:
+                    response.raise_for_status()
+                    text = await _read_capped(response, url)
+                self._memo_put('rss', url, text)
 
             parsed_feed = feedparser.parse(text)
 
-            # Collect entries to scrape, skipping already-posted
+            # Collect entries to scrape, skipping already-posted. The
+            # comment always claimed this, but the filter lived *after*
+            # the scrape — so every run re-fetched every event page and
+            # threw nearly all of them away. posted_events holds
+            # composite "rss_uid|YYYY-MM-DD" keys, so match on prefix.
+            seen_uids = {p.rsplit('|', 1)[0] for p in posted_events}
             entries_to_scrape = []
             for entry in parsed_feed.get('entries', []):
                 link = getattr(entry, 'link', '')
                 rss_uid = getattr(entry, 'id', '') or link
-                if not rss_uid:
+                if not rss_uid or rss_uid in seen_uids:
                     continue
                 entries_to_scrape.append((link, rss_uid))
+            if not entries_to_scrape:
+                logger.info(
+                    "RSS feed %s: all %d entries already posted, "
+                    "nothing to scrape", url,
+                    len(parsed_feed.get('entries', [])))
+                return []
 
             # Scrape all pages concurrently with semaphore
             scrape_tasks = [
@@ -831,13 +1091,10 @@ class EventFeed:  # pylint: disable=too-few-public-methods,too-many-public-metho
                     continue
 
                 # Filter to next 30 days
-                if hasattr(sd, 'tzinfo') and sd.tzinfo:
-                    sd_naive = sd.replace(tzinfo=None)
-                else:
-                    sd_naive = sd
-                if sd_naive < current_time - timedelta(hours=1):
+                sd_aware = _localize_naive(sd)
+                if sd_aware < current_time - timedelta(hours=1):
                     continue
-                if sd_naive > cutoff:
+                if sd_aware > cutoff:
                     continue
 
                 new_events.append(event)
@@ -854,14 +1111,26 @@ class EventFeed:  # pylint: disable=too-few-public-methods,too-many-public-metho
         if not url:
             return None
 
+        problem = await _validate_fetchable_url(url)
+        if problem:
+            logger.warning('Refusing to scrape %s: %s', url, problem)
+            return None
+
+        cached, hit = self._memo_get('page', url)
+        if hit:
+            # Copy: _fetch_and_parse_rss mutates the returned dict
+            # (event['uid'] = composite), which must not leak across
+            # the two passes sharing this memo.
+            return dict(cached) if cached else cached
+
         try:
             async with session.get(url) as response:
                 if response.status != 200:
                     logger.error(
                         "Failed to scrape %s: HTTP %s",
                         url, response.status)
-                    return None
-                html = await response.text()
+                    return self._memo_put('page', url, None)
+                html = await _read_capped(response, url)
 
             # Extract JSON-LD Event data. The script tag carries extra
             # attributes on Meetup (data-next-head=""), so match any
@@ -879,15 +1148,17 @@ class EventFeed:  # pylint: disable=too-few-public-methods,too-many-public-metho
                     for item in items:
                         if (isinstance(item, dict)
                                 and item.get('@type') == 'Event'):
-                            return self._parse_jsonld_event(
-                                item, url, uid)
+                            return self._memo_put(
+                                'page', url,
+                                self._parse_jsonld_event(item, url, uid))
                 except (json.JSONDecodeError, KeyError):
                     continue
 
             logger.warning("No JSON-LD Event found on %s", url)
-            return None
+            return self._memo_put('page', url, None)
 
-        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        except (aiohttp.ClientError, asyncio.TimeoutError,
+                ResponseTooLarge) as e:
             logger.error(
                 "Error scraping event page %s: %s", url, e)
             return None
@@ -1070,26 +1341,18 @@ class EventFeed:  # pylint: disable=too-few-public-methods,too-many-public-metho
             end_time = event.get('end_date')
             location = event.get('location', '')
 
-            # Make timezone-aware (discord.py 2.7+ requires aware datetimes)
-            if isinstance(start_time, datetime) and \
-               start_time.tzinfo is None:
-                start_time = start_time.replace(
-                    tzinfo=timezone.utc)
-            if end_time and isinstance(end_time, datetime) and \
-               end_time.tzinfo is None:
-                end_time = end_time.replace(
-                    tzinfo=timezone.utc)
+            # Make timezone-aware (discord.py 2.7+ requires aware
+            # datetimes). Zone-less feed times are local wall-clock, so
+            # they get BOT_TIMEZONE — see _localize_naive.
+            start_time = _localize_naive(start_time)
+            end_time = _localize_naive(end_time) if end_time else end_time
             if not isinstance(start_time, datetime):
-                start_time = datetime.combine(
-                    start_time, datetime.min.time())
-                start_time = start_time.replace(
-                    tzinfo=timezone.utc)
+                start_time = _localize_naive(datetime.combine(
+                    start_time, datetime.min.time()))
             if end_time and not isinstance(end_time, datetime):
-                end_time = datetime.combine(
+                end_time = _localize_naive(datetime.combine(
                     end_time,
-                    datetime.max.time().replace(microsecond=0))
-                end_time = end_time.replace(
-                    tzinfo=timezone.utc)
+                    datetime.max.time().replace(microsecond=0)))
             if not end_time:
                 end_time = start_time + timedelta(hours=1)
 
@@ -1209,19 +1472,19 @@ class EventFeed:  # pylint: disable=too-few-public-methods,too-many-public-metho
             if not channel:
                 continue
 
-            try:
-                scheduled = await guild.fetch_scheduled_events()
-            except discord.HTTPException as e:
-                logger.error(
-                    "Announce: error fetching events for %s: %s",
-                    guild.name, e)
-                continue
+            # Cached sequence rather than an API call: this path only
+            # reads for display. The two dedup paths deliberately keep
+            # fetch_scheduled_events() — create_scheduled_event() does
+            # not write to this cache (only the gateway does), so a
+            # just-created event would be briefly missing and get
+            # duplicated.
+            scheduled = guild.scheduled_events
 
             matching = []
             for ev in scheduled:
                 ev_start = ev.start_time
                 if ev_start.tzinfo is None:
-                    ev_start = CENTRAL_TZ.localize(ev_start)
+                    ev_start = ev_start.replace(tzinfo=CENTRAL_TZ)
                 else:
                     ev_start = ev_start.astimezone(CENTRAL_TZ)
                 if predicate(ev_start):
@@ -1233,7 +1496,7 @@ class EventFeed:  # pylint: disable=too-few-public-methods,too-many-public-metho
 
             for ev in matching:
                 await self._post_discord_event_announcement(
-                    channel, ev, title_prefix=title_prefix)
+                    channel, ev, title_prefix)
 
             logger.info(
                 "Announced %d events (%s) for %s",
@@ -1242,11 +1505,8 @@ class EventFeed:  # pylint: disable=too-few-public-methods,too-many-public-metho
     async def announce_weekly_events(self):
         """Announce this week's Discord Events. Runs Mon 10am CT."""
         now = datetime.now(CENTRAL_TZ)
-        ws_naive = (
-            now - timedelta(days=now.weekday())
-        ).replace(hour=0, minute=0, second=0, microsecond=0,
-                  tzinfo=None)
-        ws = CENTRAL_TZ.localize(ws_naive)
+        ws = (now - timedelta(days=now.weekday())).replace(
+            hour=0, minute=0, second=0, microsecond=0)
         we = ws + timedelta(days=7)
         await self._announce_events(
             lambda s: ws <= s < we,
@@ -1261,7 +1521,7 @@ class EventFeed:  # pylint: disable=too-few-public-methods,too-many-public-metho
             "Today",
             "No events today for %s")
 
-    async def reconcile_discord_events(self) -> Dict[str, Any]:
+    async def reconcile_discord_events(self, guild_id: Optional[int] = None) -> Dict[str, Any]:
         """Create Discord Events for any feed entries missing from the
         guild's scheduled-events list.
 
@@ -1279,11 +1539,13 @@ class EventFeed:  # pylint: disable=too-few-public-methods,too-many-public-metho
             'errors': [],
         }
 
-        for guild_id, feeds in self.feeds.items():
-            guild = self.bot.get_guild(guild_id)
+        for gid, feeds in self.feeds.items():
+            if guild_id is not None and gid != guild_id:
+                continue
+            guild = self.bot.get_guild(gid)
             if not guild:
                 results['errors'].append(
-                    f"Guild {guild_id} not found")
+                    f"Guild {gid} not found")
                 continue
 
             try:
@@ -1338,41 +1600,22 @@ class EventFeed:  # pylint: disable=too-few-public-methods,too-many-public-metho
 
     async def _post_discord_event_announcement(self, channel,
                                                scheduled_event,
-                                               title_prefix: str = "This Week"):
+                                               title_prefix="This Week"):
         """Post a single Discord Event announcement with URL preview."""
         try:
-            start = scheduled_event.start_time
-            if start.tzinfo:
-                start = start.astimezone(CENTRAL_TZ)
-
-            date_str = start.strftime("%A, %B %d, %Y")
-            time_str = start.strftime("%I:%M %p %Z")
-
-            embed = discord.Embed(
-                title=f"📢 {title_prefix}: {scheduled_event.name}",
-                color=0xFF6600,
-                description="Don't miss this event!"
-            )
-            embed.add_field(
-                name="📅 Date", value=date_str, inline=True)
-            embed.add_field(
-                name="⏰ Time", value=time_str, inline=True)
-
-            loc = getattr(scheduled_event, 'location', '') or ''
-            if loc and loc != "See event details":
-                embed.add_field(
-                    name="📍 Location",
-                    value=loc, inline=False)
-
-            # Build event URL for preview
+            # Build event URL — Discord auto-unfurls this into its own
+            # native event card, so no custom embed is sent alongside it.
             event_url = (
                 f"https://discord.com/events/"
                 f"{scheduled_event.guild.id}/"
                 f"{scheduled_event.id}")
 
-            # Send URL as content (generates preview) + embed
+            # A one-line heading above the URL rather than an embed:
+            # the unfurled card still renders, but the Monday weekly
+            # preview and the Tue-Sun day-of reminder are no longer
+            # byte-identical posts that read as accidental duplicates.
             await channel.send(
-                content=event_url, embed=embed)
+                content=f"📢 **{title_prefix}**\n{event_url}")
             logger.info(
                 "Announced event '%s' to #%s",
                 scheduled_event.name, channel.name)
@@ -1490,32 +1733,66 @@ def register_all_reminder_jobs():
 
 
 
+def _apply_scope(cmd, *, gate_perms=None):
+    """Common scoping applied to every command and command group.
+
+    - guild_only: this bot is server-only by design — it auto-kicks
+      unsolicited DMs — so no command is offered in DMs, including the
+      bot interaction ones. Discord hides them there, and the three
+      backup commands used to AttributeError in a DM because they
+      dereference interaction.guild unguarded.
+    - guild_install: this is a server moderation bot; nothing should be
+      installable to a user account and invoked outside a guild.
+    - default_permissions: a *hint* Discord uses to hide the command in
+      the picker from members who lack the permission. Server admins can
+      override it in Integrations settings and it is silently ignored on
+      subcommands, so it never replaces the runtime check below — it
+      only stops every member seeing /kick and /server_restore listed.
+    """
+    cmd = app_commands.guild_only()(cmd)
+    cmd = app_commands.guild_install()(cmd)
+    if gate_perms:
+        cmd = app_commands.default_permissions(**gate_perms)(cmd)
+    return cmd
+
+
 def _reg(name, description, handler, *,
          describe=None, mod_only=False, admin_only=False, error=None):
     """Register `handler` as a slash command directly (no wrapper function).
 
     handler must be an `async def` whose first arg is the interaction.
 
-    `mod_only` gates on the invoker's resolved `manage_messages`
+    `mod_only` gates on the invoker's guild-wide `manage_messages`
     permission — the permission that lets someone delete other people's
     messages, used here as the signal for "this is a moderator" rather
-    than a role literally named MODERATOR_ROLE_NAME. Discord resolves
-    this correctly regardless of which role(s) grant it.
+    than a role literally named MODERATOR_ROLE_NAME.
 
-    `admin_only` is stricter: it requires the resolved Administrator
+    `admin_only` is stricter: it requires the guild-wide Administrator
     permission bit, reserved for commands that can rewrite the whole
     guild's structure (server backup/restore).
+
+    Both use _require_guild_permissions rather than app_commands'
+    has_permissions so the gate matches _is_moderator and the bot.py
+    behavioural gates — see that helper for why channel-scoped
+    resolution was wrong here.
     """
     cmd = handler
     if describe:
         cmd = app_commands.describe(**describe)(cmd)
+    gate_perms = None
     if admin_only:
-        cmd = app_commands.checks.has_permissions(administrator=True)(cmd)
+        gate_perms = {'administrator': True}
     elif mod_only:
-        cmd = app_commands.checks.has_permissions(manage_messages=True)(cmd)
+        gate_perms = {'manage_messages': True}
+    if gate_perms:
+        cmd = _require_guild_permissions(**gate_perms)(cmd)
+    cmd = _apply_scope(cmd, gate_perms=gate_perms)
     cmd = tree.command(name=name, description=description)(cmd)
-    if error is not None:
-        cmd.on_error = error
+    # Default rather than leave on_error unset: the tree-wide backstop
+    # bails out when interaction.response.is_done(), which is also true
+    # for a command that merely deferred before raising — so a deferring
+    # command without a handler would spin forever with only a log line.
+    cmd.on_error = error if error is not None else _command_error_handler
     return cmd
 
 
@@ -1557,15 +1834,17 @@ def register_commands():
                    'limit': 'Number of messages to delete'},
          error=purge_last_messages_error)
     _reg('purge_string',
-         'Purges all messages containing a specific string from a channel',
+         'Purges messages containing a specific string from a channel',
          purge_string, mod_only=True,
          describe={'channel': 'Channel to purge messages from',
-                   'search_string': 'String to search for in messages'},
+                   'search_string': 'String to search for in messages',
+                   'limit': 'How many recent messages to scan (default 1000)'},
          error=purge_string_error)
     _reg('purge_webhooks',
-         'Purges all messages sent by webhooks or apps from a channel',
+         'Purges messages sent by webhooks or apps from a channel',
          purge_webhooks, mod_only=True,
-         describe={'channel': 'Channel to purge messages from'},
+         describe={'channel': 'Channel to purge messages from',
+                   'limit': 'How many recent messages to scan (default 1000)'},
          error=purge_webhooks_error)
     _reg('kick', 'Kicks one or more members from the server',
          kick_members, mod_only=True,
@@ -1585,13 +1864,13 @@ def register_commands():
     _reg('timeout', 'Timeouts a member for a specified duration',
          timeout_member, mod_only=True,
          describe={'member': 'Member to timeout',
-                   'duration': 'Timeout duration in seconds',
+                   'duration': 'Timeout duration in seconds (max 28 days)',
                    'reason': 'Reason for timeout'},
          error=timeout_error)
     _reg('log_tail',
          'DM the last specified number of lines of the bot log to the user',
          log_tail_command, mod_only=True,
-         describe={'lines': 'Number of lines to retrieve from the log'},
+         describe={'lines': 'Number of log lines to retrieve (1-200)'},
          error=log_tail_error)
     _reg('add_event_feed',
          'Adds a calendar or RSS feed and its announcement channel',
@@ -1703,7 +1982,7 @@ def register_commands():
          'creates a new backup when the structure actually changed',
          auto_backup_command, admin_only=True,
          describe={'enabled': 'True to enable automatic backups, False to disable',
-                   'interval_hours': 'Hours between backup checks (default 24; only used when enabling)'},
+                   'interval_hours': 'Hours between backup checks, 1-720 (default 24; only used when enabling)'},
          error=auto_backup_error)
 
     register_autoreply_commands()
@@ -1749,16 +2028,11 @@ def setup_commands(bot_param):
     register_commands()
 
 
-class InvalidReminderInterval(Exception):
-    """Exception raised when an invalid reminder interval is provided."""
-
-def validate_reminder_interval(interval: int) -> None:
-    """Validate that reminder interval is reasonable."""
-    if interval < 60:
-        raise InvalidReminderInterval("Interval must be at least 60 seconds")
-
 def create_set_reminder_command():
     """Factory function to create the set_reminder command."""
+    @app_commands.guild_only()
+    @app_commands.guild_install()
+    @app_commands.default_permissions(manage_messages=True)
     @app_commands.command(name='set_reminder', description='Sets a reminder message to be sent to a channel at regular intervals')
     @app_commands.describe(
         channel='Channel to send reminders to',
@@ -1766,38 +2040,26 @@ def create_set_reminder_command():
         message='Message content of the reminder',
         interval='Interval in seconds between reminders (minimum 60)'
     )
-    @app_commands.checks.has_permissions(manage_messages=True)
+    @_require_guild_permissions(manage_messages=True)
     async def set_reminder_command(interaction: discord.Interaction,
                                   channel: discord.TextChannel, title: str,
-                                  message: str, interval: int):
+                                  message: str,
+                                  interval: app_commands.Range[int, 60]):
         """Sets a reminder message to be sent to a channel at regular intervals."""
         await set_reminder_callback(interaction, channel, title, message, interval)
 
-    async def on_error(interaction: discord.Interaction, error):
-        """Handles errors for the set_reminder command."""
-        last_log = get_last_log_line()
-        if isinstance(error, app_commands.errors.MissingPermissions):
-            needed = ', '.join(
-                p.replace('_', ' ').title() for p in error.missing_permissions
-            ) or 'the required permission'
-            await interaction.response.send_message(
-                f'You need the {needed} permission to use this command.\n\nLast log: {last_log}', ephemeral=True)
-        elif isinstance(error, InvalidReminderInterval):
-            await interaction.response.send_message(f'Invalid interval: {error}\n\nLast log: {last_log}', ephemeral=True)
-        elif isinstance(error, discord.HTTPException):
-            logger.error('Discord API error: %s', error)
-            await interaction.response.send_message(f'Discord API error occurred.\n\nLast log: {last_log}', ephemeral=True)
-        else:
-            await interaction.response.send_message(f'Error: {error}\n\nLast log: {last_log}', ephemeral=True)
-    
-    set_reminder_command.on_error = on_error
+    # Routed through the shared handler rather than a local one. The
+    # local version appended "Last log: ..." to *every* branch —
+    # including MissingPermissions, which by definition fires for
+    # someone without manage_messages — re-opening the log leak that
+    # _command_error_handler gates behind _is_moderator.
+    set_reminder_command.on_error = _command_error_handler
     return set_reminder_command
 
 async def set_reminder_callback(interaction: discord.Interaction,
                                channel: discord.TextChannel, title: str,
                                message: str, interval: int):
     """Callback for the set_reminder command."""
-    validate_reminder_interval(interval)
     reminder_data = {
         'channel_id': channel.id,
         'title': title,
@@ -1858,11 +2120,14 @@ async def delete_reminder(interaction: discord.Interaction, title: str) -> None:
         logger.error('Error deleting reminder: %s', e)
         await interaction.response.send_message('Failed to delete reminder due to an error.', ephemeral=True)
 
-async def purge_last_messages(interaction: discord.Interaction, channel: discord.TextChannel, limit: int):
+async def purge_last_messages(interaction: discord.Interaction, channel: discord.TextChannel,
+                              limit: app_commands.Range[int, 1, 1000]):
     """Purges a specified number of messages from a channel."""
     await interaction.response.defer(ephemeral=True)
     try:
-        deleted = await channel.purge(limit=limit)
+        deleted = await channel.purge(
+            limit=limit,
+            reason=f'/purge_last_messages by {interaction.user}')
         await interaction.followup.send(f'Deleted {len(deleted)} message(s)', ephemeral=True)
     except discord.Forbidden:
         await interaction.followup.send('You do not have permission to perform this action.', ephemeral=True)
@@ -1871,29 +2136,50 @@ async def purge_last_messages(interaction: discord.Interaction, channel: discord
         await interaction.followup.send('Discord API error occurred. Please try again later.', ephemeral=True)
 
 purge_last_messages_error = _command_error_handler
-async def purge_string(interaction: discord.Interaction, channel: discord.TextChannel, search_string: str):
-    """Purges all messages containing a specific string from a channel."""
+async def purge_string(interaction: discord.Interaction, channel: discord.TextChannel, search_string: str,
+                       limit: app_commands.Range[int, 1, 10000] = 1000):
+    """Purges messages containing a specific string from a channel.
+
+    `limit` is how many recent messages to *scan*, not how many to
+    delete. channel.purge() defaults to scanning only 100, so without an
+    explicit value this silently ignored anything further back and
+    reported 'Deleted 0 message(s)' as though the string were absent.
+    """
     await interaction.response.defer(ephemeral=True)
     try:
         def check_message(message):
             return search_string in message.content
 
-        deleted = await channel.purge(check=check_message)
-        await interaction.followup.send(f'Deleted {len(deleted)} message(s) containing "{search_string}".', ephemeral=True)
+        deleted = await channel.purge(
+            limit=limit, check=check_message,
+            reason=f'/purge_string by {interaction.user}')
+        await interaction.followup.send(
+            f'Deleted {len(deleted)} message(s) containing "{search_string}" '
+            f'from the last {limit} message(s) in {channel.mention}.',
+            ephemeral=True)
     except (discord.Forbidden, discord.NotFound, discord.HTTPException) as e:
         logger.error('Discord API error: %s', e)
         await interaction.followup.send('A Discord API error occurred.', ephemeral=True)
 
 purge_string_error = _command_error_handler
-async def purge_webhooks(interaction: discord.Interaction, channel: discord.TextChannel):
-    """Purges all messages sent by webhooks or apps from a channel."""
+async def purge_webhooks(interaction: discord.Interaction, channel: discord.TextChannel,
+                         limit: app_commands.Range[int, 1, 10000] = 1000):
+    """Purges messages sent by webhooks or apps from a channel.
+
+    `limit` is the number of recent messages to scan — see purge_string.
+    """
     await interaction.response.defer(ephemeral=True)
     try:
         def check_message(message):
             return message.webhook_id is not None or message.author.bot
 
-        deleted = await channel.purge(check=check_message)
-        await interaction.followup.send(f'Deleted {len(deleted)} message(s) sent by webhooks or apps.', ephemeral=True)
+        deleted = await channel.purge(
+            limit=limit, check=check_message,
+            reason=f'/purge_webhooks by {interaction.user}')
+        await interaction.followup.send(
+            f'Deleted {len(deleted)} message(s) sent by webhooks or apps '
+            f'from the last {limit} message(s) in {channel.mention}.',
+            ephemeral=True)
     except (discord.Forbidden, discord.HTTPException, discord.NotFound) as e:
         logger.error('Discord API error: %s', e)
         await interaction.followup.send('A Discord API error occurred.', ephemeral=True)
@@ -1937,10 +2223,19 @@ async def kick_members(interaction: discord.Interaction, members: str, reason: O
                 if interaction.guild.me and member.top_role >= interaction.guild.me.top_role:
                     failed_kicks.append(f"{member.display_name} (higher role)")
                     continue
-                
-                # Skip the command user
+
+                # Skip the command user. Checked before the rank test
+                # below: your own top role is never strictly below
+                # itself, so self-kicks would otherwise be reported as
+                # "outranks you".
                 if member.id == interaction.user.id:
                     failed_kicks.append(f"{member.display_name} (cannot kick yourself)")
+                    continue
+
+                # Skip members ranked at or above the invoker
+                if not _invoker_outranks(interaction, member):
+                    failed_kicks.append(
+                        f"{member.display_name} (outranks you)")
                     continue
                 
                 await member.kick(reason=f"Kicked by {interaction.user}. Reason: {reason}" if reason else f"Kicked by {interaction.user}")
@@ -2027,7 +2322,22 @@ async def kick_role(interaction: discord.Interaction, role: discord.Role, reason
                 if interaction.guild.me and member.top_role >= interaction.guild.me.top_role:
                     failed_kicks.append(f"{member.display_name} (higher role)")
                     continue
-                
+
+                # Skip the command user — kick_members already did this,
+                # but a role kick could otherwise remove the moderator
+                # who ran it. Ordered before the rank test for the same
+                # reason as in kick_members.
+                if member.id == interaction.user.id:
+                    failed_kicks.append(
+                        f"{member.display_name} (cannot kick yourself)")
+                    continue
+
+                # Skip members ranked at or above the invoker
+                if not _invoker_outranks(interaction, member):
+                    failed_kicks.append(
+                        f"{member.display_name} (outranks you)")
+                    continue
+
                 await member.kick(reason=f"Role kick: {role.name}. {reason}" if reason else f"Role kick: {role.name}")
                 kicked_count += 1
                 logger.info('Kicked member %s for having role %s', member, role.name)
@@ -2073,7 +2383,9 @@ async def botsay_message(interaction: discord.Interaction, channel: discord.Text
         await interaction.response.send_message('A Discord API error occurred.', ephemeral=True)
 
 botsay_error = _command_error_handler
-async def timeout_member(interaction: discord.Interaction, member: discord.Member, duration: int, reason: Optional[str] = None):
+async def timeout_member(interaction: discord.Interaction, member: discord.Member,
+                         duration: app_commands.Range[int, 1, 2419200],
+                         reason: Optional[str] = None):
     """Timeouts a member for a specified duration."""
     try:
         until = discord.utils.utcnow() + timedelta(seconds=duration)
@@ -2084,7 +2396,8 @@ async def timeout_member(interaction: discord.Interaction, member: discord.Membe
         await interaction.response.send_message('A Discord API error occurred.', ephemeral=True)
 
 timeout_error = _command_error_handler
-async def log_tail_command(interaction: discord.Interaction, lines: int):
+async def log_tail_command(interaction: discord.Interaction,
+                           lines: app_commands.Range[int, 1, 200]):
     """DM the last specified number of lines of the bot log to the user."""
     try:
         with open(LOG_FILE, 'r', encoding='utf-8') as log_file:
@@ -2116,9 +2429,9 @@ async def add_event_feed_command(interaction: discord.Interaction,  # pylint: di
             "add_event_feed: name=%s url=%s channel=#%s",
             feed_name, calendar_url, resolved_channel_name)
 
-        if not calendar_url.startswith(('http://', 'https://')):
-            await interaction.followup.send(
-                "Invalid URL format", ephemeral=True)
+        problem = await _validate_fetchable_url(calendar_url)
+        if problem:
+            await interaction.followup.send(problem, ephemeral=True)
             return
 
         # Fetch the URL and auto-detect feed type
@@ -2132,7 +2445,7 @@ async def add_event_feed_command(interaction: discord.Interaction,  # pylint: di
                     response.raise_for_status()
                     content_type = response.headers.get(
                         'content-type', '')
-                    text = await response.text()
+                    text = await _read_capped(response, calendar_url)
 
             # Try iCal first
             try:
@@ -2154,6 +2467,10 @@ async def add_event_feed_command(interaction: discord.Interaction,  # pylint: di
                             ephemeral=True)
                         return
 
+        except ResponseTooLarge as e:
+            await interaction.followup.send(
+                f"That feed is too large to process ({e}).", ephemeral=True)
+            return
         except aiohttp.ClientError as e:
             await interaction.followup.send(
                 f"Error accessing feed: {str(e)}",
@@ -2165,11 +2482,16 @@ async def add_event_feed_command(interaction: discord.Interaction,  # pylint: di
             if guild_id not in event_feed.feeds:
                 event_feed.feeds[guild_id] = {}
 
+            # Preserve posted_events when re-adding a URL already
+            # registered (e.g. to rename it or repoint the channel).
+            # Resetting it made every future event look new and
+            # re-created the lot.
+            existing = event_feed.feeds[guild_id].get(calendar_url, {})
             event_feed.feeds[guild_id][calendar_url] = {
                 'name': feed_name,
                 'last_checked': datetime.now(),
                 'channel': resolved_channel_name,
-                'posted_events': set(),
+                'posted_events': existing.get('posted_events', set()),
                 'feed_type': detected_type,
             }
             event_feed.save_feeds()
@@ -2246,8 +2568,12 @@ async def check_event_feeds_command(interaction: discord.Interaction):
                 ephemeral=True)
             return
 
-        results = await event_feed.check_feeds_job()
-        recon = await event_feed.reconcile_discord_events()
+        # One memo across both passes: reconcile re-parses every feed
+        # by design, and without this every page is scraped twice.
+        async with event_feed.memoized_fetches():
+            results = await event_feed.check_feeds_job(guild_id=guild_id)
+            recon = await event_feed.reconcile_discord_events(
+                guild_id=guild_id)
 
         # Build result message
         parts = [
@@ -2481,7 +2807,8 @@ def cleanup_orphaned_dumps():
         return cleaned_count
 
 async def message_dump_command(interaction: discord.Interaction, user: discord.User, channel: discord.TextChannel,  # pylint: disable=too-many-locals,too-many-branches,too-many-statements,too-many-nested-blocks
-                              start_date: str, limit: int = 1000):
+                              start_date: str,
+                              limit: app_commands.Range[int, 1, 100000] = 1000):
     """Dump a user's messages from a channel into a downloadable file starting from a specific date."""
     try:
         logger.info("Checking for orphaned message dump files/folders...")
@@ -2618,32 +2945,39 @@ async def message_dump_command(interaction: discord.Interaction, user: discord.U
                 # Reset retry count on successful fetch
                 retry_count = 0
                 
-            except discord.HTTPException as e:
-                if "rate limited" in str(e).lower():
-                    retry_delay = base_delay * (2 ** retry_count)
-                    retry_count += 1
-                    logger.warning("Rate limited. Retrying in %s seconds. Retry %s/%s",
-                                  retry_delay, retry_count, max_retries)
-                    
-                    if retry_count <= max_retries:
-                        await interaction.followup.send(
-                            f"Hit Discord rate limit. Waiting {retry_delay} seconds before continuing...",
-                            ephemeral=True
-                        )
-                        await asyncio.sleep(retry_delay)
-                        # Skip the rest of this iteration and retry
-                        continue
-                    
-                    logger.error("Max retries (%s) reached for rate limiting", max_retries)
+            except discord.RateLimited as e:
+                # discord.RateLimited, NOT HTTPException — it derives
+                # from DiscordException and this block used to catch
+                # HTTPException and string-match "rate limited", so it
+                # could never fire. The real 429 escaped to the
+                # catch-all and lost the entire dump.
+                #
+                # Keep whatever this partial batch already collected:
+                # total_processed and newest_message_id have both
+                # advanced past those messages, so dropping
+                # current_batch would silently truncate the archive.
+                messages.extend(current_batch)
+                retry_delay = getattr(e, 'retry_after', None) or (
+                    base_delay * (2 ** retry_count))
+                retry_count += 1
+                logger.warning("Rate limited. Retrying in %.1fs. Retry %s/%s",
+                               retry_delay, retry_count, max_retries)
+
+                if retry_count <= max_retries:
                     await interaction.followup.send(
-                        "Hit Discord rate limit too many times. Try again later or with a smaller limit.",
+                        f"Hit Discord rate limit. Waiting "
+                        f"{retry_delay:.0f} seconds before continuing...",
                         ephemeral=True
                     )
-                    # Break out of the loop entirely
-                    break
-                else:
-                    # Re-raise other HTTP exceptions
-                    raise
+                    await asyncio.sleep(retry_delay)
+                    continue
+
+                logger.error("Max retries (%s) reached for rate limiting", max_retries)
+                await interaction.followup.send(
+                    "Hit Discord rate limit too many times. Try again later or with a smaller limit.",
+                    ephemeral=True
+                )
+                break
             
             # Log the results of this batch
             batch_count = len(current_batch)
@@ -2671,14 +3005,11 @@ async def message_dump_command(interaction: discord.Interaction, user: discord.U
                            total_processed, len(messages))
                 break
             
-            # Add a delay to avoid rate limiting
-            # Use exponential backoff - start with a small delay and increase if we hit rate limits
-            try:
-                await asyncio.sleep(1.0)  # Increased from 0.5 to 1.0 second
-            except asyncio.CancelledError:
-                # Handle cancellation gracefully
-                logger.info("Message fetching was cancelled")
-                break
+            # No unconditional sleep here: discord.py's HTTP layer
+            # already paces requests and sleeps through 429s, and the
+            # RateLimited branch above handles the case it gives up on.
+            # A flat 1s per 100-message batch just made a 1000-message
+            # dump ten seconds slower for no benefit.
         
         # Send a completion message based on whether we reached the limit or ran out of messages
         if total_processed >= limit:
@@ -3646,13 +3977,24 @@ async def voice_chaperone_command(interaction: discord.Interaction, enabled: boo
     """Enable or disable the voice channel chaperone functionality."""
     try:
         config.VOICE_CHAPERONE_ENABLED = enabled
-        
+
+        released = 0
+        if not enabled:
+            # Turning the feature off used to leave anyone it had muted
+            # muted until they next changed voice state — i.e. exactly
+            # when a moderator overrides the safety system to let two
+            # people talk, nothing happened. Release them now.
+            released = await _release_all_chaperone_mutes()
+
         status = "enabled" if enabled else "disabled"
         current_status = "✅ Enabled" if config.VOICE_CHAPERONE_ENABLED else "❌ Disabled"
         
+        released_note = (
+            f'\nReleased {released} outstanding chaperone mute(s).'
+            if released else '')
         await interaction.response.send_message(
             f'Voice channel chaperone functionality has been **{status}**.\n'
-            f'Current status: {current_status}\n\n'
+            f'Current status: {current_status}{released_note}\n\n'
             f'ℹ️ This setting controls whether the bot monitors voice channels for adult/child combinations '
             f'and takes protective action when only one adult and one child are present.',
             ephemeral=True
@@ -3666,6 +4008,30 @@ async def voice_chaperone_command(interaction: discord.Interaction, enabled: boo
             'An error occurred while updating the voice chaperone setting.',
             ephemeral=True
         )
+
+async def _release_all_chaperone_mutes():
+    """Lift every mute the chaperone still holds. Returns the count.
+
+    Lives here rather than in bot.py because the slash command needs it;
+    the actual mute bookkeeping is bot.py's, so this imports it lazily to
+    avoid a circular import at module load.
+    """
+    try:
+        import bot as bot_module  # pylint: disable=cyclic-import
+    except ImportError:
+        return 0
+
+    released = 0
+    for guild in getattr(bot_module.bot, 'guilds', []):
+        for channel in getattr(guild, 'voice_channels', []):
+            for member in list(getattr(channel, 'members', [])):
+                if (guild.id, member.id) in bot_module._chaperone_muted:  # pylint: disable=protected-access
+                    await bot_module._unmute_member(  # pylint: disable=protected-access
+                        member, 'voice chaperone disabled')
+                    released += 1
+    bot_module._chaperone_flagged.clear()  # pylint: disable=protected-access
+    return released
+
 
 voice_chaperone_error = _command_error_handler
 def load_autoreplies():
@@ -3709,20 +4075,23 @@ async def check_message_for_autoreplies(message):
     matched_rule_id = None
     matched_reply = None
 
+    # Lowered once, not once per rule — this runs for every message in
+    # every channel, and the loop previously re-lowered the whole
+    # message body on each iteration.
+    content_lower = message_content.lower()
+
     with autoreplies_lock:
         for rule_id, rule_data in autoreplies.items():
-            # Skip if rule is disabled or for different guild
-            if not rule_data.get('enabled', True) or rule_data.get('guild_id') != guild_id:
+            # Skip if rule is disabled or for a different guild
+            if (not rule_data.get('enabled', True)
+                    or rule_data.get('guild_id') != guild_id):
                 continue
 
             trigger_string = rule_data.get('trigger_string', '')
-            case_sensitive = rule_data.get('case_sensitive', False)
-
-            # Check if message contains the trigger string
-            if case_sensitive:
+            if rule_data.get('case_sensitive', False):
                 contains_trigger = trigger_string in message_content
             else:
-                contains_trigger = trigger_string.lower() in message_content.lower()
+                contains_trigger = trigger_string.lower() in content_lower
 
             if contains_trigger:
                 matched_rule_id = rule_id
@@ -4001,6 +4370,11 @@ def get_command_categories():
             "/voice_chaperone - Enable or disable voice channel chaperone functionality",
             "/dashboard - Display this command dashboard"
         ],
+        "💾 Backup & Restore": [
+            "/server_backup - DM you a full structural backup of this server",
+            "/server_restore - Restore server structure from a backup file",
+            "/auto_backup - Enable/disable automatic backups on an interval"
+        ],
         "💬 Autoreply System": [
             "/autoreply add - Add a new autoreply rule",
             "/autoreply list - List all autoreply rules for this server",
@@ -4009,28 +4383,56 @@ def get_command_categories():
         ]
     }
 
+# Discord rejects any message content over 2000 characters. The full
+# dashboard is ~2.9k, so it has to go out in pieces — it was previously
+# sent as one string and the send raised HTTPException every time,
+# meaning the command never once succeeded.
+DASHBOARD_CHUNK_LIMIT = 1900  # headroom under Discord's 2000-char cap
+
+_DASHBOARD_HEADER = (
+    "# 📊 JohnnyBot Command Dashboard\n"
+    "*All available slash commands organized by category*\n"
+    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+)
+_DASHBOARD_FOOTER = (
+    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    "*Full command documentation: "
+    "<https://github.com/BurbSec/JohnnyBot/wiki/Commands-Reference>*"
+)
+
+
+def _format_dashboard_sections():
+    """One formatted block per category, header first and footer last."""
+    sections = [_DASHBOARD_HEADER]
+    for category, command_lines in get_command_categories().items():
+        body = ''.join(f"• {line}\n" for line in command_lines)
+        sections.append(f"## {category}\n{body}\n")
+    sections.append(_DASHBOARD_FOOTER)
+    return sections
+
+
+def format_dashboard_messages():
+    """Split the dashboard into Discord-sized chunks on category
+    boundaries, so no category is ever cut in half."""
+    messages = []
+    current = ''
+    for section in _format_dashboard_sections():
+        if current and len(current) + len(section) > DASHBOARD_CHUNK_LIMIT:
+            messages.append(current)
+            current = ''
+        current += section
+    if current:
+        messages.append(current)
+    return messages
+
+
 def format_dashboard_message():
-    """Format the dashboard message with all commands grouped by category."""
-    categories = get_command_categories()
-    
-    message_parts = [
-        "# 📊 JohnnyBot Command Dashboard\n",
-        "*All available slash commands organized by category*\n",
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-    ]
-    
-    for category, commands in categories.items():
-        message_parts.append(f"## {category}\n")
-        for command in commands:
-            message_parts.append(f"• {command}\n")
-        message_parts.append("\n")
-    
-    message_parts.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
-    message_parts.append(
-        "*Full command documentation: "
-        "<https://github.com/BurbSec/JohnnyBot/wiki/Commands-Reference>*")
-    
-    return ''.join(message_parts)
+    """The whole dashboard as one string.
+
+    Kept for callers that just want the text; anything sending it to
+    Discord must use format_dashboard_messages() instead, since this
+    exceeds the 2000-character message limit."""
+    return ''.join(_format_dashboard_sections())
 
 async def dashboard_command(interaction: discord.Interaction):
     """Display the command dashboard with confirmation."""
@@ -4075,14 +4477,13 @@ async def dashboard_command(interaction: discord.Interaction):
                 ephemeral=True
             )
             
-            # Format and send the dashboard
-            dashboard_message = format_dashboard_message()
-            
-            # Post to the channel (not ephemeral)
-            await interaction.channel.send(dashboard_message)
+            # Post to the channel (not ephemeral), one chunk per message
+            for chunk in format_dashboard_messages():
+                await interaction.channel.send(chunk)
             
             logger.info('Dashboard posted by %s in channel %s',
-                       interaction.user, interaction.channel.name if hasattr(interaction.channel, 'name') else 'DM')
+                       interaction.user,
+                       getattr(interaction.channel, 'name', 'unknown'))
             
     except discord.Forbidden:
         # The confirmation branch above may have already used the
@@ -4119,10 +4520,27 @@ _DANGEROUS_PERM_MASK = discord.Permissions(
 def _serialize_overwrites(overwrites):
     """Serialize permission overwrites. Member-targeted overwrites are
     skipped — a restore target's membership rarely matches the source
-    server's, so replaying them would silently apply the wrong grants."""
+    server's, so replaying them would silently apply the wrong grants.
+
+    Roles are keyed by name because ids don't survive a cross-server
+    clone. Discord permits duplicate role names, and a duplicate would
+    resolve to an arbitrary one of them on restore, so those are dropped
+    rather than guessed at."""
+    seen = {}
+    for target in overwrites:
+        if isinstance(target, discord.Role):
+            seen[target.name] = seen.get(target.name, 0) + 1
+    ambiguous = {name for name, n in seen.items() if n > 1}
+    if ambiguous:
+        logger.warning(
+            'Skipping overwrites for duplicated role name(s): %s',
+            ', '.join(sorted(ambiguous)))
+
     entries = []
     for target, overwrite in overwrites.items():
         if not isinstance(target, discord.Role):
+            continue
+        if target.name in ambiguous:
             continue
         allow, deny = overwrite.pair()
         entries.append({
@@ -4202,6 +4620,14 @@ def _save_backup_file(guild, data, tag='backup'):
     return path
 
 
+async def _save_backup_file_async(guild, data, tag='backup'):
+    """Off-loop variant. A whole-guild backup is a sizeable JSON dump,
+    and serialising plus writing it inline stalls every other command
+    and event handler for the duration — the reminder paths already use
+    asyncio.to_thread for the same reason."""
+    return await asyncio.to_thread(_save_backup_file, guild, data, tag)
+
+
 def _role_differs(role, data):
     return (role.permissions.value != data['permissions']
             or role.colour.value != data['color']
@@ -4224,7 +4650,13 @@ def _diff_backup(guild, data):
         cur = existing_roles.get(r['name'])
         if cur is None:
             plan['roles_create'].append(r['name'])
-        elif _role_differs(cur, r):
+        # Compare against the *masked* permissions, the same way
+        # _apply_backup does. Comparing raw values listed roles as
+        # "to update" whose only difference was a moderation bit that
+        # restore then correctly refused to apply — so the preview the
+        # admin approved overstated what would happen.
+        elif _role_differs(cur, {**r, 'permissions':
+                                 r['permissions'] & ~_DANGEROUS_PERM_MASK}):
             plan['roles_update'].append(r['name'])
 
     existing_category_names = {c.name for c in guild.categories}
@@ -4465,7 +4897,21 @@ async def _apply_backup(guild, data):  # pylint: disable=too-many-branches,too-m
                         if resp.status != 200:
                             counts['failed'] += 1
                             continue
-                        image_bytes = await resp.read()
+                        declared = resp.content_length
+                        if declared is not None and declared > MAX_EMOJI_BYTES:
+                            counts['failed'] += 1
+                            logger.warning(
+                                'Emoji %s is %d bytes, over the %d cap',
+                                e['name'], declared, MAX_EMOJI_BYTES)
+                            continue
+                        image_bytes = await resp.content.read(
+                            MAX_EMOJI_BYTES + 1)
+                        if len(image_bytes) > MAX_EMOJI_BYTES:
+                            counts['failed'] += 1
+                            logger.warning(
+                                'Emoji %s exceeded the %d byte cap',
+                                e['name'], MAX_EMOJI_BYTES)
+                            continue
                     await guild.create_custom_emoji(name=e['name'], image=image_bytes)
                     counts['emojis_created'] += 1
                 except (discord.Forbidden, discord.HTTPException, aiohttp.ClientError) as ex:
@@ -4516,8 +4962,9 @@ async def server_backup_command(interaction: discord.Interaction):
     try:
         await interaction.response.defer(ephemeral=True)
         data = build_backup_dict(interaction.guild)
-        path = _save_backup_file(interaction.guild, data)
+        path = await _save_backup_file_async(interaction.guild, data)
         try:
+            note_bot_dm(interaction.user.id)
             await interaction.user.send(
                 f'Backup of **{interaction.guild.name}** taken at {data["created_at"]}.',
                 file=discord.File(path))
@@ -4548,6 +4995,13 @@ async def server_restore_command(interaction: discord.Interaction, backup_file: 
         if not backup_file.filename.endswith('.json'):
             await interaction.followup.send(
                 'Please attach a .json backup file produced by /server_backup.',
+                ephemeral=True)
+            return
+
+        if backup_file.size > MAX_BACKUP_BYTES:
+            await interaction.followup.send(
+                f'That file is {backup_file.size / 1024 / 1024:.1f} MB; '
+                f'the limit is {MAX_BACKUP_BYTES // (1024 * 1024)} MB.',
                 ephemeral=True)
             return
 
@@ -4602,8 +5056,10 @@ async def server_restore_command(interaction: discord.Interaction, backup_file: 
             return
 
         pre_restore_data = build_backup_dict(interaction.guild)
-        pre_path = _save_backup_file(interaction.guild, pre_restore_data, tag='pre_restore')
+        pre_path = await _save_backup_file_async(
+            interaction.guild, pre_restore_data, tag='pre_restore')
         try:
+            note_bot_dm(interaction.user.id)
             await interaction.user.send(
                 'Safety snapshot taken automatically before your /server_restore. '
                 'This records the prior names/permissions/overwrites so you can '
@@ -4736,7 +5192,8 @@ async def _run_auto_backup(guild_id: int):
     data = build_backup_dict(guild)
     new_hash = _backup_content_hash(data)
     changed = new_hash != cfg.get('last_hash')
-    path = _save_backup_file(guild, data, tag='auto') if changed else None
+    path = (await _save_backup_file_async(guild, data, tag='auto')
+            if changed else None)
 
     with auto_backup_lock:
         # Always persisted, even on a no-delta run, so a restart schedules
@@ -4772,7 +5229,9 @@ async def _run_auto_backup(guild_id: int):
 
 
 async def auto_backup_command(interaction: discord.Interaction, enabled: bool,
-                              interval_hours: int = 24):
+                              interval_hours: app_commands.Range[
+                                  int, AUTO_BACKUP_MIN_HOURS,
+                                  AUTO_BACKUP_MAX_HOURS] = 24):
     """Enable/disable automatic backups for this server on an interval."""
     try:
         await interaction.response.defer(ephemeral=True)
@@ -4791,17 +5250,6 @@ async def auto_backup_command(interaction: discord.Interaction, enabled: bool,
             msg = ('Automatic backups disabled for this server.' if had_config
                    else 'Automatic backups were not enabled for this server.')
             await interaction.followup.send(msg, ephemeral=True)
-            return
-
-        if interval_hours < AUTO_BACKUP_MIN_HOURS:
-            await interaction.followup.send(
-                f'Interval must be at least {AUTO_BACKUP_MIN_HOURS} hour(s).',
-                ephemeral=True)
-            return
-        if interval_hours > AUTO_BACKUP_MAX_HOURS:
-            await interaction.followup.send(
-                f'Interval must be {AUTO_BACKUP_MAX_HOURS} hours or less.',
-                ephemeral=True)
             return
 
         with auto_backup_lock:
@@ -4837,6 +5285,9 @@ def register_autoreply_commands():
 
     # Create autoreply command group
     autoreply_group = app_commands.Group(name='autoreply', description='Manage automatic reply rules')
+    # default_permissions is ignored on subcommands by Discord, so the
+    # hint has to live on the group itself.
+    _apply_scope(autoreply_group, gate_perms={'manage_messages': True})
 
     @autoreply_group.command(name='add', description='Add a new autoreply rule')
     @app_commands.describe(
@@ -4844,7 +5295,7 @@ def register_autoreply_commands():
         reply='The message to send when the trigger is found',
         case_sensitive='Whether the trigger matching should be case sensitive (default: False)'
     )
-    @app_commands.checks.has_permissions(manage_messages=True)
+    @_require_guild_permissions(manage_messages=True)
     async def _autoreply_add(interaction: discord.Interaction, trigger: str, reply: str, case_sensitive: bool = False):
         await autoreply_add_command(interaction, trigger, reply, case_sensitive)
 
@@ -4854,13 +5305,13 @@ def register_autoreply_commands():
 
     @autoreply_group.command(name='remove', description='Remove an autoreply rule')
     @app_commands.describe(rule_id='The ID of the autoreply rule to remove')
-    @app_commands.checks.has_permissions(manage_messages=True)
+    @_require_guild_permissions(manage_messages=True)
     async def _autoreply_remove(interaction: discord.Interaction, rule_id: str):
         await autoreply_remove_command(interaction, rule_id)
 
     @autoreply_group.command(name='toggle', description='Enable or disable an autoreply rule')
     @app_commands.describe(rule_id='The ID of the autoreply rule to toggle')
-    @app_commands.checks.has_permissions(manage_messages=True)
+    @_require_guild_permissions(manage_messages=True)
     async def _autoreply_toggle(interaction: discord.Interaction, rule_id: str):
         await autoreply_toggle_command(interaction, rule_id)
 

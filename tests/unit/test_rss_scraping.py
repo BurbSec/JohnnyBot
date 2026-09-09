@@ -6,15 +6,35 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+import commands
 from commands import EventFeed
+
+
+@pytest.fixture(autouse=True)
+def _allow_test_urls(monkeypatch):
+    """Bypass the SSRF/DNS guard. These tests exercise JSON-LD
+    extraction, not URL policy, and use unresolvable placeholder hosts —
+    resolving them would make the suite depend on DNS."""
+    async def _ok(_url):
+        return None
+    monkeypatch.setattr(commands, '_validate_fetchable_url', _ok)
 
 
 def _async_response(status=200, text=''):
     """Build a mock that supports `async with session.get(url) as response`."""
+    body = text.encode()
     response = MagicMock()
     response.status = status
     response.text = AsyncMock(return_value=text)
     response.raise_for_status = MagicMock()
+    # _read_capped streams rather than calling .text(), so model that.
+    response.content_length = len(body)
+    response.charset = 'utf-8'
+
+    async def _iter_chunked(_size):
+        yield body
+    response.content = MagicMock()
+    response.content.iter_chunked = _iter_chunked
 
     cm = MagicMock()
     cm.__aenter__ = AsyncMock(return_value=response)

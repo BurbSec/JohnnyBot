@@ -140,7 +140,9 @@ Update checking is configured in `config.py` (not via slash command): `UPDATE_CH
 
 ## Requirements
 
-- **Python 3.11+** (tested on 3.11 and 3.12 in CI)
+- **Python 3.11+** — tested on 3.11, 3.12, 3.13 and 3.14 in CI.
+  The dependencies themselves require 3.10+, but 3.10 reaches
+  end-of-life in October 2026, so 3.11 is the supported floor.
 - **Dependencies:** Listed in [`requirements.txt`](requirements.txt)
 
 ## Contributing

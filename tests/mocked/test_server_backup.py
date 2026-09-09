@@ -96,14 +96,12 @@ def test_reg_mod_only_gates_on_manage_messages_permission_not_role():
     assert checks, 'mod_only=True must attach a permission check to the command'
     check = checks[0]
 
-    inter = MagicMock()
-    inter.permissions = discord.Permissions(manage_messages=False, administrator=False)
     with pytest.raises(discord.app_commands.errors.MissingPermissions):
-        check(inter)
+        check(_gate_interaction(manage_messages=False, administrator=False))
 
     # manage_messages alone is enough — Administrator should not be required.
-    inter.permissions = discord.Permissions(manage_messages=True, administrator=False)
-    assert check(inter) is True
+    assert check(_gate_interaction(
+        manage_messages=True, administrator=False)) is True
 
 
 def test_reg_admin_only_gates_on_administrator_permission_only():
@@ -121,13 +119,11 @@ def test_reg_admin_only_gates_on_administrator_permission_only():
     assert checks, 'admin_only=True must attach a permission check to the command'
     check = checks[0]
 
-    inter = MagicMock()
-    inter.permissions = discord.Permissions(manage_messages=True, administrator=False)
     with pytest.raises(discord.app_commands.errors.MissingPermissions):
-        check(inter)
+        check(_gate_interaction(manage_messages=True, administrator=False))
 
-    inter.permissions = discord.Permissions(administrator=True)
-    assert check(inter) is True
+    assert check(_gate_interaction(
+        manage_messages=False, administrator=True)) is True
 
 
 def test_reg_admin_only_takes_precedence_over_mod_only():
@@ -576,16 +572,66 @@ async def test_auto_backup_command_disable_removes_config(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_auto_backup_command_rejects_too_small_interval(monkeypatch):
-    monkeypatch.setattr(commands, 'auto_backup_lock', threading.Lock())
-    monkeypatch.setattr(commands, 'scheduler', None)
+async def test_auto_backup_interval_bounds_are_enforced_by_the_schema():
+    """The runtime min/max branches were replaced by app_commands.Range,
+    so Discord rejects an out-of-range interval before the interaction
+    exists. Assert the annotation carries the bounds."""
+    import typing
+    rng = typing.get_type_hints(
+        commands.auto_backup_command, include_extras=True)['interval_hours']
+    assert rng.min_value == commands.AUTO_BACKUP_MIN_HOURS
+    assert rng.max_value == commands.AUTO_BACKUP_MAX_HOURS
+
+
+def _gate_interaction(*, manage_messages=False, administrator=False,
+                      channel_grant=False):
+    """An interaction whose invoker has the given *guild-wide* perms.
+
+    `channel_grant` additionally grants manage_messages at the channel
+    level only (Interaction.permissions), which is what app_commands'
+    has_permissions used to read — the escalation path B7 closed.
+    """
     inter = MagicMock()
-    inter.guild.id = 8
-    inter.response.defer = AsyncMock()
-    inter.followup.send = AsyncMock()
+    inter.user.id = 7
+    member = MagicMock()
+    member.guild_permissions = discord.Permissions(
+        manage_messages=manage_messages, administrator=administrator)
+    inter.guild.get_member.return_value = member
+    inter.permissions = discord.Permissions(
+        manage_messages=manage_messages or channel_grant,
+        administrator=administrator)
+    return inter
 
-    await commands.auto_backup_command(inter, enabled=True, interval_hours=0)
 
-    msg = inter.followup.send.call_args.args[0]
-    assert 'at least' in msg.lower()
-    assert 8 not in commands.auto_backup_configs
+def _mod_gate_check():
+    prev_tree = commands.tree
+    commands.tree = _FakeTree()
+    try:
+        cmd = commands._reg(  # pylint: disable=protected-access
+            'fake_gate_cmd', 'desc', lambda interaction: None, mod_only=True)
+    finally:
+        commands.tree = prev_tree
+    return getattr(cmd, '__discord_app_commands_checks__', [])[0]
+
+
+def test_mod_gate_ignores_a_channel_only_permission_overwrite():
+    """B7: a member granted manage_messages by a channel overwrite must
+    not be able to run moderator commands from that channel. The old
+    has_permissions check read Interaction.permissions and let them."""
+    check = _mod_gate_check()
+    inter = _gate_interaction(manage_messages=False, channel_grant=True)
+
+    # The channel-scoped view says yes...
+    assert inter.permissions.manage_messages is True
+    # ...but the guild-wide gate says no.
+    with pytest.raises(discord.app_commands.errors.MissingPermissions):
+        check(inter)
+
+
+def test_mod_gate_denies_when_membership_cannot_be_resolved():
+    """Fails closed rather than permitting an unresolvable invoker."""
+    check = _mod_gate_check()
+    inter = MagicMock()
+    inter.guild = None
+    with pytest.raises(discord.app_commands.errors.MissingPermissions):
+        check(inter)
