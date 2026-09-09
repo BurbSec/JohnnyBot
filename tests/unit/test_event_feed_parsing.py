@@ -146,7 +146,7 @@ def test_parse_calendar_assigns_composite_uid(sample_calendar):
 
 # ── _cleanup_old_posted_events ──
 
-def test_cleanup_keeps_recent_drops_old(tmp_path, monkeypatch):
+def test_cleanup_keeps_recent_and_legacy_drops_old(tmp_path, monkeypatch):
     # Build an EventFeed without invoking __init__'s file I/O
     ef = EventFeed.__new__(EventFeed)
     import threading
@@ -167,10 +167,13 @@ def test_cleanup_keeps_recent_drops_old(tmp_path, monkeypatch):
 
     ef._cleanup_old_posted_events()
     remaining = ef.feeds[1]['http://x']['posted_events']
-    # Recent should survive; old + legacy should be cleaned
+    # Recent survives; genuinely-old composite uids are cleaned.
     assert any(u.startswith('uid1|') for u in remaining)
     assert not any(u.startswith('uid2|') for u in remaining)
-    assert 'uid3-legacy' not in remaining
+    # B11: a legacy dateless uid is *kept*. Dropping it did not cause a
+    # re-check — the re-check looks for "uid|date", never matches, and
+    # re-creates an event that was already posted.
+    assert 'uid3-legacy' in remaining
 
 
 # ── _parse_jsonld_event ──
