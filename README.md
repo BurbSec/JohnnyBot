@@ -3,11 +3,12 @@
 JohnnyBot does all of the stuff Discord bizarrely won't let you do!
 Designed to automate tons of server management and enforce some rules while
 you're at it. It provides features such as mass role management, message
-moderation, permissions cloning, and event feed integration to ensure a smooth
-server experience. Most moderation commands require the "Manage Messages"
-permission (no role to create or name — works on any server out of the
-box); server backup and restore commands require the stricter
-Administrator permission. PetBot commands can be leveraged by all users.
+moderation, permissions cloning, event feed integration, and an automatic
+anti-raid suite to ensure a smooth server experience. Most moderation
+commands require the "Manage Messages" permission (no role to create or
+name — works on any server out of the box); server backup and restore
+commands require the stricter Administrator permission. PetBot commands
+can be leveraged by all users.
 
 ## Documentation
 
@@ -17,6 +18,7 @@ Administrator permission. PetBot commands can be leveraged by all users.
 - **[Wiki Home](../../wiki/Home)** - Project overview and features
 - **[Setup Guide](../../wiki/Setup-Guide)** - Complete installation and configuration
 - **[Commands Reference](../../wiki/Commands-Reference)** - All available commands with examples
+- **[Safety Systems](../../wiki/Safety-Systems)** - Raid protection, anti-nuke, and spam filtering in depth
 
 ## Automatic Behavior
 
@@ -25,6 +27,11 @@ These run without being invoked, so they are worth knowing about before you depl
 - **DMs to the bot get you kicked.** Anyone who sends the bot a direct message is removed from every server they share with it, and the kick is reported to the moderators channel. Two exemptions: users with the Manage Messages permission, and anyone the bot itself DMed in the last 24 hours — so replying to a `/message_dump` archive or `/log_tail` output is safe.
 - **Protected channels are enforced.** Messages posted by anyone without Manage Messages in any channel listed in `PROTECTED_CHANNELS` are deleted.
 - **Voice channel chaperone.** When a voice channel contains exactly one adult and one child (by `ADULT_ROLE_NAMES` / `CHILD_ROLE_NAMES`), everyone in it is server-muted and the moderators channel is alerted once. The mute lifts automatically when the channel is no longer one adult and one child, when a muted member moves to a safe channel, or when the feature is disabled — including across a bot restart, since outstanding mutes are persisted to `chaperone_mutes.json`. Only mutes the bot applied are lifted; a manual moderator mute is never undone. Toggle with `/voice_chaperone`.
+- **Raid protection.** A burst of joins (default 6 within 30s) pauses invites and DMs between members for an hour using Discord's own self-expiring incident actions, and alerts moderators. The pause lifts itself — no cleanup needed, even if the bot restarts. The alert includes an avatar-cluster breakdown ("12 of 14 share one image"), since bulk-created raid accounts reuse profile pictures. Toggle with `/raid protection`.
+- **Anti-nuke.** Watches the audit log for a compromised moderator account or rogue integration: 3+ destructive actions (channel/role deletes, kicks, bans, webhook creation) in 60s, a member prune, or any grant of a dangerous permission. By default it strips the offending account's roles *and reverts the permission change itself*, then alerts. Reversible via `/assign_role` if it's a false alarm. Toggle with `/nuke_protection`.
+- **Message spam protection.** Deletes and times out for the same link posted in 2+ channels within 30s, or 3+ mentions in one message. Offenders whose account is under 2 days old are kicked instead. Link detection is behavioral rather than a domain blocklist, so it catches brand-new scam domains with nothing to maintain. Toggle with `/spam_protection`.
+
+Each of these can be turned off at runtime. Moderators are exempt from spam protection and from `/raid kick_recent` — but **deliberately not from anti-nuke**, since a compromised moderator account is exactly what it exists to catch. See the **[Safety Systems](../../wiki/Safety-Systems)** wiki page for thresholds, tuning, and the required bot permissions (**Manage Server**, **Moderate Members**, **Kick Members**, **Manage Roles**).
 
 ## Key Features
 
@@ -40,6 +47,20 @@ These run without being invoked, so they are worth knowing about before you depl
 | `/timeout` | Timeout a member for a specified duration | Mod |
 | `/botsay` | Make the bot send a message to a specified channel | Mod |
 | `/message_dump` | Dump a user's messages from a channel into a zipped archive DM'd to you (25 MB cap) | Mod |
+
+### Safety & Anti-Raid
+
+| Command | Description | Access |
+|---|---|---|
+| `/raid status` | Show raid-protection settings, current lockdown state, and joins in the current window | Mod |
+| `/raid protection` | Enable/disable automatic join-burst detection | Mod |
+| `/raid lockdown` | Manually pause (or lift a pause on) invites and DMs, independent of auto-detection | Mod |
+| `/raid recent_joins` | List members who joined recently, flagging new accounts and grouping them by identical avatar | Mod |
+| `/raid kick_recent` | Kick recently-joined new accounts — dry run by default, so you preview before anything irreversible | Mod |
+| `/nuke_protection` | Enable/disable audit-log monitoring for a compromised moderator account | Mod |
+| `/spam_protection` | Enable/disable cross-channel link spam and mass-mention filtering | Mod |
+
+These need the bot to hold **Manage Server** (pausing invites/DMs), **Moderate Members** (timeouts), and **Kick Members**. Without them the detection still fires and alerts, but the automatic response is reported as blocked rather than applied.
 
 ### Permissions Management
 
@@ -103,6 +124,8 @@ Once a feed is added, everything else is automatic: feeds are re-checked every M
 | Command | Description | Access |
 |---|---|---|
 | `/voice_chaperone` | Enable/disable automatic voice channel safety monitoring (when only 1 adult + 1 child are in a channel, everyone present is server-muted and mods are alerted; the mute lifts automatically once the channel is no longer 1 adult + 1 child) | Mod |
+| `/nuke_protection` | Enable/disable anti-nuke audit-log monitoring | Mod |
+| `/spam_protection` | Enable/disable message spam protection | Mod |
 | `/log_tail` | DM the last N lines of the bot log to yourself | Mod |
 | `/dashboard` | Display all available commands grouped by category | All |
 
