@@ -4,7 +4,8 @@ import os
 import sys
 import asyncio
 import logging
-from datetime import datetime, timedelta
+from collections import deque
+from datetime import datetime, timedelta, timezone
 
 from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.triggers.cron import CronTrigger
@@ -315,6 +316,10 @@ intents.message_content = True
 intents.guilds = True
 intents.members = True
 intents.voice_states = True
+# Non-privileged; enables on_audit_log_entry_create for anti-nuke
+# protection. Already on via Intents.default(), set explicitly for
+# clarity alongside the other intents here.
+intents.moderation = True
 
 bot = commands.Bot(command_prefix='!', intents=intents)
 
@@ -824,6 +829,382 @@ async def check_voice_channel_safety(channel):  # pylint: disable=too-many-branc
 
     except discord.HTTPException as e:
         logger.error('Failed to send alert to moderators channel: %s', e)
+
+# Raid protection
+# ---------------------------------------------------------------------------
+# Timestamps of recent joins per guild, used only to detect a burst.
+# Not persisted: a restart simply resets the window, same tradeoff as
+# _chaperone_flagged. Config is read with getattr() everywhere here
+# because config.py is gitignored and a deployed instance may predate
+# these settings (see check_for_updates' config_changed handling).
+_raid_join_times = {}
+
+def _raid_lockdown_active(guild):
+    """True if this guild currently has an unexpired invites pause.
+
+    Reads Discord's own incident state (`invites_paused_until`) rather
+    than tracking our own flag, so this is correct across restarts and
+    also reflects a lockdown a moderator applied by hand in the UI.
+    """
+    until = getattr(guild, 'invites_paused_until', None)
+    return until is not None and until > datetime.now(timezone.utc)
+
+async def _apply_raid_lockdown(guild, join_count, window_seconds):
+    """Pause invites and DMs (Discord's self-expiring incident actions)
+    and alert moderators. No-ops if a lockdown is already active so a
+    continuing burst doesn't re-alert on every join."""
+    if _raid_lockdown_active(guild):
+        return
+
+    minutes = getattr(config, 'RAID_LOCKDOWN_MINUTES', 60)
+    until = datetime.now(timezone.utc) + timedelta(minutes=minutes)
+
+    edited = True
+    try:
+        await guild.edit(
+            invites_disabled_until=until,
+            dms_disabled_until=until,
+            reason=(f'Raid protection: {join_count} joins in '
+                    f'{window_seconds}s'))
+    except discord.Forbidden:
+        edited = False
+        logger.error(
+            'Raid protection triggered in %s but the bot lacks '
+            'Manage Server to pause invites/DMs', guild.name)
+    except discord.HTTPException as e:
+        edited = False
+        logger.error('Raid protection: failed to edit guild %s: %s',
+                     guild.name, e)
+
+    logger.warning(
+        'ALERT: raid protection triggered in %s (%d joins in %ds)',
+        guild.name, join_count, window_seconds)
+
+    moderators_channel = discord.utils.get(
+        guild.text_channels, name=MODERATORS_CHANNEL_NAME)
+    if not moderators_channel:
+        logger.error('Moderators channel "%s" not found in %s',
+                     MODERATORS_CHANNEL_NAME, guild.name)
+        return
+
+    if edited:
+        body = (
+            f"🚨 **RAID PROTECTION TRIGGERED**\n\n"
+            f"**{join_count}** members joined within **{window_seconds}s**. "
+            f"Invites and DMs between members have been paused for "
+            f"**{minutes} minute(s)** (auto-lifts, or run "
+            f"`/raid lockdown enabled:False` to lift early).\n\n"
+            f"Use `/raid recent_joins` to review who joined, or "
+            f"`/raid kick_recent` to remove suspicious new accounts.")
+    else:
+        body = (
+            f"🚨 **RAID DETECTED** ({join_count} joins in "
+            f"{window_seconds}s) — **could not pause invites/DMs**, "
+            f"the bot needs the **Manage Server** permission. "
+            f"Review with `/raid recent_joins` and act manually.")
+    try:
+        await moderators_channel.send(body)
+    except (discord.HTTPException, discord.Forbidden) as e:
+        logger.error('Failed to send raid alert to moderators: %s', e)
+
+@bot.event
+async def on_member_join(member):
+    """Track join bursts and trigger raid protection past the threshold.
+
+    Unlike the voice chaperone and DM-kick gates, bot accounts are not
+    exempted here — bulk-joining bot accounts are a common raid vector.
+    """
+    if not getattr(config, 'RAID_PROTECTION_ENABLED', True):
+        return
+
+    guild = member.guild
+    window = getattr(config, 'RAID_JOIN_WINDOW_SECONDS', 30)
+    threshold = getattr(config, 'RAID_JOIN_THRESHOLD', 6)
+
+    now = datetime.now(timezone.utc).timestamp()
+    times = _raid_join_times.setdefault(guild.id, deque())
+    times.append(now)
+    while times and now - times[0] > window:
+        times.popleft()
+
+    if len(times) >= threshold:
+        await _apply_raid_lockdown(guild, len(times), window)
+
+# Anti-nuke protection
+# ---------------------------------------------------------------------------
+# Defends against a compromised moderator/admin account (or a rogue
+# integration) acting straight against the Discord API — raid protection
+# above only sees join events, not this. Driven by the audit-log gateway
+# event rather than polling, so it fires in near-real-time per entry.
+# State is in-memory only, same tradeoff as _raid_join_times: a restart
+# resets the window, which is acceptable for a burst detector.
+_nuke_actions = {}  # (guild_id, actor_id) -> deque[float] of action times
+
+# Destructive actions counted toward the burst threshold. Permission
+# escalation (role_update / member_role_update granting a dangerous
+# permission) is checked separately below, on every occurrence, since one
+# occurrence of that is already the attack.
+_NUKE_BURST_ACTIONS = {
+    discord.AuditLogAction.channel_delete,
+    discord.AuditLogAction.role_delete,
+    discord.AuditLogAction.kick,
+    discord.AuditLogAction.ban,
+    discord.AuditLogAction.webhook_create,
+}
+
+# A prune can remove hundreds of members in ONE audit-log entry, so it
+# never accumulates toward a burst threshold — it fires on its own.
+_NUKE_SINGLE_ACTIONS = {discord.AuditLogAction.member_prune}
+
+_NUKE_DANGEROUS_PERMS = (
+    'administrator', 'manage_guild', 'manage_roles',
+    'manage_channels', 'ban_members', 'kick_members',
+)
+
+def _check_permission_escalation(entry, actor_perms=None):
+    """Detect a dangerous permission being granted.
+
+    Returns (description, privileged_roles_added) — the roles list is
+    populated for member_role_update so the caller can undo the grant —
+    or None when nothing escalated.
+
+    Covers the two ways a role ends up with real power: editing the
+    role's own permission bits (role_update), or assigning a member a
+    role that already carries one (member_role_update).
+
+    `actor_perms` suppresses the *routine administration* case: granting
+    a permission the actor already holds is not an escalation, because
+    you cannot escalate to something you already have. A real admin
+    setting up a Moderator role with kick_members is normal work and must
+    not lock them out of their own server. The classic attack — a
+    manage_roles holder granting administrator to themselves or an alt —
+    still fires, because the actor lacked administrator. An actor who
+    already has administrator and turns destructive is caught by the
+    burst path instead.
+    """
+    def _is_escalation(perm_names):
+        if actor_perms is None:
+            return list(perm_names)
+        return [p for p in perm_names if not getattr(actor_perms, p, False)]
+
+    if entry.action is discord.AuditLogAction.role_update:
+        after_perms = getattr(entry.after, 'permissions', None)
+        if after_perms is None:
+            return None
+        before_perms = getattr(entry.before, 'permissions', None)
+        before_set = {p for p, v in before_perms if v} if before_perms else set()
+        granted = _is_escalation(
+            p for p, v in after_perms
+            if v and p in _NUKE_DANGEROUS_PERMS and p not in before_set)
+        if granted:
+            return (f"role **{entry.target}** was granted: "
+                   f"{', '.join(sorted(granted))}", [])
+        return None
+
+    if entry.action is discord.AuditLogAction.member_role_update:
+        for role in getattr(entry.after, 'roles', []):
+            perms = getattr(role, 'permissions', None)
+            if perms is None:
+                continue
+            granted = _is_escalation(
+                p for p in _NUKE_DANGEROUS_PERMS if getattr(perms, p, False))
+            if granted:
+                return (f"**{entry.target}** was assigned role "
+                       f"**{role}**, which carries: {', '.join(granted)}",
+                       [role])
+        return None
+
+    return None
+
+def _resolve_role(guild, target):
+    """A live Role for an audit-log target, or None.
+
+    Audit-log targets fall back to a bare `discord.Object` when the role
+    isn't cached, and Object carries no behaviour — look it up by id.
+    """
+    if isinstance(target, discord.Role):
+        return target
+    role_id = getattr(target, 'id', None)
+    return guild.get_role(role_id) if role_id is not None else None
+
+async def _revert_escalation(entry, privileged_roles):
+    """Undo the permission grant itself, not just neutralize the actor.
+
+    Stripping the actor's roles leaves the payoff standing — the alt keeps
+    the administrator role, or the edited role keeps the permission and
+    everyone holding it keeps the power. Returns a note for the alert.
+    """
+    try:
+        if entry.action is discord.AuditLogAction.role_update:
+            before_perms = getattr(entry.before, 'permissions', None)
+            if before_perms is None:
+                return ''
+            # entry.target is a discord.Object, not a Role, whenever the
+            # role isn't cached — which is exactly the realistic attack
+            # (a role the attacker created seconds earlier). Object has
+            # no .edit(), so resolve it against the guild first.
+            role = _resolve_role(entry.guild, entry.target)
+            if role is None:
+                return ('\n⚠️ Could not revert the permission change — the '
+                        'role is no longer resolvable. Revert it manually.')
+            await role.edit(
+                permissions=before_perms,
+                reason='Anti-nuke: reverting permission escalation')
+            return f"\n↩️ Reverted **{role}**'s permissions."
+
+        if entry.action is discord.AuditLogAction.member_role_update:
+            for role in privileged_roles:
+                await entry.target.remove_roles(
+                    role, reason='Anti-nuke: reverting permission escalation')
+            names = ', '.join(str(r) for r in privileged_roles)
+            return f"\n↩️ Removed **{names}** from **{entry.target}**."
+    except discord.Forbidden:
+        return ('\n⚠️ Could not revert the permission change — I lack the '
+                'permission or rank to do so. Revert it manually.')
+    except discord.HTTPException as e:
+        logger.error('Anti-nuke: failed to revert escalation: %s', e)
+        return '\n⚠️ Failed to revert the permission change — API error.'
+    except AttributeError as e:
+        # Belt-and-braces: an un-resolvable audit-log target must never
+        # take the event handler down mid-incident.
+        logger.error('Anti-nuke: un-revertable escalation target: %s', e)
+        return '\n⚠️ Could not revert the permission change automatically.'
+    return ''
+
+async def _apply_anti_nuke_response(guild, actor_id, reason_text, extra_note=''):
+    """Strip the actor's roles (unless configured to alert-only or the
+    actor is the guild owner) and alert moderators.
+
+    The strip happens before the alert is sent — response time matters
+    more here than narration order.
+
+    Returns True if the actor was actually neutralized. Callers use this
+    to decide whether to reset their burst counter: when the strip failed
+    (the bot is ranked below them — precisely when the attacker is most
+    dangerous) the actor still has full permissions, and resetting would
+    mean their continued destruction goes quiet until a whole fresh
+    window's worth of actions accumulates again.
+    """
+    stripped_note = ''
+    neutralized = False
+    action = getattr(config, 'ANTI_NUKE_ACTION', 'strip_roles')
+
+    if action == 'strip_roles' and actor_id != guild.owner_id:
+        member = guild.get_member(actor_id)
+        if member is None:
+            try:
+                member = await guild.fetch_member(actor_id)
+            except discord.NotFound:
+                member = None
+            except discord.HTTPException as e:
+                logger.error('Anti-nuke: failed to fetch actor %s: %s',
+                             actor_id, e)
+                member = None
+        if member is not None:
+            try:
+                await member.edit(roles=[],
+                                  reason='Anti-nuke: destructive activity detected')
+                stripped_note = f'\n🔒 Stripped all roles from {member.mention}.'
+                neutralized = True
+                logger.warning('Anti-nuke: stripped roles from %s in %s',
+                               member, guild.name)
+            except discord.Forbidden:
+                stripped_note = (
+                    '\n⚠️ Could not strip roles — I\'m ranked at or below '
+                    'them in the role hierarchy. Act manually.')
+            except discord.HTTPException as e:
+                logger.error('Anti-nuke: failed to strip roles for %s: %s',
+                             member, e)
+                stripped_note = '\n⚠️ Failed to strip roles — Discord API error.'
+    elif action == 'strip_roles' and actor_id == guild.owner_id:
+        stripped_note = '\nℹ️ Actor is the guild owner — no action taken.'
+
+    logger.warning('ALERT: anti-nuke triggered in %s: %s',
+                   guild.name, reason_text)
+
+    moderators_channel = discord.utils.get(
+        guild.text_channels, name=MODERATORS_CHANNEL_NAME)
+    if not moderators_channel:
+        logger.error('Moderators channel "%s" not found in %s',
+                     MODERATORS_CHANNEL_NAME, guild.name)
+        return neutralized
+    try:
+        await moderators_channel.send(
+            f"🚨 **ANTI-NUKE TRIGGERED**\n\n"
+            f"{reason_text}{extra_note}{stripped_note}")
+    except (discord.HTTPException, discord.Forbidden) as e:
+        logger.error('Failed to send anti-nuke alert to moderators: %s', e)
+    return neutralized
+
+@bot.event
+async def on_audit_log_entry_create(entry):
+    """Watch the audit log for a destructive spree or a permission grant.
+
+    entry.user_id is the actor Discord's own token attributed the action
+    to. Every destructive command JohnnyBot itself runs (kick, purge,
+    server_restore, /raid kick_recent, ...) shows up here with the BOT's
+    user as actor, not the invoking moderator — so the bot's own actions
+    must never be counted, or its own moderation commands would trip
+    anti-nuke on themselves.
+    """
+    if not getattr(config, 'ANTI_NUKE_ENABLED', True):
+        return
+    if entry.user_id is None or entry.user_id == bot.user.id:
+        return
+
+    guild = entry.guild
+    actor = guild.get_member(entry.user_id)
+
+    escalation = _check_permission_escalation(
+        entry, getattr(actor, 'guild_permissions', None))
+    if escalation:
+        description, privileged_roles = escalation
+        revert_note = await _revert_escalation(entry, privileged_roles)
+        await _apply_anti_nuke_response(
+            guild, entry.user_id,
+            f"**{entry.user}** — permission escalation: {description}",
+            revert_note)
+        return
+
+    if entry.action not in _NUKE_BURST_ACTIONS | _NUKE_SINGLE_ACTIONS:
+        return
+
+    threshold = getattr(config, 'ANTI_NUKE_THRESHOLD', 3)
+    window = getattr(config, 'ANTI_NUKE_WINDOW_SECONDS', 60)
+
+    now = datetime.now(timezone.utc).timestamp()
+    key = (guild.id, entry.user_id)
+    times = _nuke_actions.setdefault(key, deque())
+    already_responded = bool(times) and entry.action in _NUKE_SINGLE_ACTIONS
+    times.append(now)
+    while times and now - times[0] > window:
+        times.popleft()
+
+    if entry.action in _NUKE_SINGLE_ACTIONS:
+        # Fires on its own rather than accumulating: one prune entry can
+        # remove hundreds of members. The shared deque still dedups a
+        # rapid series of them into a single response.
+        if already_responded:
+            return
+        removed = getattr(getattr(entry, 'extra', None), 'members_removed', None)
+        neutralized = await _apply_anti_nuke_response(
+            guild, entry.user_id,
+            f"**{entry.user}** ran a member prune"
+            + (f", removing **{removed}** member(s)." if removed else "."))
+    elif len(times) >= threshold:
+        neutralized = await _apply_anti_nuke_response(
+            guild, entry.user_id,
+            f"**{entry.user}** performed **{len(times)}** destructive "
+            f"action(s) in {window}s (latest: `{entry.action.name}`).")
+    else:
+        return
+
+    # Only reset the counter once the actor is actually depowered. If the
+    # strip failed they still hold their permissions, and clearing here
+    # would silence their continued destruction until a whole fresh
+    # window's worth of actions piled up again.
+    if neutralized:
+        times.clear()
 
 @bot.event
 async def on_voice_state_update(member, before, after):

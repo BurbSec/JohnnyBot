@@ -22,6 +22,28 @@ VOICE_CHAPERONE_ENABLED = True  # Set to False to disable voice chaperone functi
 ADULT_ROLE_NAMES = {'Dads', 'GrownUps'}
 CHILD_ROLE_NAMES = {'Kids', 'Bambinos', 'Girls'}
 
+# Raid detection: a burst of joins in a short window pauses invites
+# and DMs (Discord's own "incident" actions, self-expiring) and alerts
+# moderators. See CLAUDE.md's "Raid Protection" section for details.
+RAID_PROTECTION_ENABLED = True
+RAID_JOIN_THRESHOLD = 6        # joins within the window that trigger it
+RAID_JOIN_WINDOW_SECONDS = 30  # sliding window the threshold measures
+RAID_LOCKDOWN_MINUTES = 60     # how long invites/DMs stay paused
+RAID_NEW_ACCOUNT_HOURS = 24    # flag accounts younger than this in review/kick
+
+# Anti-nuke: watches the audit log for a compromised mod/admin account (or
+# a rogue integration) going on a destructive spree, or quietly granting a
+# role dangerous permissions. See CLAUDE.md's "Anti-Nuke Protection"
+# section for details.
+ANTI_NUKE_ENABLED = True
+ANTI_NUKE_THRESHOLD = 3            # destructive actions by one actor...
+ANTI_NUKE_WINDOW_SECONDS = 60      # ...within this many seconds
+# 'strip_roles' immediately zeros the actor's permissions (reversible via
+# /assign_role) before a human has to react; response time matters more
+# here than avoiding a false-positive story. 'alert' skips the automated
+# response and only notifies moderators.
+ANTI_NUKE_ACTION = 'strip_roles'   # 'strip_roles' | 'alert'
+
 # Update checking configuration
 UPDATE_CHECKING_ENABLED = True  # Set to False to disable automatic update checking
 UPDATE_CHECK_REPO_URL = "https://github.com/BurbSec/JohnnyBot"

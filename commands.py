@@ -1964,6 +1964,11 @@ def register_commands():
          voice_chaperone_command, mod_only=True,
          describe={'enabled': 'True to enable, False to disable voice chaperone'},
          error=voice_chaperone_error)
+    _reg('nuke_protection',
+         'Enable or disable anti-nuke protection',
+         nuke_protection_command, mod_only=True,
+         describe={'enabled': 'True to enable, False to disable anti-nuke protection'},
+         error=nuke_protection_error)
     _reg('dashboard',
          'Display a dashboard of all available commands grouped by category',
          dashboard_command, error=dashboard_command_error)
@@ -1985,6 +1990,7 @@ def register_commands():
                    'interval_hours': 'Hours between backup checks, 1-720 (default 24; only used when enabling)'},
          error=auto_backup_error)
 
+    register_raid_commands()
     register_autoreply_commands()
 
 def setup_commands(bot_param):
@@ -4368,7 +4374,15 @@ def get_command_categories():
         "⚙️ System & Utilities": [
             "/log_tail - DM the last specified number of lines of the bot log",
             "/voice_chaperone - Enable or disable voice channel chaperone functionality",
+            "/nuke_protection - Enable or disable anti-nuke protection",
             "/dashboard - Display this command dashboard"
+        ],
+        "🛡️ Raid Protection": [
+            "/raid protection - Enable or disable automatic raid detection",
+            "/raid status - Show raid protection settings and lockdown state",
+            "/raid lockdown - Manually pause or lift a pause on invites/DMs",
+            "/raid recent_joins - List recent joins, flagging new accounts",
+            "/raid kick_recent - Kick recently-joined new accounts (dry run by default)"
         ],
         "💾 Backup & Restore": [
             "/server_backup - DM you a full structural backup of this server",
@@ -5276,6 +5290,360 @@ async def auto_backup_command(interaction: discord.Interaction, enabled: bool,
             'An unexpected error occurred.', ephemeral=True)
 
 auto_backup_error = _command_error_handler
+
+
+# ---------------------------------------------------------------------------
+# Raid protection
+# ---------------------------------------------------------------------------
+# Burst detection and the auto-lockdown live in bot.py's on_member_join,
+# since only it sees the raw join events. These are the moderator-facing
+# commands: toggle, status, manual lockdown, and reviewing/kicking the
+# members who joined during an incident. Config is read with getattr()
+# throughout — see the note above _raid_join_times in bot.py.
+
+async def raid_protection_command(interaction: discord.Interaction, enabled: bool):
+    """Enable or disable automatic raid detection.
+
+    Disabling it also lifts any lockdown currently in progress — same
+    reasoning as voice_chaperone_command releasing outstanding mutes on
+    disable: a moderator turning the feature off mid-incident is telling
+    the bot to stand down, not just to stop watching for new ones.
+    """
+    try:
+        await interaction.response.defer(ephemeral=True)
+        config.RAID_PROTECTION_ENABLED = enabled
+        status = 'enabled' if enabled else 'disabled'
+
+        lifted_note = ''
+        if not enabled:
+            import bot as bot_module  # pylint: disable=cyclic-import
+            guild = interaction.guild
+            if guild is not None and bot_module._raid_lockdown_active(guild):  # pylint: disable=protected-access
+                try:
+                    await guild.edit(
+                        invites_disabled_until=None, dms_disabled_until=None,
+                        reason=f'Raid protection disabled by {interaction.user}')
+                    lifted_note = '\nAn active lockdown was also lifted.'
+                except discord.Forbidden:
+                    lifted_note = (
+                        '\n⚠️ Could not lift the active lockdown — I lack '
+                        'the Manage Server permission.')
+
+        await interaction.followup.send(
+            f'Raid protection has been **{status}**.{lifted_note}\n\n'
+            f'ℹ️ When enabled, a burst of joins past the configured '
+            f'threshold automatically pauses invites and DMs and alerts '
+            f'moderators.',
+            ephemeral=True)
+        logger.info('Raid protection %s by user %s', status, interaction.user)
+    except discord.HTTPException as e:
+        logger.error('Error in raid_protection command: %s', e)
+        await interaction.followup.send(
+            'An error occurred while updating raid protection.', ephemeral=True)
+
+raid_protection_error = _command_error_handler
+
+
+async def raid_status_command(interaction: discord.Interaction):
+    """Show raid protection settings and the current lockdown state."""
+    try:
+        import bot as bot_module  # pylint: disable=cyclic-import
+        guild = interaction.guild
+        enabled = getattr(config, 'RAID_PROTECTION_ENABLED', True)
+        threshold = getattr(config, 'RAID_JOIN_THRESHOLD', 6)
+        window = getattr(config, 'RAID_JOIN_WINDOW_SECONDS', 30)
+        lockdown_minutes = getattr(config, 'RAID_LOCKDOWN_MINUTES', 60)
+        new_hours = getattr(config, 'RAID_NEW_ACCOUNT_HOURS', 24)
+
+        times = getattr(bot_module, '_raid_join_times', {}).get(guild.id, [])
+        now = datetime.now(timezone.utc).timestamp()
+        recent = sum(1 for t in times if now - t <= window)
+
+        invites_until = getattr(guild, 'invites_paused_until', None)
+        if invites_until and invites_until > datetime.now(timezone.utc):
+            lock_status = (
+                f'🔒 Locked down until <t:{int(invites_until.timestamp())}:f>')
+        else:
+            lock_status = '🔓 Not locked down'
+
+        msg = (
+            f"**Raid Protection:** {'✅ Enabled' if enabled else '❌ Disabled'}\n"
+            f"**Trigger:** {threshold} joins within {window}s\n"
+            f"**Lockdown duration:** {lockdown_minutes} minute(s)\n"
+            f"**New-account flag:** accounts younger than {new_hours}h\n"
+            f"**Current status:** {lock_status}\n"
+            f"**Joins in the last {window}s:** {recent}")
+        await interaction.response.send_message(msg, ephemeral=True)
+    except discord.HTTPException as e:
+        logger.error('Error in raid_status command: %s', e)
+        await interaction.response.send_message(
+            'An error occurred while fetching raid status.', ephemeral=True)
+
+raid_status_error = _command_error_handler
+
+
+async def raid_lockdown_command(interaction: discord.Interaction, enabled: bool,
+                                minutes: Optional[app_commands.Range[int, 1, 10080]] = None):
+    """Manually pause (or lift a pause on) invites and DMs."""
+    try:
+        await interaction.response.defer(ephemeral=True)
+        guild = interaction.guild
+
+        if not guild.me or not guild.me.guild_permissions.manage_guild:
+            await interaction.followup.send(
+                'I need the **Manage Server** permission to pause '
+                'invites/DMs.', ephemeral=True)
+            return
+
+        if enabled:
+            mins = minutes or getattr(config, 'RAID_LOCKDOWN_MINUTES', 60)
+            until = datetime.now(timezone.utc) + timedelta(minutes=mins)
+            await guild.edit(
+                invites_disabled_until=until, dms_disabled_until=until,
+                reason=f'Manual raid lockdown by {interaction.user}')
+            await interaction.followup.send(
+                f'🔒 Invites and DMs paused for **{mins} minute(s)**.',
+                ephemeral=True)
+        else:
+            await guild.edit(
+                invites_disabled_until=None, dms_disabled_until=None,
+                reason=f'Raid lockdown lifted by {interaction.user}')
+            await interaction.followup.send('🔓 Lockdown lifted.', ephemeral=True)
+
+        logger.info('Raid lockdown %s by %s',
+                    'enabled' if enabled else 'disabled', interaction.user)
+    except discord.Forbidden:
+        await interaction.followup.send(
+            'I lack permission to do that.', ephemeral=True)
+    except discord.HTTPException as e:
+        logger.error('Error in raid_lockdown command: %s', e)
+        await interaction.followup.send(
+            'A Discord API error occurred.', ephemeral=True)
+
+raid_lockdown_error = _command_error_handler
+
+
+async def raid_recent_joins_command(
+        interaction: discord.Interaction,
+        minutes: app_commands.Range[int, 1, 1440] = 30):
+    """List members who joined recently, flagging new accounts."""
+    try:
+        await interaction.response.defer(ephemeral=True)
+        guild = interaction.guild
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=minutes)
+        new_hours = getattr(config, 'RAID_NEW_ACCOUNT_HOURS', 24)
+        age_cutoff = datetime.now(timezone.utc) - timedelta(hours=new_hours)
+
+        joined = sorted(
+            (m for m in guild.members if m.joined_at and m.joined_at >= cutoff),
+            key=lambda m: m.joined_at)
+
+        if not joined:
+            await interaction.followup.send(
+                f'No members joined in the last {minutes} minute(s).',
+                ephemeral=True)
+            return
+
+        lines = [
+            f'{m.mention} ({m}) — joined <t:{int(m.joined_at.timestamp())}:R>'
+            + (' ⚠️ new account' if m.created_at >= age_cutoff else '')
+            for m in joined
+        ]
+        body = (f'**{len(joined)} member(s) joined in the last '
+               f'{minutes} minute(s):**\n'
+               + _format_list_with_overflow(lines, max_shown=25, prefix=''))
+        await interaction.followup.send(body, ephemeral=True)
+    except discord.HTTPException as e:
+        logger.error('Error in raid_recent_joins command: %s', e)
+        await interaction.followup.send(
+            'An error occurred while listing recent joins.', ephemeral=True)
+
+raid_recent_joins_error = _command_error_handler
+
+
+async def raid_kick_recent_command(  # pylint: disable=too-many-locals
+        interaction: discord.Interaction,
+        minutes: app_commands.Range[int, 1, 1440],
+        dry_run: bool = True):
+    """Kick recently-joined members flagged as new accounts.
+
+    Defaults to a dry run — a real moderator can have joined five
+    minutes ago too, so this previews candidates before anything
+    irreversible happens. Moderators and the guild owner are always
+    exempt, mirroring /kick's hierarchy check.
+    """
+    try:
+        await interaction.response.defer(ephemeral=True)
+        guild = interaction.guild
+
+        if not guild.me or not guild.me.guild_permissions.kick_members:
+            await interaction.followup.send(
+                'I do not have permission to kick members.', ephemeral=True)
+            return
+
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=minutes)
+        new_hours = getattr(config, 'RAID_NEW_ACCOUNT_HOURS', 24)
+        age_cutoff = datetime.now(timezone.utc) - timedelta(hours=new_hours)
+
+        candidates = [
+            m for m in guild.members
+            if m.joined_at and m.joined_at >= cutoff
+            and m.created_at >= age_cutoff
+            and m.id != guild.me.id
+            and not _is_moderator(m)
+            and _invoker_outranks(interaction, m)
+        ]
+
+        if not candidates:
+            await interaction.followup.send(
+                f'No new-account members joined in the last {minutes} '
+                f'minute(s) matching the raid criteria.', ephemeral=True)
+            return
+
+        if dry_run:
+            lines = [
+                f'{m.mention} ({m}) — account created '
+                f'<t:{int(m.created_at.timestamp())}:R>'
+                for m in candidates]
+            body = (
+                f'**Dry run — {len(candidates)} member(s) would be kicked:**\n'
+                + _format_list_with_overflow(lines, max_shown=25, prefix='')
+                + '\n\nRun again with `dry_run:False` to actually kick them.')
+            await interaction.followup.send(body, ephemeral=True)
+            return
+
+        kicked, failed = [], []
+        for m in candidates:
+            try:
+                await m.kick(
+                    reason=f'Raid protection: kicked by {interaction.user}')
+                kicked.append(str(m))
+                logger.info('Raid protection: kicked %s (invoked by %s)',
+                           m, interaction.user)
+            except discord.Forbidden:
+                failed.append(f'{m} (insufficient permissions)')
+            except discord.HTTPException as e:
+                failed.append(f'{m} (API error)')
+                logger.error('Raid kick failed for %s: %s', m, e)
+
+        parts = []
+        if kicked:
+            parts.append(
+                f'✅ **Kicked {len(kicked)} member(s):** ' + ', '.join(kicked))
+        if failed:
+            parts.append(
+                f'❌ **Failed to kick {len(failed)}:**\n'
+                + _format_list_with_overflow(failed))
+        await interaction.followup.send('\n\n'.join(parts), ephemeral=True)
+    except discord.HTTPException as e:
+        logger.error('Error in raid_kick_recent command: %s', e)
+        await interaction.followup.send(
+            'A Discord API error occurred.', ephemeral=True)
+
+raid_kick_recent_error = _command_error_handler
+
+
+def register_raid_commands():
+    """Register the /raid command group."""
+    if tree is None:
+        return
+
+    raid_group = app_commands.Group(
+        name='raid', description='Raid detection and response')
+    # default_permissions is ignored on subcommands, so the hint lives
+    # on the group itself — see _apply_scope's docstring.
+    _apply_scope(raid_group, gate_perms={'manage_messages': True})
+
+    @raid_group.command(
+        name='protection',
+        description='Enable or disable automatic raid detection')
+    @app_commands.describe(enabled='True to enable, False to disable')
+    @_require_guild_permissions(manage_messages=True)
+    async def _raid_protection(interaction: discord.Interaction, enabled: bool):
+        await raid_protection_command(interaction, enabled)
+
+    @raid_group.command(
+        name='status',
+        description='Show raid protection settings and lockdown state')
+    @_require_guild_permissions(manage_messages=True)
+    async def _raid_status(interaction: discord.Interaction):
+        await raid_status_command(interaction)
+
+    @raid_group.command(
+        name='lockdown',
+        description='Manually pause (or lift a pause on) invites and DMs')
+    @app_commands.describe(
+        enabled='True to lock down, False to lift an active lockdown',
+        minutes='How long to lock down for (default: configured lockdown duration)')
+    @_require_guild_permissions(manage_messages=True)
+    async def _raid_lockdown(interaction: discord.Interaction, enabled: bool,
+                             minutes: Optional[app_commands.Range[int, 1, 10080]] = None):
+        await raid_lockdown_command(interaction, enabled, minutes)
+
+    @raid_group.command(
+        name='recent_joins',
+        description='List members who joined recently, flagging new accounts')
+    @app_commands.describe(minutes='How far back to look (default: 30)')
+    @_require_guild_permissions(manage_messages=True)
+    async def _raid_recent_joins(interaction: discord.Interaction,
+                                 minutes: app_commands.Range[int, 1, 1440] = 30):
+        await raid_recent_joins_command(interaction, minutes)
+
+    @raid_group.command(
+        name='kick_recent',
+        description='Kick recently-joined new accounts (dry run by default)')
+    @app_commands.describe(
+        minutes='How far back to look for joins',
+        dry_run='Preview candidates without kicking (default: True)')
+    @_require_guild_permissions(manage_messages=True)
+    async def _raid_kick_recent(interaction: discord.Interaction,
+                                minutes: app_commands.Range[int, 1, 1440],
+                                dry_run: bool = True):
+        await raid_kick_recent_command(interaction, minutes, dry_run)
+
+    _raid_protection.on_error = raid_protection_error
+    _raid_status.on_error = raid_status_error
+    _raid_lockdown.on_error = raid_lockdown_error
+    _raid_recent_joins.on_error = raid_recent_joins_error
+    _raid_kick_recent.on_error = raid_kick_recent_error
+
+    tree.add_command(raid_group)
+
+
+# ---------------------------------------------------------------------------
+# Anti-nuke protection
+# ---------------------------------------------------------------------------
+# Detection and response live in bot.py's on_audit_log_entry_create, since
+# only it receives the raw audit-log gateway event. This is the single
+# moderator-facing toggle, mirroring voice_chaperone_command /
+# raid_protection_command.
+
+async def nuke_protection_command(interaction: discord.Interaction, enabled: bool):
+    """Enable or disable anti-nuke protection."""
+    try:
+        config.ANTI_NUKE_ENABLED = enabled
+        status = 'enabled' if enabled else 'disabled'
+        response_mode = getattr(config, 'ANTI_NUKE_ACTION', 'strip_roles')
+        mode_note = (
+            'automatically stripping the offending account\'s roles'
+            if response_mode == 'strip_roles'
+            else 'alerting moderators only (no automated response)')
+        await interaction.response.send_message(
+            f'Anti-nuke protection has been **{status}**.\n\n'
+            f'ℹ️ When enabled, a burst of destructive actions (channel/role '
+            f'deletes, kicks, bans, webhook creation) by one actor, or any '
+            f'grant of a dangerous permission, triggers a response: '
+            f'currently **{mode_note}**. Change `ANTI_NUKE_ACTION` in '
+            f'config.py to switch modes.',
+            ephemeral=True)
+        logger.info('Anti-nuke protection %s by user %s', status, interaction.user)
+    except discord.HTTPException as e:
+        logger.error('Error in nuke_protection command: %s', e)
+        await interaction.response.send_message(
+            'An error occurred while updating anti-nuke protection.',
+            ephemeral=True)
+
+nuke_protection_error = _command_error_handler
 
 
 def register_autoreply_commands():

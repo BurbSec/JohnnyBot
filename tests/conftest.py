@@ -22,6 +22,15 @@ def _install_config_stub():
     cfg.VOICE_CHAPERONE_ENABLED = True
     cfg.ADULT_ROLE_NAMES = {'Dads', 'GrownUps'}
     cfg.CHILD_ROLE_NAMES = {'Kids', 'Bambinos'}
+    cfg.RAID_PROTECTION_ENABLED = True
+    cfg.RAID_JOIN_THRESHOLD = 6
+    cfg.RAID_JOIN_WINDOW_SECONDS = 30
+    cfg.RAID_LOCKDOWN_MINUTES = 60
+    cfg.RAID_NEW_ACCOUNT_HOURS = 24
+    cfg.ANTI_NUKE_ENABLED = True
+    cfg.ANTI_NUKE_THRESHOLD = 3
+    cfg.ANTI_NUKE_WINDOW_SECONDS = 60
+    cfg.ANTI_NUKE_ACTION = 'strip_roles'
     cfg.UPDATE_CHECKING_ENABLED = False
     cfg.UPDATE_CHECK_REPO_URL = 'https://github.com/example/repo'
     cfg.AUTO_UPDATE_ENABLED = False
