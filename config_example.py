@@ -69,6 +69,13 @@ UPDATE_CHECK_REPO_URL = "https://github.com/BurbSec/JohnnyBot"
 # bot to run from a git checkout. Anything else (CI not green, config
 # changes, pull/install failure) falls back to a moderator notification.
 AUTO_UPDATE_ENABLED = False
+# Announce to the moderators channel when the running version changes,
+# on the first start after an update. Confirms an update actually landed
+# (the pre-restart notice is sent before anything is proven) and covers
+# manual git pull + restart, which otherwise announces nothing. The body
+# is the annotated tag's message, so whatever you write when tagging a
+# release is what moderators read.
+VERSION_ANNOUNCE_ENABLED = True
 
 # Timezone for scheduled jobs and event announcements
 BOT_TIMEZONE = 'America/Chicago'

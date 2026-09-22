@@ -313,6 +313,182 @@ async def send_update_notification(local_version, remote_version, config_changed
     except (discord.HTTPException, discord.Forbidden) as e:
         logger.error("Error sending update notification: %s", e)
 
+
+# Version-change announcements
+# ---------------------------------------------------------------------------
+# Both existing notices fire *before* anything changes — "Update
+# Available", and "restarting now" sent immediately before os.execv. So
+# nothing ever confirms an update actually landed: if the new version
+# fails to boot, the last thing moderators saw was "Back in a moment!",
+# and silence looks identical to success. A manual `git pull` + restart
+# announces nothing at all. This is the missing half, posted on the first
+# start after the running commit changes.
+
+# Kept out of config.py for the same reason as CHAPERONE_MUTES_FILE:
+# deployed configs are not tracked by git and would not have the constant
+# after a pull.
+VERSION_STATE_FILE = getattr(
+    config, 'VERSION_STATE_FILE',
+    os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                 'version_state.json'))
+
+# Well under Discord's 2000-character cap, leaving room for the header.
+_RELEASE_NOTES_BUDGET = 1500
+
+
+def _load_version_state():
+    """The commit/label recorded on the last start, or None."""
+    if not os.path.exists(VERSION_STATE_FILE):
+        return None
+    try:
+        with open(VERSION_STATE_FILE, 'r', encoding='utf-8') as f:
+            state = json.load(f)
+        return state if isinstance(state, dict) else None
+    except (OSError, IOError, ValueError, TypeError) as e:
+        logger.error('Failed to read version state: %s', e)
+        return None
+
+
+def _save_version_state(sha, label):
+    """Record the running version. Never let this abort startup."""
+    try:
+        _atomic_json_write(VERSION_STATE_FILE, {
+            'commit': sha,
+            'label': label,
+            'recorded_at': datetime.now(timezone.utc).isoformat(),
+        })
+    except (OSError, IOError, TypeError, ValueError) as e:
+        logger.error('Failed to save version state: %s', e)
+
+
+async def _current_version():
+    """(sha, label) for the running checkout, or None if git is absent.
+
+    Update checking already assumes a git checkout, so a tarball or
+    container install without one simply opts out rather than erroring.
+    """
+    try:
+        rc, sha, err = await _run_cmd('git', 'rev-parse', 'HEAD')
+    except OSError as e:
+        logger.info('Version announce: git unavailable (%s)', e)
+        return None
+    if rc != 0 or not sha:
+        logger.info('Version announce: could not resolve HEAD (%s)', err)
+        return None
+    label = await _local_tag_for_commit(sha) or _short_sha(sha)
+    return sha, label
+
+
+async def _is_ancestor(old_sha, new_sha):
+    """True if old_sha is an ancestor of new_sha — i.e. a forward move.
+
+    Distinguishes an upgrade from a rollback or a diverged checkout, so a
+    surprise `git checkout` of an older tag reads as what it is instead
+    of being announced as an update.
+    """
+    try:
+        rc, _, _ = await _run_cmd(
+            'git', 'merge-base', '--is-ancestor', old_sha, new_sha)
+    except OSError:
+        return True
+    return rc == 0
+
+
+# Signed tags carry the signature inside the annotation, so `%(contents)`
+# returns it too. This repo signs with SSH, others use PGP/GPG — match
+# any of them rather than one, or a wall of base64 gets posted to the
+# moderators channel.
+_SIGNATURE_RE = re.compile(r'^-----BEGIN [A-Z0-9 ]*SIGNATURE-----',
+                           re.MULTILINE)
+
+
+def _strip_signature(notes):
+    """Drop a trailing signature block from a tag annotation."""
+    match = _SIGNATURE_RE.search(notes)
+    return notes[:match.start()].strip() if match else notes
+
+
+async def _tag_release_notes(label):
+    """The annotated tag's message for `label`, or ''.
+
+    Deliberately the tag annotation rather than `git log old..new`: a
+    commit log is noise in a moderators channel — every chore, CI tweak
+    and doc fix — while the annotation is written by whoever cut the
+    release and therefore contains the highlights by construction.
+
+    Returns '' for a lightweight tag (no message), an untagged commit, or
+    any git failure. A missing body must never suppress the announcement.
+    """
+    if not label or not label.startswith('v'):
+        return ''
+    try:
+        rc, out, _ = await _run_cmd(
+            'git', 'for-each-ref', '--format=%(contents)',
+            f'refs/tags/{label}')
+    except OSError:
+        return ''
+    if rc != 0 or not out.strip():
+        return ''
+    notes = _strip_signature(out.strip())
+    if len(notes) > _RELEASE_NOTES_BUDGET:
+        notes = notes[:_RELEASE_NOTES_BUDGET].rstrip() + '\n…'
+    return notes
+
+
+async def announce_version_change():
+    """Post to every guild's moderators channel when the running version
+    differs from the one recorded on the last start.
+
+    Posts to each guild rather than via _get_moderators_channel(), which
+    returns the first match across all guilds — in a multi-guild
+    deployment only one server would ever learn the bot changed. The
+    existing update notices still use that single-channel lookup; that
+    inconsistency is known and left alone here.
+    """
+    if not getattr(config, 'VERSION_ANNOUNCE_ENABLED', True):
+        return
+
+    current = await _current_version()
+    if current is None:
+        return
+    sha, label = current
+
+    previous = _load_version_state()
+    if previous is None:
+        # First start after this feature ships, or a fresh install.
+        # Recording silently avoids a bogus "updated" notice on every
+        # existing deployment the first time it runs.
+        await asyncio.to_thread(_save_version_state, sha, label)
+        logger.info('Version announce: recorded baseline %s', label)
+        return
+
+    if previous.get('commit') == sha:
+        return  # ordinary restart, reconnect, or crash-loop
+
+    old_label = previous.get('label') or _short_sha(previous.get('commit'))
+    forward = await _is_ancestor(previous.get('commit', ''), sha)
+    header = (f"🤖 **JohnnyBot updated** — `{old_label}` → `{label}`"
+              if forward else
+              f"🔄 **JohnnyBot version changed** — `{old_label}` → "
+              f"`{label}` (rollback or diverged checkout)")
+
+    notes = await _tag_release_notes(label)
+    message = f"{header}\n\n{notes}" if notes else header
+
+    for guild in bot.guilds:
+        channel = discord.utils.get(
+            guild.text_channels, name=MODERATORS_CHANNEL_NAME)
+        if channel is None:
+            continue
+        try:
+            await channel.send(message)
+        except (discord.HTTPException, discord.Forbidden) as e:
+            logger.error('Failed to announce version change in %s: %s',
+                         guild.name, e)
+
+    logger.info('Version announce: %s -> %s', old_label, label)
+    await asyncio.to_thread(_save_version_state, sha, label)
+
 intents = discord.Intents.default()
 intents.message_content = True
 intents.guilds = True
@@ -494,6 +670,13 @@ async def on_ready():  # pylint: disable=too-many-statements
             logger.warning('Event feed not available')
     except (AttributeError, ImportError, ValueError) as e:
         logger.error('Failed to start event feed scheduler: %s', e)
+
+    # Last, so a git or network problem here can never delay the
+    # chaperone sweep or the scheduler above.
+    try:
+        await announce_version_change()
+    except Exception as e:  # pylint: disable=broad-exception-caught
+        logger.error('Version announce failed: %s', e)
 
 async def handle_unsolicited_dm(message):
     """Kick anyone who DMs the bot.

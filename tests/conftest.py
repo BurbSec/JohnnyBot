@@ -42,6 +42,7 @@ def _install_config_stub():
     cfg.UPDATE_CHECKING_ENABLED = False
     cfg.UPDATE_CHECK_REPO_URL = 'https://github.com/example/repo'
     cfg.AUTO_UPDATE_ENABLED = False
+    cfg.VERSION_ANNOUNCE_ENABLED = True
     cfg.BOT_TIMEZONE = 'America/Chicago'
     cfg.TOKEN = 'test-token'
 

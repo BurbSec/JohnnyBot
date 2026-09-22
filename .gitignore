@@ -19,6 +19,7 @@ event_announce.json
 autoreplies.json
 chaperone_mutes.json
 auto_backups.json
+version_state.json
 johnnybot.log
 temp/
 backups/
