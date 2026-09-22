@@ -475,18 +475,28 @@ async def announce_version_change():
     notes = await _tag_release_notes(label)
     message = f"{header}\n\n{notes}" if notes else header
 
+    sent = 0
     for guild in bot.guilds:
         channel = discord.utils.get(
             guild.text_channels, name=MODERATORS_CHANNEL_NAME)
         if channel is None:
+            # Matches the "not found" logging every other alert path in
+            # this file does (raid/anti-nuke/spam) — a silent `continue`
+            # here left this exact bug invisible: the info line below
+            # fired unconditionally, so a channel-name mismatch looked
+            # identical to a successful send in the log.
+            logger.error('Moderators channel "%s" not found in %s',
+                         MODERATORS_CHANNEL_NAME, guild.name)
             continue
         try:
             await channel.send(message)
+            sent += 1
         except (discord.HTTPException, discord.Forbidden) as e:
             logger.error('Failed to announce version change in %s: %s',
                          guild.name, e)
 
-    logger.info('Version announce: %s -> %s', old_label, label)
+    logger.info('Version announce: %s -> %s (delivered to %d guild(s))',
+               old_label, label, sent)
     await asyncio.to_thread(_save_version_state, sha, label)
 
 intents = discord.Intents.default()

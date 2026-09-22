@@ -139,6 +139,23 @@ async def test_changed_commit_announces_both_labels(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_missing_moderators_channel_is_logged_not_silent(monkeypatch, caplog):
+    """Regression test: a channel-name mismatch used to `continue`
+    silently, and the unconditional info line right after made a
+    zero-guild send look identical to a successful one in the log — the
+    exact shape of bug that let this go unnoticed on a live deployment."""
+    g, _none = _guild(with_mod_channel=False)
+    monkeypatch.setattr(bot, '_run_cmd', _fake_git(tag='v1.1.0'))
+    _use_guilds(monkeypatch, [g])
+    _seed_state()
+
+    with caplog.at_level('ERROR'):
+        await bot.announce_version_change()
+
+    assert any('not found' in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
 async def test_every_guild_moderators_channel_is_notified(monkeypatch):
     """_get_moderators_channel returns only the first match across all
     guilds, which would leave every other server unaware."""
