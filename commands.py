@@ -1969,6 +1969,11 @@ def register_commands():
          nuke_protection_command, mod_only=True,
          describe={'enabled': 'True to enable, False to disable anti-nuke protection'},
          error=nuke_protection_error)
+    _reg('spam_protection',
+         'Enable or disable message spam protection',
+         spam_protection_command, mod_only=True,
+         describe={'enabled': 'True to enable, False to disable spam protection'},
+         error=spam_protection_error)
     _reg('dashboard',
          'Display a dashboard of all available commands grouped by category',
          dashboard_command, error=dashboard_command_error)
@@ -4375,6 +4380,7 @@ def get_command_categories():
             "/log_tail - DM the last specified number of lines of the bot log",
             "/voice_chaperone - Enable or disable voice channel chaperone functionality",
             "/nuke_protection - Enable or disable anti-nuke protection",
+            "/spam_protection - Enable or disable message spam protection",
             "/dashboard - Display this command dashboard"
         ],
         "🛡️ Raid Protection": [
@@ -5644,6 +5650,39 @@ async def nuke_protection_command(interaction: discord.Interaction, enabled: boo
             ephemeral=True)
 
 nuke_protection_error = _command_error_handler
+
+
+# ---------------------------------------------------------------------------
+# Message spam protection
+# ---------------------------------------------------------------------------
+# Detection and response live in bot.py's on_message path, since only it
+# sees every message. This is the moderator-facing toggle.
+
+async def spam_protection_command(interaction: discord.Interaction, enabled: bool):
+    """Enable or disable message spam protection."""
+    try:
+        config.SPAM_PROTECTION_ENABLED = enabled
+        status = 'enabled' if enabled else 'disabled'
+        window = getattr(config, 'SPAM_CROSSPOST_WINDOW_SECONDS', 30)
+        mentions = getattr(config, 'SPAM_MENTION_THRESHOLD', 3)
+        minutes = getattr(config, 'SPAM_TIMEOUT_MINUTES', 10)
+        days = getattr(config, 'SPAM_NEW_ACCOUNT_DAYS', 2)
+        await interaction.response.send_message(
+            f'Message spam protection has been **{status}**.\n\n'
+            f'ℹ️ When enabled, the bot deletes and times out '
+            f'({minutes} min) for: the same link posted in 2+ channels '
+            f'within {window}s, or {mentions}+ mentions in one message. '
+            f'Link spammers whose account is under {days} day(s) old are '
+            f'kicked instead. Moderators are exempt.',
+            ephemeral=True)
+        logger.info('Spam protection %s by user %s', status, interaction.user)
+    except discord.HTTPException as e:
+        logger.error('Error in spam_protection command: %s', e)
+        await interaction.response.send_message(
+            'An error occurred while updating spam protection.',
+            ephemeral=True)
+
+spam_protection_error = _command_error_handler
 
 
 def register_autoreply_commands():

@@ -31,6 +31,11 @@ def _install_config_stub():
     cfg.ANTI_NUKE_THRESHOLD = 3
     cfg.ANTI_NUKE_WINDOW_SECONDS = 60
     cfg.ANTI_NUKE_ACTION = 'strip_roles'
+    cfg.SPAM_PROTECTION_ENABLED = True
+    cfg.SPAM_CROSSPOST_WINDOW_SECONDS = 30
+    cfg.SPAM_MENTION_THRESHOLD = 3
+    cfg.SPAM_TIMEOUT_MINUTES = 10
+    cfg.SPAM_NEW_ACCOUNT_DAYS = 2
     cfg.UPDATE_CHECKING_ENABLED = False
     cfg.UPDATE_CHECK_REPO_URL = 'https://github.com/example/repo'
     cfg.AUTO_UPDATE_ENABLED = False

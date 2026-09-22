@@ -1,8 +1,10 @@
 """Discord bot for server management and automation with reminder functionality."""
 # pylint: disable=line-too-long,trailing-whitespace,cyclic-import
 import os
+import re
 import sys
 import asyncio
+import hashlib
 import logging
 from collections import deque
 from datetime import datetime, timedelta, timezone
@@ -604,6 +606,14 @@ async def on_message(message):
             logger.error('Error handling DM from %s: %s', message.author, e)
         return
 
+    # Runs before the autoreply and protected-channel checks below: when
+    # this deletes the message, there is nothing left to reply to.
+    try:
+        if await check_message_spam(message):
+            return
+    except Exception as e:  # pylint: disable=broad-exception-caught
+        logger.error('Error checking message for spam: %s', e)
+
     try:
         await _check_autoreplies(message)
     except (ImportError, AttributeError):
@@ -829,6 +839,226 @@ async def check_voice_channel_safety(channel):  # pylint: disable=too-many-branc
 
     except discord.HTTPException as e:
         logger.error('Failed to send alert to moderators channel: %s', e)
+
+# Message spam protection
+# ---------------------------------------------------------------------------
+# The two ways a raid cashes out once accounts are inside: the same scam
+# link blasted across several channels at once, and mass pings to drive
+# attention to it. Link detection is deliberately behavioural rather than
+# a domain blocklist — scam domains burn within days, so a list is stale
+# before it ships, while the cross-posting *pattern* is the same whatever
+# domain is in the message.
+#
+# Keyed by (guild_id, user_id), pruned by window, key dropped when its
+# deque empties — bounded without a cleanup job, same shape as
+# _raid_join_times and _nuke_actions.
+_link_posts = {}
+
+# A key is only pruned when that same user posts another link, so a
+# one-off poster's entry would otherwise linger for the process's
+# lifetime. Sweeping once the dict crosses this size keeps that bounded
+# without a scheduled job, and costs nothing on a quiet server.
+_LINK_POSTS_SWEEP_AT = 1000
+
+_URL_RE = re.compile(r'https?://\S+')
+
+def _sweep_link_posts(now, window):
+    """Drop tracking entries for users whose last link fell out of the
+    window."""
+    stale = [k for k, posts in _link_posts.items()
+             if not posts or now - posts[-1][0] > window]
+    for key in stale:
+        del _link_posts[key]
+
+def _normalize_for_spam(lowered):
+    """Hash already-lowercased content with whitespace collapsed, so
+    'FREE  nitro' and 'free nitro' land on the same key. The digest is
+    what gets tracked, so message bodies are never retained in memory."""
+    return hashlib.sha256(
+        ' '.join(lowered.split()).encode('utf-8')).hexdigest()
+
+def _spam_exempt(message):
+    """Moderators are exempt, matching every other gate in this codebase."""
+    return bool(getattr(
+        getattr(message.author, 'guild_permissions', None),
+        'manage_messages', False))
+
+def _check_link_crosspost(message):
+    """Track a link-bearing message; return the other copies if this one
+    completes a cross-channel spam run, else None.
+
+    on_message runs for every message in every channel, so this bails on a
+    substring test before doing any regex or hashing, and only
+    link-bearing messages are tracked at all. The case fold happens first
+    because matching is case-insensitive — varying capitalization between
+    posts is otherwise a one-keystroke evasion — and `check_message_for_autoreplies`
+    already establishes one `.lower()` per message as an acceptable cost.
+    """
+    lowered = message.content.lower()
+    if 'http' not in lowered or not _URL_RE.search(lowered):
+        return None
+
+    window = getattr(config, 'SPAM_CROSSPOST_WINDOW_SECONDS', 30)
+    now = datetime.now(timezone.utc).timestamp()
+    digest = _normalize_for_spam(lowered)
+    key = (message.guild.id, message.author.id)
+
+    if len(_link_posts) > _LINK_POSTS_SWEEP_AT:
+        _sweep_link_posts(now, window)
+
+    posts = _link_posts.setdefault(key, deque())
+    while posts and now - posts[0][0] > window:
+        posts.popleft()
+
+    # Same text in the *same* channel is ordinary repetition; the
+    # cross-channel spread is what marks a spam run.
+    matches = [p for p in posts
+               if p[1] == digest and p[2] != message.channel.id]
+    posts.append((now, digest, message.channel.id, message.id))
+
+    return matches or None
+
+def _check_mention_spam(message):
+    """True if one message pings too many distinct targets.
+
+    Discord de-duplicates the mentions payload, so `@bob @bob @bob` counts
+    once — the threshold is 3 distinct targets, which is the intent.
+    """
+    threshold = getattr(config, 'SPAM_MENTION_THRESHOLD', 3)
+    total = len(getattr(message, 'mentions', ()))
+    total += len(getattr(message, 'role_mentions', ()))
+    return total >= threshold
+
+async def _delete_spam_copies(message, copies):
+    """Remove the offending message and any earlier tracked copies.
+
+    Deleting only the message that tripped the detector would leave the
+    first post standing in whatever channel it landed in.
+    """
+    deleted = 0
+    try:
+        await message.delete()
+        deleted += 1
+    except discord.HTTPException as e:
+        logger.error('Spam protection: failed to delete message: %s', e)
+
+    for _ts, _digest, channel_id, message_id in copies or ():
+        channel = message.guild.get_channel(channel_id)
+        if channel is None:
+            continue
+        try:
+            await channel.get_partial_message(message_id).delete()
+            deleted += 1
+        except discord.HTTPException as e:
+            logger.error('Spam protection: failed to delete copy in %s: %s',
+                         channel_id, e)
+    return deleted
+
+async def _apply_spam_response(message, reason_text, copies=None,
+                               kick_new_accounts=False):
+    """Delete the offending message(s), punish the author, alert mods.
+
+    With kick_new_accounts, an account younger than SPAM_NEW_ACCOUNT_DAYS
+    is kicked rather than timed out — a throwaway made for the spam run
+    gets removed, while an established member gets a reversible timeout.
+    """
+    member = message.author
+    guild = message.guild
+
+    deleted = await _delete_spam_copies(message, copies)
+
+    minutes = getattr(config, 'SPAM_TIMEOUT_MINUTES', 10)
+    new_account_days = getattr(config, 'SPAM_NEW_ACCOUNT_DAYS', 2)
+    created_at = getattr(member, 'created_at', None)
+    is_new = bool(
+        kick_new_accounts and created_at is not None
+        and created_at > datetime.now(timezone.utc)
+        - timedelta(days=new_account_days))
+
+    if is_new:
+        try:
+            await member.kick(reason=f'Spam protection: {reason_text}')
+            action_note = (f'👢 Kicked **{member}** — account is less than '
+                          f'{new_account_days} day(s) old.')
+        except discord.Forbidden:
+            action_note = ('⚠️ Could not kick them — missing permission or '
+                          'rank. Act manually.')
+        except discord.HTTPException as e:
+            logger.error('Spam protection: kick failed for %s: %s', member, e)
+            action_note = '⚠️ Failed to kick them — Discord API error.'
+    else:
+        try:
+            until = discord.utils.utcnow() + timedelta(minutes=minutes)
+            await member.timeout(until, reason=f'Spam protection: {reason_text}')
+            action_note = f'🔇 Timed out **{member}** for {minutes} minute(s).'
+        except discord.Forbidden:
+            action_note = ('⚠️ Could not time them out — missing permission '
+                          'or rank. Act manually.')
+        except discord.HTTPException as e:
+            logger.error('Spam protection: timeout failed for %s: %s',
+                         member, e)
+            action_note = '⚠️ Failed to time them out — Discord API error.'
+
+    logger.warning('ALERT: spam protection triggered in %s by %s: %s',
+                   guild.name, member, reason_text)
+
+    moderators_channel = discord.utils.get(
+        guild.text_channels, name=MODERATORS_CHANNEL_NAME)
+    if not moderators_channel:
+        logger.error('Moderators channel "%s" not found in %s',
+                     MODERATORS_CHANNEL_NAME, guild.name)
+        return
+    excerpt = message.content[:200] or '[no text content]'
+    try:
+        await moderators_channel.send(
+            f"🚨 **SPAM PROTECTION TRIGGERED**\n\n"
+            f"{reason_text}\n{action_note}\n"
+            f"🗑️ Deleted {deleted} message(s).\n"
+            f"> {excerpt}")
+    except (discord.HTTPException, discord.Forbidden) as e:
+        logger.error('Failed to send spam alert to moderators: %s', e)
+
+async def check_message_spam(message):
+    """Run both spam detectors. True if the message was removed.
+
+    Returning True tells on_message to stop — there is no sense
+    autoreplying to a message that no longer exists.
+    """
+    if not getattr(config, 'SPAM_PROTECTION_ENABLED', True):
+        return False
+    if _spam_exempt(message):
+        return False
+
+    # Track the link first, unconditionally. Spam runs routinely pair a
+    # link with mass pings, and responding to the mentions before this
+    # ran would leave every such post untracked — so the cross-channel
+    # copies would never accumulate, and if the timeout failed the run
+    # would continue undetected as a cross-post.
+    copies = _check_link_crosspost(message)
+
+    if copies:
+        # A confirmed cross-channel run outranks the mention count: it's
+        # the stronger signal and carries the stronger response.
+        channels = len({c[2] for c in copies}) + 1
+        await _apply_spam_response(
+            message,
+            f'**{message.author}** posted the same link in **{channels}** '
+            f'channels within '
+            f'{getattr(config, "SPAM_CROSSPOST_WINDOW_SECONDS", 30)}s.',
+            copies=copies, kick_new_accounts=True)
+        return True
+
+    if _check_mention_spam(message):
+        total = len(getattr(message, 'mentions', ()))
+        total += len(getattr(message, 'role_mentions', ()))
+        await _apply_spam_response(
+            message,
+            f'**{message.author}** pinged **{total}** targets in one message '
+            f'in {message.channel.mention}.',
+            kick_new_accounts=True)
+        return True
+
+    return False
 
 # Raid protection
 # ---------------------------------------------------------------------------

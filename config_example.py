@@ -44,6 +44,17 @@ ANTI_NUKE_WINDOW_SECONDS = 60      # ...within this many seconds
 # response and only notifies moderators.
 ANTI_NUKE_ACTION = 'strip_roles'   # 'strip_roles' | 'alert'
 
+# Message spam protection: catches the two things a raid cashes out as —
+# the same link blasted across several channels at once, and mass pings.
+# Link detection is behavioral rather than a domain blocklist, so it
+# catches brand-new scam domains with no list to maintain. See CLAUDE.md's
+# "Message Spam Protection" section.
+SPAM_PROTECTION_ENABLED = True
+SPAM_CROSSPOST_WINDOW_SECONDS = 30  # same link in 2+ channels this fast
+SPAM_MENTION_THRESHOLD = 3          # distinct mentions in one message
+SPAM_TIMEOUT_MINUTES = 10           # how long an offender is timed out
+SPAM_NEW_ACCOUNT_DAYS = 2           # link-spammers younger: kick, not timeout
+
 # Update checking configuration
 UPDATE_CHECKING_ENABLED = True  # Set to False to disable automatic update checking
 UPDATE_CHECK_REPO_URL = "https://github.com/BurbSec/JohnnyBot"
