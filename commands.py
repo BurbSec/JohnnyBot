@@ -1988,8 +1988,8 @@ def register_commands():
          describe={'backup_file': 'The .json backup file produced by /server_backup'},
          error=server_restore_error)
     _reg('auto_backup',
-         'Enable/disable automatic server backups on an interval; only '
-         'creates a new backup when the structure actually changed',
+         'Enable/disable automatic server backups; only backs up when '
+         'the structure changed',
          auto_backup_command, admin_only=True,
          describe={'enabled': 'True to enable automatic backups, False to disable',
                    'interval_hours': 'Hours between backup checks, 1-720 (default 24; only used when enabling)'},
