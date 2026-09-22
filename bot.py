@@ -1079,6 +1079,194 @@ def _raid_lockdown_active(guild):
     until = getattr(guild, 'invites_paused_until', None)
     return until is not None and until > datetime.now(timezone.utc)
 
+# Avatar clustering
+# ---------------------------------------------------------------------------
+# Raid accounts are bought or generated in bulk and reuse a small set of
+# profile pictures, so grouping joiners by avatar separates a real raid
+# ("12 of these 14 share one image") from an ordinary surge of arrivals.
+#
+# Hashes the image BYTES rather than Discord's avatar key. The key looked
+# like a free shortcut, but whether two accounts uploading the identical
+# image receive the same key is undocumented and could not be verified —
+# building on that assumption risks a feature that silently finds
+# nothing. The key is still used as a download cache key, so if it does
+# turn out to be content-derived the work collapses for free.
+_avatar_hash_cache = {}  # avatar key -> (timestamp, sha256 of the bytes)
+
+# "Has an avatar we couldn't download", which is not the same thing as
+# "has no avatar". Reporting a failed fetch as a bare default-avatar
+# account would tell moderators something false about that account.
+_AVATAR_UNREADABLE = object()
+
+async def _hash_member_avatar(member):
+    """SHA-256 of a member's avatar image.
+
+    Returns None for a member with no custom avatar, or
+    _AVATAR_UNREADABLE when they have one but it could not be fetched.
+    """
+    asset = getattr(member, 'avatar', None)
+    if asset is None:
+        return None
+
+    key = getattr(asset, 'key', None)
+    ttl = getattr(config, 'RAID_AVATAR_CACHE_TTL', 300)
+    now = datetime.now(timezone.utc).timestamp()
+    if key is not None:
+        cached = _avatar_hash_cache.get(key)
+        if cached and now - cached[0] <= ttl:
+            return cached[1]
+
+    try:
+        raw = await asset.read()
+    except (discord.HTTPException, discord.DiscordException) as e:
+        # One unreadable avatar must never fail the whole batch.
+        logger.warning('Avatar clustering: could not read avatar for %s: %s',
+                       member, e)
+        return _AVATAR_UNREADABLE
+
+    digest = hashlib.sha256(raw).hexdigest()
+    if key is not None:
+        _avatar_hash_cache[key] = (now, digest)
+    return digest
+
+async def cluster_members_by_avatar(members):
+    """Group members by identical avatar image.
+
+    Returns a dict:
+      clusters   - list of member lists sharing an image, largest first,
+                   only groups of 2+
+      no_avatar  - members with no custom avatar, counted but never
+                   clustered: they share a Discord default derived from
+                   their user id, so grouping them would be meaningless
+                   (though a lot of them at once is its own raid signal).
+                   Members whose avatar merely failed to download are not
+                   in here — that would misreport them as picture-less.
+      unreadable - count of members whose avatar could not be fetched,
+                   reported separately so the summary never implies they
+                   were checked
+      scanned    - how many members were looked at
+      skipped    - True when the batch exceeded RAID_AVATAR_SCAN_LIMIT
+                   and no scan was run at all
+    """
+    empty = {'clusters': [], 'no_avatar': [], 'unreadable': 0,
+             'scanned': 0, 'skipped': False}
+    if not getattr(config, 'RAID_AVATAR_CLUSTERING_ENABLED', True):
+        return empty
+
+    limit = getattr(config, 'RAID_AVATAR_SCAN_LIMIT', 50)
+    if len(members) > limit:
+        return {**empty, 'skipped': True}
+
+    # Bounded concurrency, matching the scraper pattern in commands.py.
+    # Bytes are hashed and dropped inside each task, so at most this many
+    # avatars are ever resident at once.
+    sem = asyncio.Semaphore(5)
+
+    async def _hash(member):
+        async with sem:
+            return member, await _hash_member_avatar(member)
+
+    results = await asyncio.gather(
+        *[_hash(m) for m in members], return_exceptions=True)
+
+    by_digest = {}
+    no_avatar = []
+    unreadable = 0
+    scanned = 0
+    for result in results:
+        if isinstance(result, BaseException):
+            logger.warning('Avatar clustering: hashing failed: %s', result)
+            continue
+        member, digest = result
+        scanned += 1
+        if digest is _AVATAR_UNREADABLE:
+            unreadable += 1
+        elif digest is None:
+            no_avatar.append(member)
+        else:
+            by_digest.setdefault(digest, []).append(member)
+
+    if unreadable:
+        logger.info('Avatar clustering: %d avatar(s) could not be checked',
+                    unreadable)
+
+    clusters = sorted(
+        (group for group in by_digest.values() if len(group) > 1),
+        key=len, reverse=True)
+    return {'clusters': clusters, 'no_avatar': no_avatar,
+            'unreadable': unreadable, 'scanned': scanned, 'skipped': False}
+
+# Discord hard-rejects any message over 2000 characters, and this report
+# is appended to text that already carries its own content. Budgeting it
+# well under the cap keeps a big raid from turning the whole alert into
+# an HTTPException — which would cost moderators the alert at exactly
+# the wrong moment. Same reasoning as DASHBOARD_CHUNK_LIMIT.
+_CLUSTER_REPORT_BUDGET = 1200
+_CLUSTER_MAX_GROUPS = 5
+
+def format_avatar_clusters(result):
+    """Render a cluster_members_by_avatar() result as report text, or ''
+    if there is nothing worth saying."""
+    if result['skipped']:
+        limit = getattr(config, 'RAID_AVATAR_SCAN_LIMIT', 50)
+        return (f'\n\n🖼️ Avatar scan skipped — more than {limit} members to '
+                f'check.')
+    scanned = result['scanned']
+    if not scanned:
+        return ''
+
+    clusters = result['clusters']
+    no_avatar = result['no_avatar']
+    unreadable = result['unreadable']
+    # Only these were actually compared, so no line may imply anything
+    # about the ones that failed to download or never had a picture.
+    checked = scanned - unreadable
+    with_avatar = checked - len(no_avatar)
+
+    parts = []
+    if clusters:
+        matched = sum(len(group) for group in clusters)
+        parts.append(
+            f'🖼️ **{matched} of {with_avatar}** share only '
+            f'**{len(clusters)}** distinct avatar(s) — bulk-created '
+            f'accounts reuse profile pictures:')
+        for index, group in enumerate(clusters[:_CLUSTER_MAX_GROUPS], start=1):
+            names = ', '.join(str(m) for m in group[:10])
+            if len(group) > 10:
+                names += f' ... and {len(group) - 10} more'
+            parts.append(f'• Group {index} ({len(group)}): {names}')
+        if len(clusters) > _CLUSTER_MAX_GROUPS:
+            parts.append(
+                f'• ... and {len(clusters) - _CLUSTER_MAX_GROUPS} more group(s)')
+    elif with_avatar:
+        parts.append(f'🖼️ All {with_avatar} avatars are distinct.')
+    if no_avatar:
+        parts.append(
+            f'👤 **{len(no_avatar)} of {checked}** have no avatar set.')
+    if unreadable:
+        parts.append(
+            f'❓ {unreadable} avatar(s) could not be checked.')
+    if not parts:
+        return ''
+
+    body = '\n'.join(parts)
+    if len(body) > _CLUSTER_REPORT_BUDGET:
+        body = body[:_CLUSTER_REPORT_BUDGET] + '\n… report truncated.'
+    return '\n\n' + body
+
+async def _avatar_cluster_report(members):
+    """Cluster and format in one call, never raising.
+
+    Used on the raid-alert path, where a clustering problem must not cost
+    the moderators their alert.
+    """
+    try:
+        return format_avatar_clusters(
+            await cluster_members_by_avatar(members))
+    except Exception as e:  # pylint: disable=broad-exception-caught
+        logger.error('Avatar clustering failed: %s', e)
+        return ''
+
 async def _apply_raid_lockdown(guild, join_count, window_seconds):
     """Pause invites and DMs (Discord's self-expiring incident actions)
     and alert moderators. No-ops if a lockdown is already active so a
@@ -1132,10 +1320,27 @@ async def _apply_raid_lockdown(guild, join_count, window_seconds):
             f"{window_seconds}s) — **could not pause invites/DMs**, "
             f"the bot needs the **Manage Server** permission. "
             f"Review with `/raid recent_joins` and act manually.")
+
     try:
         await moderators_channel.send(body)
     except (discord.HTTPException, discord.Forbidden) as e:
         logger.error('Failed to send raid alert to moderators: %s', e)
+
+    # Runs only now, after both the lockdown and the alert: this
+    # downloads avatars, and neither the protective action nor the
+    # moderators' notification should ever wait on network calls. Sent as
+    # its own message so a long cluster list can't push the alert itself
+    # over Discord's 2000-character limit.
+    window_start = datetime.now(timezone.utc) - timedelta(
+        seconds=window_seconds)
+    recent = [m for m in guild.members
+              if m.joined_at and m.joined_at >= window_start]
+    report = await _avatar_cluster_report(recent)
+    if report.strip():
+        try:
+            await moderators_channel.send(report.strip())
+        except (discord.HTTPException, discord.Forbidden) as e:
+            logger.error('Failed to send avatar cluster report: %s', e)
 
 @bot.event
 async def on_member_join(member):

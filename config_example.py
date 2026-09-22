@@ -30,6 +30,12 @@ RAID_JOIN_THRESHOLD = 6        # joins within the window that trigger it
 RAID_JOIN_WINDOW_SECONDS = 30  # sliding window the threshold measures
 RAID_LOCKDOWN_MINUTES = 60     # how long invites/DMs stay paused
 RAID_NEW_ACCOUNT_HOURS = 24    # flag accounts younger than this in review/kick
+# Raid accounts are generated in bulk and reuse profile pictures, so
+# grouping recent joiners by avatar separates a real raid from an
+# ordinary surge of arrivals. Costs one CDN fetch per new avatar.
+RAID_AVATAR_CLUSTERING_ENABLED = True
+RAID_AVATAR_SCAN_LIMIT = 50    # skip the scan past this many members
+RAID_AVATAR_CACHE_TTL = 300    # seconds to reuse a hashed avatar
 
 # Anti-nuke: watches the audit log for a compromised mod/admin account (or
 # a rogue integration) going on a destructive spree, or quietly granting a

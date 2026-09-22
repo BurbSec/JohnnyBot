@@ -5458,7 +5458,19 @@ async def raid_recent_joins_command(
         body = (f'**{len(joined)} member(s) joined in the last '
                f'{minutes} minute(s):**\n'
                + _format_list_with_overflow(lines, max_shown=25, prefix=''))
+
         await interaction.followup.send(body, ephemeral=True)
+
+        # Same clustering the raid alert runs, on demand: tells a
+        # moderator which of these accounts are the same operator, which
+        # is what makes /raid kick_recent safe to reach for. Sent as a
+        # second followup rather than appended — together they can exceed
+        # Discord's 2000-character limit, and losing the join list to an
+        # HTTPException mid-raid is the worst possible time for it.
+        import bot as bot_module  # pylint: disable=cyclic-import
+        report = await bot_module._avatar_cluster_report(joined)  # pylint: disable=protected-access
+        if report.strip():
+            await interaction.followup.send(report.strip(), ephemeral=True)
     except discord.HTTPException as e:
         logger.error('Error in raid_recent_joins command: %s', e)
         await interaction.followup.send(
