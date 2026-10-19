@@ -61,6 +61,21 @@ SPAM_MENTION_THRESHOLD = 3          # distinct mentions in one message
 SPAM_TIMEOUT_MINUTES = 10           # how long an offender is timed out
 SPAM_NEW_ACCOUNT_DAYS = 2           # link-spammers younger: kick, not timeout
 
+# /media_dump zips a channel's images/video/audio for a date range and
+# DMs the requester a link to it, served by a small built-in web server.
+# The server binds MEDIA_DUMP_HOST only while a link is live and shuts
+# down (deleting the archives) MEDIA_DUMP_LINK_MINUTES after the newest
+# link. With no BASE_URL the link is built from the bot's public IP (looked
+# up via api.ipify.org, falling back to the local address) and the port
+# below, so that port must be reachable from moderators' browsers. Plain
+# HTTP: the unguessable link itself is the only credential.
+MEDIA_DUMP_BASE_URL = ''           # optional override, e.g. 'https://bot.example.com'
+MEDIA_DUMP_HOST = '0.0.0.0'        # interface the download server binds
+MEDIA_DUMP_PORT = 48731            # uncommon on purpose
+MEDIA_DUMP_LINK_MINUTES = 15       # link + server lifetime
+MEDIA_DUMP_MAX_FILE_MB = 100       # skip single files larger than this
+MEDIA_DUMP_MAX_TOTAL_MB = 1024     # stop adding once the archive hits this
+
 # Update checking configuration
 UPDATE_CHECKING_ENABLED = True  # Set to False to disable automatic update checking
 UPDATE_CHECK_REPO_URL = "https://github.com/BurbSec/JohnnyBot"

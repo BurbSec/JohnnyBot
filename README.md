@@ -49,6 +49,7 @@ Each of these can be turned off at runtime. Moderators are exempt from spam prot
 | `/timeout` | Timeout a member for a specified duration | Mod |
 | `/botsay` | Make the bot send a message to a specified channel | Mod |
 | `/message_dump` | Dump a user's messages from a channel into a zipped archive DM'd to you (25 MB cap) | Mod |
+| `/media_dump` | Zip a channel's images, video and audio for a date range and get a temporary (15 min) download link by DM; port 48731 must be reachable | Mod |
 
 ### Safety & Anti-Raid
 

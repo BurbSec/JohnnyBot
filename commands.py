@@ -13,6 +13,7 @@ import uuid
 import zipfile
 import shutil
 import hashlib
+import secrets
 import contextlib
 import socket
 import ipaddress
@@ -27,6 +28,7 @@ from apscheduler.jobstores.base import JobLookupError
 import discord
 from discord import app_commands
 import aiohttp
+from aiohttp import web
 import feedparser
 from icalendar import Calendar, IncompleteComponent
 try:
@@ -1906,6 +1908,14 @@ def register_commands():
                    'start_date': "Start date in YYYY-MM-DD format (e.g., 2025-01-01)",
                    'limit': "Maximum number of messages to fetch (default: 1000)"},
          error=message_dump_error)
+    _reg('media_dump',
+         "Zip a channel's media for a date range and get a temporary download link",
+         media_dump_command, mod_only=True,
+         describe={'channel': "Channel to download media from",
+                   'start_date': "First day to include, YYYY-MM-DD (UTC)",
+                   'end_date': "Last day to include, YYYY-MM-DD (UTC)",
+                   'limit': "Maximum number of messages to scan (default: 10000)"},
+         error=media_dump_error)
     _reg('clone_category_permissions',
          'Clone permissions from source category to destination category',
          clone_category_permissions, mod_only=True,
@@ -3102,6 +3112,392 @@ async def message_dump_command(interaction: discord.Interaction, user: discord.U
         await interaction.followup.send("An unexpected error occurred.", ephemeral=True)
 
 message_dump_error = _command_error_handler
+
+
+# --- /media_dump ---------------------------------------------------------
+# Media archives are routinely far past the 25 MB Discord upload cap, so
+# unlike /message_dump the zip is not attached: the bot serves it over a
+# small aiohttp server behind an unguessable, expiring link. The server
+# only exists while a link is live: it starts when an archive is ready and
+# shuts down (deleting every archive) MEDIA_DUMP_LINK_MINUTES after the
+# newest link was issued. Everything is read with getattr so a config.py
+# written before this feature existed keeps working: with no config at all
+# the link is built from the bot's own address on an uncommon port.
+MEDIA_EXTENSIONS = frozenset({
+    '.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.tif', '.tiff',
+    '.heic', '.avif', '.mp4', '.mov', '.webm', '.mkv', '.avi', '.m4v',
+    '.mp3', '.wav', '.ogg', '.flac', '.m4a', '.opus'})
+_MEDIA_TIME_BUDGET_SECONDS = 13 * 60  # interaction tokens die at 15 min
+_MEDIA_PROGRESS_EVERY = 2000
+_MEDIA_DEFAULT_PORT = 48731  # uncommon, to stay out of scanners' usual lists
+
+_media_links: Dict[str, Dict[str, Any]] = {}
+_media_server_runner: Optional[web.AppRunner] = None
+_media_server_lock = asyncio.Lock()
+_media_shutdown_handle: Optional[asyncio.TimerHandle] = None
+_media_shutdown_task: Optional[asyncio.Task] = None
+_media_dumps_running: set = set()  # guild ids with a dump in flight
+
+
+def _media_cfg(name, default):
+    return getattr(config, name, default)
+
+
+def _is_media_attachment(attachment) -> bool:
+    """True for images, video and audio.
+
+    Trusts Discord's content_type when present and falls back to the file
+    extension, since content_type is optional on old attachments.
+    """
+    ctype = (attachment.content_type or '').lower()
+    if ctype:
+        return ctype.split('/', 1)[0] in ('image', 'video', 'audio')
+    return os.path.splitext(attachment.filename or '')[1].lower() in MEDIA_EXTENSIONS
+
+
+def _media_archive_name(message, attachment) -> str:
+    """Unique, path-safe zip member name: timestamp + ids + filename.
+
+    The ids keep two `image.png` uploads apart; the character whitelist
+    means a hostile filename can never carry a path separator.
+    """
+    safe = re.sub(r'[^\w.\-]', '_', os.path.basename(attachment.filename or 'file'))
+    stamp = message.created_at.strftime('%Y%m%d_%H%M%S')
+    return f"{stamp}_{message.id}_{attachment.id}_{safe}"
+
+
+async def _public_base_url() -> str:
+    """Invent the link's base URL from the bot's own address.
+
+    MEDIA_DUMP_BASE_URL wins if set (reverse proxy, DNS name). Otherwise
+    ask api.ipify.org for our public IP (the only thing it learns is the
+    IP it already sees), falling back to the local interface address,
+    which is right for a LAN-only deployment. Raises RuntimeError if
+    neither works.
+    """
+    override = _media_cfg('MEDIA_DUMP_BASE_URL', '')
+    if override:
+        return override.rstrip('/')
+    port = _media_cfg('MEDIA_DUMP_PORT', _MEDIA_DEFAULT_PORT)
+    ip = None
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get('https://api.ipify.org',
+                                   timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                ip = str(ipaddress.ip_address((await resp.text()).strip()))
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+        logger.warning("Could not look up public IP; using local address")
+    if ip is None:
+        try:
+            # UDP connect sends nothing; it just picks the outbound interface.
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+                sock.connect(('192.0.2.1', 9))
+                ip = sock.getsockname()[0]
+        except OSError as e:
+            raise RuntimeError("could not determine the bot's address") from e
+    return f"http://{ip}:{port}"
+
+
+def _parse_utc_day(text: str) -> Optional[datetime]:
+    """Parse YYYY-MM-DD as midnight UTC, or None if malformed."""
+    try:
+        return datetime.strptime(text, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def _expire_media_link(token: str) -> None:
+    """Forget a download link and delete its archive."""
+    entry = _media_links.pop(token, None)
+    if entry:
+        shutil.rmtree(entry['dir'], ignore_errors=True)
+        logger.info("Expired media dump link and removed %s", entry['dir'])
+
+
+async def _stop_media_server() -> None:
+    """Shut the download server down and delete every outstanding archive."""
+    global _media_server_runner, _media_shutdown_handle  # pylint: disable=global-statement
+    async with _media_server_lock:
+        if _media_shutdown_handle is not None:
+            _media_shutdown_handle.cancel()
+            _media_shutdown_handle = None
+        for token in list(_media_links):
+            _expire_media_link(token)
+        runner, _media_server_runner = _media_server_runner, None
+        if runner is not None:
+            await runner.cleanup()
+            logger.info("Media dump download server stopped")
+
+
+def _schedule_media_shutdown(ttl_seconds: int) -> None:
+    """(Re)arm the server shutdown timer; the newest link wins."""
+    global _media_shutdown_handle  # pylint: disable=global-statement
+    if _media_shutdown_handle is not None:
+        _media_shutdown_handle.cancel()
+
+    def _fire():
+        global _media_shutdown_task  # pylint: disable=global-statement
+        _media_shutdown_task = asyncio.ensure_future(_stop_media_server())
+
+    _media_shutdown_handle = asyncio.get_running_loop().call_later(
+        ttl_seconds, _fire)
+
+
+def _register_media_link(zip_path: str, ttl_seconds: int) -> str:
+    """Issue an expiring token for `zip_path`; returns the token.
+
+    Must be called on the event loop (it schedules the expiry there).
+    """
+    token = secrets.token_urlsafe(32)
+    _media_links[token] = {
+        'path': zip_path,
+        'dir': os.path.dirname(zip_path),
+        'filename': os.path.basename(zip_path),
+        'expires': time_module.time() + ttl_seconds,
+    }
+    asyncio.get_running_loop().call_later(ttl_seconds, _expire_media_link, token)
+    _schedule_media_shutdown(ttl_seconds)
+    return token
+
+
+async def _media_download_handler(request):
+    token = request.match_info['token']
+    entry = _media_links.get(token)
+    if entry is None:
+        raise web.HTTPNotFound(text="This link has expired or does not exist.")
+    if entry['expires'] <= time_module.time():
+        _expire_media_link(token)
+        raise web.HTTPNotFound(text="This link has expired or does not exist.")
+    return web.FileResponse(entry['path'], headers={
+        'Content-Disposition': f'attachment; filename="{entry["filename"]}"',
+        'Cache-Control': 'no-store'})
+
+
+def _build_media_app():
+    app = web.Application()
+    app.router.add_get('/dl/{token}', _media_download_handler)
+    return app
+
+
+async def _ensure_media_server() -> None:
+    """Start the download server if it isn't up. Raises OSError if the port is taken."""
+    global _media_server_runner  # pylint: disable=global-statement
+    async with _media_server_lock:
+        if _media_server_runner is not None:
+            return
+        host = _media_cfg('MEDIA_DUMP_HOST', '0.0.0.0')
+        port = _media_cfg('MEDIA_DUMP_PORT', _MEDIA_DEFAULT_PORT)
+        runner = web.AppRunner(_build_media_app())
+        await runner.setup()
+        try:
+            await web.TCPSite(runner, host, port).start()
+        except OSError:
+            await runner.cleanup()
+            raise
+        _media_server_runner = runner
+        logger.info("Media dump download server listening on %s:%s", host, port)
+
+
+def cleanup_orphaned_media_dumps() -> int:
+    """Remove media_dump_ directories that no live link owns.
+
+    A restart loses the in-memory link table, orphaning any archives on
+    disk. Age-gated (link lifetime + grace) so a dump still being built
+    for another guild is never touched.
+    """
+    cleaned = 0
+    max_age = _media_cfg('MEDIA_DUMP_LINK_MINUTES', 15) * 60 + 1800
+    owned = {entry['dir'] for entry in _media_links.values()}
+    try:
+        for item in os.listdir(TEMP_DIR):
+            path = os.path.join(TEMP_DIR, item)
+            if (item.startswith("media_dump_") and os.path.isdir(path)
+                    and path not in owned
+                    and time_module.time() - os.path.getmtime(path) > max_age):
+                shutil.rmtree(path, ignore_errors=True)
+                cleaned += 1
+    except OSError as e:
+        logger.error("Error cleaning up orphaned media dumps: %s", e)
+    return cleaned
+
+
+async def media_dump_command(interaction: discord.Interaction, channel: discord.TextChannel,  # pylint: disable=too-many-locals,too-many-branches,too-many-statements
+                             start_date: str, end_date: str,
+                             limit: app_commands.Range[int, 1, 100000] = 10000):
+    """Zip every image/video/audio attachment in a date range and serve it via a temporary link."""
+    await interaction.response.defer(ephemeral=True)
+
+    start_dt = _parse_utc_day(start_date)
+    end_dt = _parse_utc_day(end_date)
+    if start_dt is None or end_dt is None:
+        await interaction.followup.send(
+            "Invalid date format. Please use YYYY-MM-DD (e.g., 2025-01-01).",
+            ephemeral=True)
+        return
+    if end_dt < start_dt:
+        await interaction.followup.send(
+            "`end_date` must not be before `start_date`.", ephemeral=True)
+        return
+    end_exclusive = end_dt + timedelta(days=1)  # end_date is inclusive
+
+    if not channel.permissions_for(interaction.user).read_message_history:
+        await interaction.followup.send(
+            f"You can't read the history of {channel.mention}, so you can't "
+            f"dump it either.", ephemeral=True)
+        return
+
+    guild_id = interaction.guild.id
+    if guild_id in _media_dumps_running:
+        await interaction.followup.send(
+            "A media dump is already running for this server. Try again "
+            "when it finishes.", ephemeral=True)
+        return
+    _media_dumps_running.add(guild_id)
+
+    dump_dir = None
+    try:
+        await asyncio.to_thread(cleanup_orphaned_media_dumps)
+
+        max_file = _media_cfg('MEDIA_DUMP_MAX_FILE_MB', 100) * 1024 * 1024
+        max_total = _media_cfg('MEDIA_DUMP_MAX_TOTAL_MB', 1024) * 1024 * 1024
+        ttl_minutes = _media_cfg('MEDIA_DUMP_LINK_MINUTES', 15)
+
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        dump_dir = os.path.join(TEMP_DIR, f"media_dump_{interaction.user.id}_{stamp}")
+        os.makedirs(dump_dir, exist_ok=True)
+        zip_path = os.path.join(
+            dump_dir, f"{channel.name}_media_{start_date}_to_{end_date}.zip")
+
+        await interaction.followup.send(
+            f"Collecting media from {channel.mention}, {start_date} to "
+            f"{end_date}. This may take a while...", ephemeral=True)
+
+        scanned = added = skipped_large = failed = total_bytes = 0
+        notes = []
+        deadline = time_module.monotonic() + _MEDIA_TIME_BUDGET_SECONDS
+        # ZIP_STORED: images and video are already compressed, so
+        # deflating burns CPU for ~nothing.
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_STORED) as zipf:
+            try:
+                async for msg in channel.history(
+                        limit=limit, after=start_dt, before=end_exclusive,
+                        oldest_first=True):
+                    scanned += 1
+                    if time_module.monotonic() > deadline:
+                        notes.append("Stopped early: ran out of time.")
+                        break
+                    full = False
+                    for att in msg.attachments:
+                        if not _is_media_attachment(att):
+                            continue
+                        if att.size > max_file:
+                            skipped_large += 1
+                            continue
+                        if total_bytes + att.size > max_total:
+                            notes.append(
+                                f"Stopped at the {max_total // 1024 // 1024} MB "
+                                f"archive cap.")
+                            full = True
+                            break
+                        try:
+                            data = await att.read()
+                        except (discord.HTTPException, aiohttp.ClientError) as e:
+                            logger.warning("Could not download attachment %s: %s", att.id, e)
+                            failed += 1
+                            continue
+                        await asyncio.to_thread(
+                            zipf.writestr, _media_archive_name(msg, att), data)
+                        total_bytes += len(data)
+                        added += 1
+                    if full:
+                        break
+                    if scanned % _MEDIA_PROGRESS_EVERY == 0:
+                        await interaction.followup.send(
+                            f"Progress: scanned {scanned} messages, "
+                            f"{added} files so far...", ephemeral=True)
+            except discord.RateLimited:
+                notes.append("Stopped early: Discord rate limited the bot.")
+        if scanned >= limit:
+            notes.append(f"Hit the scan limit of {limit} messages; later "
+                         f"messages in the range were not checked.")
+        if skipped_large:
+            notes.append(f"{skipped_large} file(s) over "
+                         f"{max_file // 1024 // 1024} MB were skipped.")
+        if failed:
+            notes.append(f"{failed} file(s) failed to download.")
+
+        if not added:
+            await interaction.followup.send(
+                f"No media found in {channel.mention} between {start_date} "
+                f"and {end_date} ({scanned} messages scanned)."
+                + "".join(f"\n{n}" for n in notes), ephemeral=True)
+            return
+
+        # Only now, with an archive in hand, open the port.
+        try:
+            await _ensure_media_server()
+        except OSError as e:
+            logger.error("Could not start media download server: %s", e)
+            await interaction.followup.send(
+                "The archive is built, but the download server couldn't "
+                "start (is the port in use?).", ephemeral=True)
+            return
+
+        try:
+            base_url = await _public_base_url()
+        except RuntimeError as e:
+            logger.error("media_dump: %s", e)
+            await interaction.followup.send(
+                "The archive is built, but I couldn't work out my own "
+                "address. Set `MEDIA_DUMP_BASE_URL` in config.py.",
+                ephemeral=True)
+            return
+
+        token = _register_media_link(zip_path, ttl_minutes * 60)
+        link = f"{base_url}/dl/{token}"
+        dump_dir = None  # owned by the link now; expiry deletes it
+        extra = "".join(f"\n{n}" for n in notes)
+        note_bot_dm(interaction.user.id)
+        try:
+            await interaction.user.send(
+                f"Media from {channel.mention}, {start_date} to {end_date}:\n"
+                f"**Files:** {added} ({total_bytes / 1024 / 1024:.1f} MB)\n"
+                f"**Messages scanned:** {scanned}\n"
+                f"**Download:** {link}\n"
+                f"The link and download server shut down in {ttl_minutes} "
+                f"minutes. Anyone who has the link can download the "
+                f"archive, so don't share it." + extra)
+        except discord.Forbidden:
+            _expire_media_link(token)
+            await interaction.followup.send(
+                "I couldn't DM you the link. Enable DMs from this server's "
+                "members and run the command again.", ephemeral=True)
+            return
+        await interaction.followup.send(
+            f"Done: {added} file(s) from {channel.mention}. I sent the "
+            f"download link to your DMs; it expires in {ttl_minutes} "
+            f"minutes." + extra, ephemeral=True)
+
+    except discord.Forbidden:
+        await interaction.followup.send(
+            f"I don't have permission to read messages in {channel.mention}.",
+            ephemeral=True)
+    except discord.HTTPException as e:
+        logger.error('Discord API error in media_dump_command: %s', e)
+        await interaction.followup.send("A Discord API error occurred.", ephemeral=True)
+    except OSError as e:
+        logger.error('File system error in media_dump_command: %s', e)
+        await interaction.followup.send(
+            "A file system error occurred while creating the media dump.", ephemeral=True)
+    except Exception as e:  # pylint: disable=broad-exception-caught
+        logger.error('Unexpected error in media_dump_command: %s', e)
+        await interaction.followup.send("An unexpected error occurred.", ephemeral=True)
+    finally:
+        _media_dumps_running.discard(guild_id)
+        if dump_dir:
+            shutil.rmtree(dump_dir, ignore_errors=True)
+
+media_dump_error = _command_error_handler
 _DANGEROUS_PERM_ATTRS = (
     'administrator', 'ban_members', 'kick_members', 'manage_roles',
     'manage_guild', 'manage_channels', 'manage_messages', 'moderate_members',
@@ -4348,7 +4744,8 @@ def get_command_categories():
             "/kick - Kicks one or more members from the server",
             "/kick_role - Kicks all members with a specified role",
             "/timeout - Timeouts a member for a specified duration",
-            "/message_dump - Dump a user's messages into a downloadable file"
+            "/message_dump - Dump a user's messages into a downloadable file",
+            "/media_dump - Zip a channel's media for a date range into a temporary download link"
         ],
         "🔐 Permissions Management": [
             "/clone_category_permissions - Clone permissions from source to destination category",
