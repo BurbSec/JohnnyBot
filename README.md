@@ -24,7 +24,7 @@ can be leveraged by all users.
 
 These run without being invoked, so they are worth knowing about before you deploy:
 
-- **DMs to the bot get you kicked.** Anyone who sends the bot a direct message is removed from every server they share with it, and the kick is reported to the moderators channel. Two exemptions: users with the Manage Messages permission, and anyone the bot itself DMed in the last 24 hours — so replying to a `/message_dump` archive or `/log_tail` output is safe.
+- **DMs to the bot get you kicked.** Anyone who sends the bot a direct message is removed from every server they share with it, and the kick is reported to the moderators channel. Two exemptions: users with the Manage Messages permission, and anyone the bot itself DMed in the last 24 hours — so replying to a `/message_dump` archive, `/media_dump` link or `/log_tail` output is safe.
 - **Protected channels are enforced.** Messages posted by anyone without Manage Messages in any channel listed in `PROTECTED_CHANNELS` are deleted.
 - **Voice channel chaperone.** When a voice channel contains exactly one adult and one child (by `ADULT_ROLE_NAMES` / `CHILD_ROLE_NAMES`), everyone in it is server-muted and the moderators channel is alerted once. The mute lifts automatically when the channel is no longer one adult and one child, when a muted member moves to a safe channel, or when the feature is disabled — including across a bot restart, since outstanding mutes are persisted to `chaperone_mutes.json`. Only mutes the bot applied are lifted; a manual moderator mute is never undone. Toggle with `/voice_chaperone`.
 - **Raid protection.** A burst of joins (default 6 within 30s) pauses invites and DMs between members for an hour using Discord's own self-expiring incident actions, and alerts moderators. The pause lifts itself — no cleanup needed, even if the bot restarts. The alert includes an avatar-cluster breakdown ("12 of 14 share one image"), since bulk-created raid accounts reuse profile pictures. Toggle with `/raid protection`.
@@ -49,7 +49,7 @@ Each of these can be turned off at runtime. Moderators are exempt from spam prot
 | `/timeout` | Timeout a member for a specified duration | Mod |
 | `/botsay` | Make the bot send a message to a specified channel | Mod |
 | `/message_dump` | Dump a user's messages from a channel into a zipped archive DM'd to you (25 MB cap) | Mod |
-| `/media_dump` | Zip a channel's images, video and audio for a date range and get a temporary (15 min) download link by DM; port 48731 must be reachable | Mod |
+| `/media_dump` | Zip a channel's images, video and audio for a date range and DM you a temporary download link (the built-in server shuts down after 15 min; TCP port 48731 must be reachable) | Mod |
 
 ### Safety & Anti-Raid
 
