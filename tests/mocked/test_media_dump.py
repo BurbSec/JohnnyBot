@@ -200,3 +200,9 @@ async def test_public_base_url_override(monkeypatch):
     monkeypatch.setattr(commands.config, 'MEDIA_DUMP_BASE_URL',
                         'https://bot.example.com/', raising=False)
     assert await commands._public_base_url() == 'https://bot.example.com'
+
+
+def test_dashboard_lists_media_dump_and_still_fits():
+    assert '/media_dump' in commands.format_dashboard_message()
+    assert all(len(c) <= commands.DASHBOARD_CHUNK_LIMIT
+               for c in commands.format_dashboard_messages())
