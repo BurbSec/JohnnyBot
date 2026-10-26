@@ -61,6 +61,12 @@ when it can't.
 - CI installs with `uv sync --locked`, so a `pyproject.toml` change without a
   matching `uv.lock` update fails the build.
 
+### Fixed
+- Auto-update no longer deploys a release when GitHub's list of changed files
+  can't be fetched or may be truncated (300+ files). That used to read as
+  "`config_example.py` unchanged", so a release needing config changes could
+  auto-deploy. It now posts a "review before updating" notice instead.
+
 ### Unchanged
 - Every dependency stays at the same version as v1.1.1. This release changes
   how packages are installed, not which ones.
