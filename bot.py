@@ -3,6 +3,7 @@
 import os
 import re
 import sys
+import shutil
 import asyncio
 import hashlib
 import logging
@@ -47,7 +48,7 @@ def _get_moderators_channel():
         (ch for g in bot.guilds for ch in g.text_channels
          if ch.name == MODERATORS_CHANNEL_NAME), None)
 
-async def _run_cmd(*args):
+async def _run_cmd(*args, env=None):
     """Run a command in the bot directory without blocking the event loop.
 
     Returns (returncode, stdout, stderr) as decoded strings.
@@ -56,7 +57,8 @@ async def _run_cmd(*args):
         *args,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
-        cwd=os.path.dirname(os.path.abspath(__file__))
+        cwd=os.path.dirname(os.path.abspath(__file__)),
+        env=env
     )
     stdout, stderr = await proc.communicate()
     return proc.returncode, stdout.decode().strip(), stderr.decode().strip()
@@ -157,9 +159,34 @@ async def _changed_files(session, repo_path, base, head):
         return None
     return [f['filename'] for f in files]
 
-async def _auto_update_and_restart(local_commit, remote_commit, deps_changed,
+
+async def _sync_dependencies():
+    """Bring the running interpreter's venv in line with uv.lock.
+
+    Syncs the venv the bot is actually running in (sys.prefix) rather
+    than whatever uv would pick, so the re-exec'd process sees the new
+    packages. Returns an error string on failure, None on success.
+    """
+    uv = shutil.which('uv')
+    if not uv:
+        return ("Dependencies changed, but `uv` is not installed on this "
+                "host. Install uv, then run `uv sync --frozen --no-dev` "
+                "and restart the bot.")
+    if sys.prefix == sys.base_prefix:
+        # Never let uv treat a system Python as the project environment
+        return ("Dependencies changed, but the bot is not running from a "
+                "virtual environment. Run `uv sync --frozen --no-dev` and "
+                "start the bot with `uv run bot.py`.")
+    env = {**os.environ, 'UV_PROJECT_ENVIRONMENT': sys.prefix}
+    rc, _, err = await _run_cmd(uv, 'sync', '--frozen', '--no-dev', env=env)
+    if rc != 0:
+        return f"`uv sync --frozen --no-dev` failed: {err or 'unknown error'}"
+    return None
+
+
+async def _auto_update_and_restart(local_commit, remote_commit,
                                    local_version=None, remote_version=None):
-    """Pull the latest code, reinstall deps if needed, and re-exec the bot.
+    """Pull the latest code, sync dependencies, and re-exec the bot.
 
     On success this never returns (the process is replaced). Returns an
     error string on failure so the caller can notify moderators.
@@ -171,13 +198,14 @@ async def _auto_update_and_restart(local_commit, remote_commit, deps_changed,
     if rc != 0:
         return f"`git pull --ff-only` failed: {err or 'unknown error'}"
 
-    if deps_changed:
-        rc, _, err = await _run_cmd(
-            sys.executable, '-m', 'pip', 'install', '-r', 'requirements.txt')
-        if rc != 0:
-            # Code is already pulled; restarting with missing deps could
-            # crash-loop, so bail out and ask for a manual fix
-            return f"`pip install -r requirements.txt` failed: {err or 'unknown error'}"
+    # Always sync rather than only when the diff shows a dependency
+    # change: the compare API's file list can fail or be truncated, and
+    # a no-op sync against an up-to-date venv costs well under a second.
+    error = await _sync_dependencies()
+    if error:
+        # Code is already pulled; restarting with missing deps could
+        # crash-loop, so bail out and ask for a manual fix
+        return error
 
     channel = _get_moderators_channel()
     if channel:
@@ -275,8 +303,7 @@ async def check_for_updates():
 
     if can_auto_update and ci_ok:
         error = await _auto_update_and_restart(
-            local_commit, remote_commit, 'requirements.txt' in changed_files,
-            local_version, remote_version)
+            local_commit, remote_commit, local_version, remote_version)
         # Only reached on failure — os.execv never returns
         logger.error("Auto-update failed: %s", error)
         _last_notified_commit = remote_commit
