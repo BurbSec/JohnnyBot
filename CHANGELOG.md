@@ -3,6 +3,39 @@
 Release notes for moderators are posted to the moderators channel from each
 release's annotated git tag. This file is for whoever runs the bot.
 
+## v1.2.2
+
+> [!WARNING]
+> ### One-time step before updating: untrack your live state files
+>
+> `event_feeds.json` and `reminders.json` were listed in `.gitignore` but still
+> tracked by git, so every feed check left a local change behind — and
+> `git pull --ff-only` refuses to run over one. This release stops tracking
+> them. **Before pulling it, run this in the bot directory** so git leaves
+> your live copies in place:
+>
+> ```shell
+> git rm --cached --ignore-unmatch event_feeds.json reminders.json
+> ```
+>
+> Skip it and auto-update stops with an **"Auto-update failed"** alert naming
+> `event_feeds.json`; your data is untouched. Run the command, then
+> `git pull --ff-only` and restart. A host that never edited either file can
+> skip this — git simply removes its unused copies, and the bot recreates
+> them empty.
+
+### Fixed
+- `event_feeds.json` and `reminders.json` are no longer tracked, so the bot's
+  own state writes can't block auto-update. The tracked `event_feeds.json`
+  also held one server's live feed subscriptions, which shouldn't have been in
+  the repository at all.
+
+### Docs
+- The README and Setup Guide now cover running under a sandboxed systemd unit
+  (system-wide uv, a writable uv cache, system Python only) and what
+  auto-update needs from the host: an HTTPS remote, write access for the
+  service account, and a clean working tree.
+
 ## v1.2.1
 
 ### Security

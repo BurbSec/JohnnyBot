@@ -2,7 +2,7 @@
 name = "johnnybot"
 # Display only — the running version shown to moderators comes from git
 # tags (see _version_label in bot.py). Bump alongside each release tag.
-version = "1.2.1"
+version = "1.2.2"
 description = "Discord bot for server management and automation"
 readme = "README.md"
 # 3.11 is the documented floor; CI tests 3.11-3.14.
