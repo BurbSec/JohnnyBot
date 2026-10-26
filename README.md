@@ -208,6 +208,10 @@ Environment=UV_LINK_MODE=copy
 # Use the system Python; never download one at service start
 Environment=UV_PYTHON_DOWNLOADS=never
 Environment=UV_PYTHON_PREFERENCE=only-system
+# Keep what auto-update pulls group-writable, and stop git warning about
+# the ~/.config that ProtectHome= hides
+UMask=0007
+Environment=XDG_CONFIG_HOME=/nonexistent
 ```
 
 The **[Setup Guide](../../wiki/Setup-Guide#running-as-a-service-recommended)** has a complete, sandboxed unit.
@@ -217,7 +221,7 @@ The **[Setup Guide](../../wiki/Setup-Guide#running-as-a-service-recommended)** h
 `AUTO_UPDATE_ENABLED` makes the bot run `git pull --ff-only` and `uv sync` **as the service account**, so that account must be able to update its own checkout:
 
 - **An HTTPS remote.** The repository is public, so `git remote set-url origin https://github.com/BurbSec/JohnnyBot.git` needs no credentials. An SSH remote needs a key the service account can read, which a sandboxed unit usually hides.
-- **Write access to the checkout and `.git`.** If you pull by hand as another account, share a group: `chgrp -R <bot-group> <dir>`, `find <dir> -type d -exec chmod g+rws {} +`, `chmod -R g+rw <dir>/.git`, `git -C <dir> config core.sharedRepository group`, and add yourself to the group.
+- **Write access to the checkout's directories and `.git`.** Git replaces files rather than editing them, so the files themselves can stay read-only to the bot — including `config.py`. If you also pull by hand as another account, share a group: make the directories group-writable and setgid, make `.git` group-writable, set `git config core.sharedRepository group`, add yourself to the group, and give the unit `UMask=0007`. The [Setup Guide](../../wiki/Setup-Guide#running-as-a-service-recommended) has the exact commands.
 - **A clean working tree.** `git pull --ff-only` refuses to run over local edits to tracked files.
 
 If any of these fail, the update stops before restarting and the moderators channel gets an "Auto-update failed" alert, so a misconfigured host fails loudly rather than breaking.
