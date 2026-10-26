@@ -63,3 +63,118 @@ async def test_ci_passed_no_runs_blocks():
 async def test_ci_passed_http_error_blocks():
     session = _FakeSession(503, {})
     assert await bot._ci_passed(session, 'owner/repo', 'a' * 40) is False
+
+
+# --- changed-file gate ------------------------------------------------
+
+class _RoutedSession:
+    """Fake aiohttp session answering by URL substring."""
+
+    def __init__(self, routes):
+        self._routes = routes
+
+    def get(self, url):
+        for fragment, (status, payload) in self._routes.items():
+            if fragment in url:
+                return _FakeResponse(status, payload)
+        raise AssertionError(f'unexpected request: {url}')
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return False
+
+
+def _files(*names):
+    return {'files': [{'filename': n} for n in names]}
+
+
+@pytest.mark.asyncio
+async def test_changed_files_lists_filenames():
+    session = _RoutedSession({'/compare/': (200, _files('bot.py', 'README.md'))})
+    assert await bot._changed_files(session, 'o/r', 'a', 'b') == ['bot.py', 'README.md']
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('status, payload', [
+    (404, {}),                 # request failed
+    (200, {}),                 # no file list at all
+    (200, _files(*[f'f{i}.py' for i in range(bot._COMPARE_FILE_LIMIT)])),  # may be truncated
+])
+async def test_changed_files_unknown_is_none_not_empty(status, payload):
+    session = _RoutedSession({'/compare/': (status, payload)})
+    assert await bot._changed_files(session, 'o/r', 'a', 'b') is None
+
+
+@pytest.fixture
+def update_check(monkeypatch):
+    """Drive check_for_updates with auto-update on and CI green.
+
+    Returns a function taking the compare response; it runs one check
+    and returns (auto_update_calls, notification_calls).
+    """
+    monkeypatch.setattr(bot.config, 'UPDATE_CHECKING_ENABLED', True)
+    monkeypatch.setattr(bot.config, 'AUTO_UPDATE_ENABLED', True)
+    monkeypatch.setattr(bot, '_last_notified_commit', None)
+
+    async def fake_run(*args, **kwargs):
+        return 0, 'a' * 40, ''  # git rev-parse HEAD
+    async def ci_green(*args):
+        return True
+    async def label(session, repo, sha, local):
+        return 'v-local' if local else 'v-remote'
+    monkeypatch.setattr(bot, '_run_cmd', fake_run)
+    monkeypatch.setattr(bot, '_ci_passed', ci_green)
+    monkeypatch.setattr(bot, '_version_label', label)
+
+    async def run(compare_status, compare_payload):
+        updates, notices = [], []
+
+        async def fake_update(*args):
+            updates.append(args)
+            return 'stopped by test'
+        async def fake_notify(*args):
+            notices.append(args)
+        monkeypatch.setattr(bot, '_auto_update_and_restart', fake_update)
+        monkeypatch.setattr(bot, 'send_update_notification', fake_notify)
+        monkeypatch.setattr(bot, '_get_moderators_channel', lambda: None)
+        session = _RoutedSession({
+            '/commits/main': (200, {'sha': 'b' * 40}),
+            '/compare/': (compare_status, compare_payload),
+        })
+        monkeypatch.setattr(bot.aiohttp, 'ClientSession', lambda **kw: session)
+        await bot.check_for_updates()
+        return updates, notices
+
+    return run
+
+
+@pytest.mark.asyncio
+async def test_failed_compare_blocks_auto_update(update_check):
+    updates, notices = await update_check(502, {})
+    assert updates == []
+    (local, remote, config_changed, changes_unknown), = notices
+    assert config_changed is False and changes_unknown is True
+
+
+@pytest.mark.asyncio
+async def test_truncated_compare_blocks_auto_update(update_check):
+    many = _files(*[f'f{i}.py' for i in range(bot._COMPARE_FILE_LIMIT)])
+    updates, notices = await update_check(200, many)
+    assert updates == []
+    assert notices[0][3] is True
+
+
+@pytest.mark.asyncio
+async def test_config_change_still_blocks_auto_update(update_check):
+    updates, notices = await update_check(200, _files('config_example.py'))
+    assert updates == []
+    assert notices[0][2:] == (True, False)
+
+
+@pytest.mark.asyncio
+async def test_known_safe_change_auto_updates(update_check):
+    updates, notices = await update_check(200, _files('bot.py'))
+    assert len(updates) == 1
+    assert notices == []
