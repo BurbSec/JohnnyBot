@@ -7,11 +7,11 @@
 > and keep running the old version. To upgrade, on the host:
 >
 > ```shell
-> curl -LsSf https://astral.sh/uv/install.sh | sh   # or: brew install uv / pipx install uv
+> curl -LsSf https://astral.sh/uv/install.sh | sh   # or: brew install uv
 > cd johnnybot
 > git pull --ff-only
 > uv sync --frozen --no-dev
-> uv run bot.py        # update your service unit / start script to match
+> uv run --frozen --no-dev bot.py   # update your service unit / start script to match
 > ```
 >
 > After that, auto-update works again — as long as `uv` is on the bot's `PATH`.
@@ -177,11 +177,14 @@ Update checking is configured in `config.py` (not via slash command): `UPDATE_CH
    export DISCORD_BOT_TOKEN="your_bot_token_here"
    ```
 
-4. **Run:** `uv run bot.py`
+4. **Run:** `uv run --frozen --no-dev bot.py`
 
-   Run the bot through `uv run` (or `.venv/bin/python bot.py`) so it uses
-   the project's venv. Auto-update re-syncs that venv when dependencies
-   change, which needs `uv` on the bot's `PATH`.
+   Always start the bot this way, including from a service unit. A plain
+   `uv run` also installs the test dependencies, and without `--frozen` it
+   may rewrite `uv.lock` on the host. Auto-update re-syncs the bot's venv
+   on every update, which needs `uv` on the bot's `PATH` — under systemd,
+   that usually means setting `PATH` in the unit, since the installer puts
+   uv in `~/.local/bin`.
 
 **Need help?** Check the **[Setup Guide](../../wiki/Setup-Guide)** for detailed instructions.
 
