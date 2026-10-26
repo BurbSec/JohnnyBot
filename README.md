@@ -1,5 +1,22 @@
 # JohnnyBot - The Missing Discord Server Management Toolkit
 
+> [!CAUTION]
+> **Breaking change in v1.2.0: JohnnyBot now installs with [uv](https://docs.astral.sh/uv/), not pip.**
+> `requirements.txt` is gone. **Auto-update will not carry you across this release** —
+> a bot on v1.1.x that tries to auto-update will post an "Auto-update failed" alert
+> and keep running the old version. To upgrade, on the host:
+>
+> ```shell
+> curl -LsSf https://astral.sh/uv/install.sh | sh   # or: brew install uv / pipx install uv
+> cd johnnybot
+> git pull --ff-only
+> uv sync --frozen --no-dev
+> uv run bot.py        # update your service unit / start script to match
+> ```
+>
+> After that, auto-update works again — as long as `uv` is on the bot's `PATH`.
+> See [CHANGELOG.md](CHANGELOG.md#v120) for details.
+
 JohnnyBot does all of the stuff Discord bizarrely won't let you do!
 Designed to automate tons of server management and enforce some rules while
 you're at it. It provides features such as mass role management, message
@@ -146,11 +163,11 @@ Update checking is configured in `config.py` (not via slash command): `UPDATE_CH
 
 ## Quick Start
 
-1. **Clone and Install:**
+1. **Clone and Install** (needs [uv](https://docs.astral.sh/uv/getting-started/installation/)):
    ```shell
    git clone https://github.com/burbsec/johnnybot.git
    cd johnnybot
-   pip install -r requirements.txt
+   uv sync --frozen --no-dev
    ```
 
 2. **Configure:** Copy [`config_example.py`](config_example.py) to `config.py` and edit it with your server settings (`config.py` is gitignored)
@@ -160,7 +177,11 @@ Update checking is configured in `config.py` (not via slash command): `UPDATE_CH
    export DISCORD_BOT_TOKEN="your_bot_token_here"
    ```
 
-4. **Run:** `python bot.py`
+4. **Run:** `uv run bot.py`
+
+   Run the bot through `uv run` (or `.venv/bin/python bot.py`) so it uses
+   the project's venv. Auto-update re-syncs that venv when dependencies
+   change, which needs `uv` on the bot's `PATH`.
 
 **Need help?** Check the **[Setup Guide](../../wiki/Setup-Guide)** for detailed instructions.
 
@@ -169,7 +190,11 @@ Update checking is configured in `config.py` (not via slash command): `UPDATE_CH
 - **Python 3.11+** — tested on 3.11, 3.12, 3.13 and 3.14 in CI.
   The dependencies themselves require 3.10+, but 3.10 reaches
   end-of-life in October 2026, so 3.11 is the supported floor.
-- **Dependencies:** Listed in [`requirements.txt`](requirements.txt)
+- **[uv](https://docs.astral.sh/uv/)** — dependencies are declared in
+  [`pyproject.toml`](pyproject.toml) and pinned in [`uv.lock`](uv.lock).
+  uv can also install a suitable Python for you.
+- **Development:** `uv sync` installs the test dependencies too; run the
+  suite with `uv run pytest`.
 
 ## Contributing
 
