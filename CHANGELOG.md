@@ -3,6 +3,24 @@
 Release notes for moderators are posted to the moderators channel from each
 release's annotated git tag. This file is for whoever runs the bot.
 
+## v1.2.1
+
+### Security
+- aiohttp 3.14.3 → 3.14.5, fixing eight advisories (three high):
+  GHSA-2g87-pp6c-29x5, GHSA-5wr8-gcqf-gqf3, GHSA-9xw5-w5jj-pvcg,
+  GHSA-494j-54xm-rwp3, GHSA-6cjc-53gc-5rqm, GHSA-pqxq-w44r-73xw,
+  GHSA-f9xw-jh8m-3mwq and GHSA-gx76-c99x-2c96. `pyproject.toml` now
+  requires `aiohttp>=3.14.4`, so the lock can never resolve back to a
+  vulnerable version. Auto-update applies this on its own.
+
+### Fixed
+- The documented start command is now `uv run --frozen --no-dev bot.py`.
+  v1.2.0 said `uv run bot.py`, which also installs the test dependencies
+  on the host and, if that host's uv decides the lock is stale, rewrites
+  `uv.lock` in the checkout — a local change that can make the next
+  auto-update's `git pull --ff-only` fail. **If you followed the v1.2.0
+  steps, update your service unit or start script.**
+
 ## v1.2.0
 
 > [!CAUTION]
@@ -21,11 +39,11 @@ release's annotated git tag. This file is for whoever runs the bot.
 > **To upgrade, on the host:**
 >
 > 1. Install uv: `curl -LsSf https://astral.sh/uv/install.sh | sh`
->    (or `brew install uv`, `pipx install uv`, …). Make sure it is on the `PATH`
+>    (or `brew install uv`). Make sure it is on the `PATH`
 >    of the account the bot runs as.
 > 2. In the bot directory: `git pull --ff-only`
 > 3. `uv sync --frozen --no-dev` — creates `.venv/` with the exact locked versions.
-> 4. Start the bot with `uv run bot.py` (or `.venv/bin/python bot.py`) and
+> 4. Start the bot with `uv run --frozen --no-dev bot.py` and
 >    **update your systemd unit / start script to match**. Starting it with a
 >    bare `python bot.py` uses whatever interpreter happens to be on the `PATH`,
 >    not the synced venv.

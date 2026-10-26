@@ -2,7 +2,7 @@
 name = "johnnybot"
 # Display only — the running version shown to moderators comes from git
 # tags (see _version_label in bot.py). Bump alongside each release tag.
-version = "1.2.0"
+version = "1.2.1"
 description = "Discord bot for server management and automation"
 readme = "README.md"
 # 3.11 is the documented floor; CI tests 3.11-3.14.
@@ -12,7 +12,9 @@ dependencies = [
     # APScheduler 4 is a ground-up rewrite with a different API.
     "APScheduler>=3.11.3,<4",
     "icalendar>=7.3.0",
-    "aiohttp>=3.14.3",
+    # 3.14.4 fixes GHSA-2g87-pp6c-29x5, GHSA-5wr8-gcqf-gqf3, GHSA-9xw5-w5jj-pvcg
+    # and five lower-severity advisories; never lock below it.
+    "aiohttp>=3.14.4",
     "feedparser>=6.0.14",
     "python-dateutil>=2.9.0.post0",
 ]
@@ -25,6 +27,6 @@ dev = [
 ]
 
 [tool.uv]
-# An application run from its checkout (python bot.py), not an
+# An application run from its checkout (uv run bot.py), not an
 # installable package — uv manages the venv only.
 package = false

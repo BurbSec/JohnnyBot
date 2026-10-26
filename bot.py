@@ -176,7 +176,7 @@ async def _sync_dependencies():
         # Never let uv treat a system Python as the project environment
         return ("Dependencies changed, but the bot is not running from a "
                 "virtual environment. Run `uv sync --frozen --no-dev` and "
-                "start the bot with `uv run bot.py`.")
+                "start the bot with `uv run --frozen --no-dev bot.py`.")
     env = {**os.environ, 'UV_PROJECT_ENVIRONMENT': sys.prefix}
     rc, _, err = await _run_cmd(uv, 'sync', '--frozen', '--no-dev', env=env)
     if rc != 0:
