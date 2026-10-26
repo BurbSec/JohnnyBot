@@ -132,6 +132,34 @@ async def _version_label(session, repo_path, sha, *, local):
     return tag or _short_sha(sha)
 
 
+# The compare API lists at most this many files and gives no other sign
+# that the list was cut short
+_COMPARE_FILE_LIMIT = 300
+
+async def _changed_files(session, repo_path, base, head):
+    """Return the files changed between two commits, or None if unknown.
+
+    None covers both a failed request and a list that may have been
+    truncated. Callers must treat it as "anything may have changed",
+    never as "nothing changed" — an empty list would hide a
+    config_example.py change from the auto-update gate.
+    """
+    url = f"https://api.github.com/repos/{repo_path}/compare/{base}...{head}"
+    async with session.get(url) as response:
+        if response.status != 200:
+            logger.warning("Failed to fetch commit comparison: HTTP %s", response.status)
+            return None
+        compare_data = await response.json()
+    files = compare_data.get('files')
+    if files is None:
+        logger.warning("Commit comparison returned no file list")
+        return None
+    if len(files) >= _COMPARE_FILE_LIMIT:
+        logger.warning("Commit comparison lists %d files and may be truncated", len(files))
+        return None
+    return [f['filename'] for f in files]
+
+
 async def _sync_dependencies():
     """Bring the running interpreter's venv in line with uv.lock.
 
@@ -247,21 +275,18 @@ async def check_for_updates():
                 logger.info("Already notified for commit %s, skipping", remote_commit[:8])
                 return
 
-            # Check what changed between local and remote
-            compare_url = f"https://api.github.com/repos/{repo_path}/compare/{local_commit}...{remote_commit}"
-            changed_files = []
-            async with session.get(compare_url) as response:
-                if response.status == 200:
-                    compare_data = await response.json()
-                    changed_files = [f['filename'] for f in compare_data.get('files', [])]
-                else:
-                    logger.warning("Failed to fetch commit comparison: HTTP %s", response.status)
-            config_changed = 'config_example.py' in changed_files
+            # Check what changed between local and remote. If that
+            # can't be determined, a config change can't be ruled out
+            changed_files = await _changed_files(
+                session, repo_path, local_commit, remote_commit)
+            changes_unknown = changed_files is None
+            config_changed = not changes_unknown and 'config_example.py' in changed_files
 
-            # Auto-update only commits that passed CI and don't
-            # require config changes
+            # Auto-update only commits that passed CI and are known
+            # not to require config changes
+            can_auto_update = auto_update and not config_changed and not changes_unknown
             ci_ok = False
-            if auto_update and not config_changed:
+            if can_auto_update:
                 ci_ok = await _ci_passed(session, repo_path, remote_commit)
 
             # Tag names are cosmetic only — detection above stays
@@ -276,7 +301,7 @@ async def check_for_updates():
 
     logger.info("Update available: local=%s, remote=%s", local_version, remote_version)
 
-    if auto_update and not config_changed and ci_ok:
+    if can_auto_update and ci_ok:
         error = await _auto_update_and_restart(
             local_commit, remote_commit, local_version, remote_version)
         # Only reached on failure — os.execv never returns
@@ -296,14 +321,22 @@ async def check_for_updates():
                 logger.error("Error sending auto-update failure notice: %s", e)
         return
 
-    if auto_update and not config_changed and not ci_ok:
+    if auto_update and changes_unknown:
+        logger.warning("Auto-update skipped: could not determine what changed in %s", remote_version)
+    elif can_auto_update and not ci_ok:
         logger.info("Auto-update skipped: CI not green for %s", remote_version)
 
     _last_notified_commit = remote_commit
-    await send_update_notification(local_version, remote_version, config_changed)
+    await send_update_notification(local_version, remote_version, config_changed,
+                                   changes_unknown)
 
-async def send_update_notification(local_version, remote_version, config_changed=False):
-    """Send update notification to the moderators channel."""
+async def send_update_notification(local_version, remote_version, config_changed=False,
+                                   changes_unknown=False):
+    """Send update notification to the moderators channel.
+
+    changes_unknown means the changed-file list couldn't be fetched, so
+    a config_example.py change can't be ruled out.
+    """
     try:
         moderators_channel = _get_moderators_channel()
 
@@ -319,6 +352,18 @@ async def send_update_notification(local_version, remote_version, config_changed
                 f"Latest version: `{remote_version}`\n\n"
                 f"**Please update manually** — review the config changes and "
                 f"update your local `config.py` before pulling.\n\n"
+                f"Repository: {UPDATE_CHECK_REPO_URL}"
+            )
+        elif changes_unknown:
+            message = (
+                "⚠️ **Bot Update Available — review before updating**\n\n"
+                f"A new version of JohnnyBot is available on GitHub, but the "
+                f"list of changed files couldn't be fetched, so it may include "
+                f"config changes. It was **not** applied automatically.\n"
+                f"Current version: `{local_version}`\n"
+                f"Latest version: `{remote_version}`\n\n"
+                f"**Please update manually** — check whether `config_example.py` "
+                f"changed and update your local `config.py` before pulling.\n\n"
                 f"Repository: {UPDATE_CHECK_REPO_URL}"
             )
         else:
