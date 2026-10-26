@@ -132,9 +132,6 @@ async def _version_label(session, repo_path, sha, *, local):
     return tag or _short_sha(sha)
 
 
-# A change to either file means the locked dependency set moved
-_DEPENDENCY_FILES = ('pyproject.toml', 'uv.lock')
-
 async def _sync_dependencies():
     """Bring the running interpreter's venv in line with uv.lock.
 
@@ -159,9 +156,9 @@ async def _sync_dependencies():
     return None
 
 
-async def _auto_update_and_restart(local_commit, remote_commit, deps_changed,
+async def _auto_update_and_restart(local_commit, remote_commit,
                                    local_version=None, remote_version=None):
-    """Pull the latest code, reinstall deps if needed, and re-exec the bot.
+    """Pull the latest code, sync dependencies, and re-exec the bot.
 
     On success this never returns (the process is replaced). Returns an
     error string on failure so the caller can notify moderators.
@@ -173,12 +170,14 @@ async def _auto_update_and_restart(local_commit, remote_commit, deps_changed,
     if rc != 0:
         return f"`git pull --ff-only` failed: {err or 'unknown error'}"
 
-    if deps_changed:
-        error = await _sync_dependencies()
-        if error:
-            # Code is already pulled; restarting with missing deps could
-            # crash-loop, so bail out and ask for a manual fix
-            return error
+    # Always sync rather than only when the diff shows a dependency
+    # change: the compare API's file list can fail or be truncated, and
+    # a no-op sync against an up-to-date venv costs well under a second.
+    error = await _sync_dependencies()
+    if error:
+        # Code is already pulled; restarting with missing deps could
+        # crash-loop, so bail out and ask for a manual fix
+        return error
 
     channel = _get_moderators_channel()
     if channel:
@@ -279,9 +278,7 @@ async def check_for_updates():
 
     if auto_update and not config_changed and ci_ok:
         error = await _auto_update_and_restart(
-            local_commit, remote_commit,
-            any(f in changed_files for f in _DEPENDENCY_FILES),
-            local_version, remote_version)
+            local_commit, remote_commit, local_version, remote_version)
         # Only reached on failure — os.execv never returns
         logger.error("Auto-update failed: %s", error)
         _last_notified_commit = remote_commit

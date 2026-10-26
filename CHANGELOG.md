@@ -31,16 +31,33 @@ release's annotated git tag. This file is for whoever runs the bot.
 >    not the synced venv.
 >
 > Once you are on v1.2.0, auto-update works again and re-syncs the venv itself
-> whenever `pyproject.toml` or `uv.lock` change. If `uv` is missing, or the bot
+> on every update. If `uv` is missing, or the bot
 > is not running from a virtual environment, auto-update stops and alerts
 > instead of restarting into a broken environment.
+
+### Why
+The point of this release is a more dependable **auto-update**. Under pip it:
+- reinstalled only the top-level pins, so transitive dependencies drifted
+  between hosts and over time;
+- never removed packages that had been dropped;
+- installed into whatever interpreter the bot happened to run under — including
+  a system Python, where pip is refused outright on distros that mark it
+  externally managed (PEP 668);
+- reinstalled only when GitHub's compare API listed `requirements.txt` among
+  the changed files, so a failed or truncated compare restarted the bot
+  without its new dependencies.
+
+With uv, every update syncs the bot's own venv to `uv.lock` exactly — every
+package, transitive ones included, added and removed — and refuses to restart
+when it can't.
 
 ### Changed
 - Installation and dependency management moved from pip (`requirements.txt`,
   `requirements-test.txt`) to uv (`pyproject.toml`, `uv.lock`). Test
   dependencies are now the `dev` dependency group: `uv sync && uv run pytest`.
-- Auto-update runs `uv sync --frozen --no-dev` into the bot's own venv when
-  dependencies change, in place of `pip install -r requirements.txt`.
+- Auto-update runs `uv sync --frozen --no-dev` into the bot's own venv after
+  every pull, in place of `pip install -r requirements.txt` when
+  `requirements.txt` changed.
 - CI installs with `uv sync --locked`, so a `pyproject.toml` change without a
   matching `uv.lock` update fails the build.
 

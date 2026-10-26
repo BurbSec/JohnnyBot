@@ -134,5 +134,28 @@ async def test_auto_update_bails_before_restart_when_sync_fails(monkeypatch):
     monkeypatch.setattr(bot, '_sync_dependencies', failing_sync)
     monkeypatch.setattr(bot.os, 'execv', no_exec)
 
-    error = await bot._auto_update_and_restart('a' * 40, 'b' * 40, True)
+    error = await bot._auto_update_and_restart('a' * 40, 'b' * 40)
     assert error == 'sync broke'
+
+
+@pytest.mark.asyncio
+async def test_auto_update_syncs_even_without_a_known_dependency_change(monkeypatch):
+    # The compare API's file list can be missing or truncated, so sync
+    # must not depend on it
+    synced = []
+    async def fake_run(*args, env=None):
+        return 0, '', ''
+    async def fake_sync():
+        synced.append(True)
+        return None
+    def fake_exec(*args):
+        raise SystemExit('restarted')
+    monkeypatch.setattr(bot, '_run_cmd', fake_run)
+    monkeypatch.setattr(bot, '_sync_dependencies', fake_sync)
+    monkeypatch.setattr(bot, '_get_moderators_channel', lambda: None)
+    monkeypatch.setattr(bot.logging, 'shutdown', lambda: None)
+    monkeypatch.setattr(bot.os, 'execv', fake_exec)
+
+    with pytest.raises(SystemExit):
+        await bot._auto_update_and_restart('a' * 40, 'b' * 40)
+    assert synced == [True]
