@@ -1,0 +1,30 @@
+[project]
+name = "johnnybot"
+# Display only — the running version shown to moderators comes from git
+# tags (see _version_label in bot.py). Bump alongside each release tag.
+version = "1.2.0"
+description = "Discord bot for server management and automation"
+readme = "README.md"
+# 3.11 is the documented floor; CI tests 3.11-3.14.
+requires-python = ">=3.11"
+dependencies = [
+    "discord.py>=2.7.1",
+    # APScheduler 4 is a ground-up rewrite with a different API.
+    "APScheduler>=3.11.3,<4",
+    "icalendar>=7.3.0",
+    "aiohttp>=3.14.3",
+    "feedparser>=6.0.14",
+    "python-dateutil>=2.9.0.post0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+    "pytest-asyncio>=1.4.0",
+    "freezegun>=1.5.5",
+]
+
+[tool.uv]
+# An application run from its checkout (python bot.py), not an
+# installable package — uv manages the venv only.
+package = false
