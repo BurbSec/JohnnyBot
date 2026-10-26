@@ -151,7 +151,7 @@ Once a feed is added, everything else is automatic: feeds are re-checked every M
 
 `Mod` above means the invoker needs the **Manage Messages** permission — not a specific role name, so there's nothing to configure to make command access work on a new server. `Admin` means the stricter **Administrator** permission, reserved for the backup/restore commands since they can rewrite the server's entire structure.
 
-Update checking is configured in `config.py` (not via slash command): `UPDATE_CHECKING_ENABLED` turns on daily checks for new commits with moderator notifications, and `AUTO_UPDATE_ENABLED` additionally makes the bot pull CI-passing updates and restart itself. Notifications display a git tag (e.g. `v1.0.0`) when the relevant commit is tagged, falling back to a short commit SHA otherwise — tags are cosmetic labels only, update detection itself is still commit-based so untagged commits are never missed.
+Update checking is configured in `config.py` (not via slash command): `UPDATE_CHECKING_ENABLED` turns on daily checks for new commits with moderator notifications, and `AUTO_UPDATE_ENABLED` additionally makes the bot pull CI-passing updates, sync its dependencies with uv and restart itself (see [Auto-update requirements](#auto-update-requirements)). Notifications display a git tag (e.g. `v1.0.0`) when the relevant commit is tagged, falling back to a short commit SHA otherwise — tags are cosmetic labels only, update detection itself is still commit-based so untagged commits are never missed.
 
 ### PetBot Interactions
 
@@ -181,12 +181,50 @@ Update checking is configured in `config.py` (not via slash command): `UPDATE_CH
 
    Always start the bot this way, including from a service unit. A plain
    `uv run` also installs the test dependencies, and without `--frozen` it
-   may rewrite `uv.lock` on the host. Auto-update re-syncs the bot's venv
-   on every update, which needs `uv` on the bot's `PATH` — under systemd,
-   that usually means setting `PATH` in the unit, since the installer puts
-   uv in `~/.local/bin`.
+   may rewrite `uv.lock` on the host.
 
 **Need help?** Check the **[Setup Guide](../../wiki/Setup-Guide)** for detailed instructions.
+
+## Running as a Service
+
+For a long-running install, run the bot from systemd as a dedicated account, and **install uv system-wide** rather than in a home directory. That puts it on the service's default `PATH`, which auto-update needs, and out of reach of `ProtectHome=`:
+
+```shell
+curl -LsSf https://astral.sh/uv/install.sh | sudo env UV_INSTALL_DIR=/usr/local/bin UV_NO_MODIFY_PATH=1 sh
+```
+
+The parts of the unit that matter for uv:
+
+```ini
+[Service]
+User=johnnybot
+WorkingDirectory=/opt/JohnnyBot
+ExecStart=/usr/local/bin/uv run --frozen --no-dev bot.py
+# uv's cache normally lives in ~/.cache, which ProtectHome= hides and
+# ProtectSystem=strict makes read-only; systemd creates this one writable
+CacheDirectory=johnnybot
+Environment=UV_CACHE_DIR=/var/cache/johnnybot/uv
+Environment=UV_LINK_MODE=copy
+# Use the system Python; never download one at service start
+Environment=UV_PYTHON_DOWNLOADS=never
+Environment=UV_PYTHON_PREFERENCE=only-system
+# Keep what auto-update pulls group-writable, and stop git warning about
+# the ~/.config that ProtectHome= hides
+UMask=0007
+Environment=XDG_CONFIG_HOME=/nonexistent
+```
+
+The **[Setup Guide](../../wiki/Setup-Guide#running-as-a-service-recommended)** has a complete, sandboxed unit.
+
+### Auto-update requirements
+
+`AUTO_UPDATE_ENABLED` makes the bot run `git pull --ff-only` and `uv sync` **as the service account**, so that account must be able to update its own checkout:
+
+- **An HTTPS remote.** The repository is public, so `git remote set-url origin https://github.com/BurbSec/JohnnyBot.git` needs no credentials. An SSH remote needs a key the service account can read, which a sandboxed unit usually hides.
+- **Write access to the checkout's directories and `.git`.** Git replaces files rather than editing them, so the files themselves can stay read-only to the bot — including `config.py`. If you also pull by hand as another account, share a group: make the directories group-writable and setgid, make `.git` group-writable, set `git config core.sharedRepository group`, add yourself to the group, and give the unit `UMask=0007`. The [Setup Guide](../../wiki/Setup-Guide#running-as-a-service-recommended) has the exact commands.
+- **A clean working tree.** `git pull --ff-only` refuses to run over local edits to tracked files.
+
+If any of these fail, the update stops before restarting and the moderators channel gets an "Auto-update failed" alert, so a misconfigured host fails loudly rather than breaking.
 
 ## Requirements
 
