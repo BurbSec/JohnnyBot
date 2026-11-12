@@ -1830,10 +1830,11 @@ def register_commands():
          delete_reminder, mod_only=True,
          describe={'title': 'Title of the reminder to delete'})
     _reg('purge_last_messages',
-         'Purges a specified number of messages from a channel',
+         'Purges a specified number of messages from a channel, optionally only from one user',
          purge_last_messages, mod_only=True,
          describe={'channel': 'Channel to purge messages from',
-                   'limit': 'Number of messages to delete'},
+                   'limit': 'Number of messages to delete',
+                   'user': 'Only delete messages from this user (optional)'},
          error=purge_last_messages_error)
     _reg('purge_string',
          'Purges messages containing a specific string from a channel',
@@ -2141,15 +2142,38 @@ async def delete_reminder(interaction: discord.Interaction, title: str) -> None:
         logger.error('Error deleting reminder: %s', e)
         await interaction.response.send_message('Failed to delete reminder due to an error.', ephemeral=True)
 
+_PURGE_USER_SCAN_LIMIT = 5000
+
 async def purge_last_messages(interaction: discord.Interaction, channel: discord.TextChannel,
-                              limit: app_commands.Range[int, 1, 1000]):
-    """Purges a specified number of messages from a channel."""
+                              limit: app_commands.Range[int, 1, 1000],
+                              user: discord.User | None = None):
+    """Purges a specified number of messages from a channel.
+
+    With `user`, deletes that user's last `limit` messages, scanning back at
+    most _PURGE_USER_SCAN_LIMIT messages. Messages older than 14 days can't
+    be bulk-deleted and are left alone.
+    """
     await interaction.response.defer(ephemeral=True)
+    reason = f'/purge_last_messages by {interaction.user}'
     try:
-        deleted = await channel.purge(
-            limit=limit,
-            reason=f'/purge_last_messages by {interaction.user}')
-        await interaction.followup.send(f'Deleted {len(deleted)} message(s)', ephemeral=True)
+        if user is None:
+            deleted = await channel.purge(limit=limit, reason=reason)
+            await interaction.followup.send(f'Deleted {len(deleted)} message(s)', ephemeral=True)
+            return
+        cutoff = discord.utils.utcnow() - timedelta(days=14, minutes=-5)
+        to_delete = []
+        async for message in channel.history(limit=_PURGE_USER_SCAN_LIMIT):
+            if message.created_at < cutoff:
+                break
+            if message.author.id == user.id:
+                to_delete.append(message)
+                if len(to_delete) >= limit:
+                    break
+        if to_delete:
+            await channel.delete_messages(to_delete, reason=reason)
+        await interaction.followup.send(
+            f'Deleted {len(to_delete)} message(s) from {user.mention} in {channel.mention}.',
+            ephemeral=True)
     except discord.Forbidden:
         await interaction.followup.send('You do not have permission to perform this action.', ephemeral=True)
     except discord.HTTPException as e:
@@ -4738,7 +4762,7 @@ def get_command_categories():
             "/delete_all_reminders - Deletes all active reminders"
         ],
         "⚖️ Moderation": [
-            "/purge_last_messages - Purges a specified number of messages from a channel",
+            "/purge_last_messages - Purges a specified number of messages from a channel, optionally only from one user",
             "/purge_string - Purges all messages containing a specific string",
             "/purge_webhooks - Purges all messages sent by webhooks or apps",
             "/kick - Kicks one or more members from the server",
